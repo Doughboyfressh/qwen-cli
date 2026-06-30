@@ -7119,31 +7119,23 @@ def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
 def main():
     """Main entry point for qwen-cli.
 
-    # Feature 7+8: Auto-index project symbols + start LSP watch on startup
-    try:
-        global _lsp_client_mod
-        if _lsp_client_mod is None:
-            import lsp_client as _mod
-            _lsp_client_mod = _mod
-        code_files = []
-        for ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".cpp", ".c"):
-            for f in Path.cwd().rglob(f"*{ext}"):
-                rel = str(f.relative_to(Path.cwd()))
-                if not rel.startswith(".") and "/." not in rel:
-                    code_files.append(str(f))
-        if code_files:
-            _lsp_client_mod.lsp_index_symbols(code_files)
-            _lsp_client_mod.lsp_start_watch(code_files)
-    except Exception:
-        pass
-
-
     Initializes the client, prints the welcome banner, and enters the REPL loop.
     Command dispatch is handled by _REPL_COMMANDS dispatch dictionary.
     """
     global MODEL, _backup_stack, _last_user_input, _branches, _turn_count, _current_mode, _session_title, _watch_thread, _cli_client, _real_ctx_tokens, _session_start
 
     _session_start = time.monotonic()
+
+    # -- Start LSP server on boot --
+    try:
+        import lsp_client as _lsp_mod
+        _lsp_mod._ensure_server("")
+        _lsp_mod.lsp_query("diagnostics", "")  # quick health-check
+        print("[LSP] started")
+    except Exception:
+        print("[LSP] failed to start")
+        pass
+
     client = make_client()
     _cli_client = client
 
