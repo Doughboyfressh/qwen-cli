@@ -36,6 +36,23 @@ try:
     from multilspy import SyncLanguageServer as _SyncLanguageServer
     from multilspy.multilspy_config import MultilspyConfig as _MultilspyConfig, Language as _Language
     from multilspy.multilspy_logger import MultilspyLogger as _MultilspyLogger
+
+    # Patch multilspy's _sync_call: when called from a thread with a running
+    # event loop, the original implementation fire-forgets the coroutine via
+    # asyncio.create_task(coro) and returns None immediately.  This produces
+    # "coroutine was never awaited" warnings and silently broken LSP calls.
+    # Our patch uses run_coroutine_threadsafe on the server's own loop instead.
+    _multilspy_original_sync_call = getattr(_SyncLanguageServer, "_sync_call", None)
+
+    def _multilspy_patched_sync_call(self, coro):
+        import asyncio
+        server_loop = getattr(self, "loop", None)
+        if server_loop is not None and not server_loop.is_closed():
+            return asyncio.run_coroutine_threadsafe(coro, server_loop).result()
+        return _multilspy_original_sync_call(self, coro)
+
+    _SyncLanguageServer._sync_call = _multilspy_patched_sync_call
+
     _multilspy_available = True
 except ImportError:
     pass
