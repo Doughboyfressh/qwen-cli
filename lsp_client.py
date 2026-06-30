@@ -12,12 +12,12 @@ Design principles:
 """
 
 from __future__ import annotations
+import asyncio
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
-import inspect
-import asyncio
 
 if TYPE_CHECKING:
     pass
@@ -40,47 +40,6 @@ try:
 except ImportError:
     pass
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Async-safe synchronous wrapper
-# ---------------------------------------------------------------------------
-
-def _sync_call(coro_or_value) -> Any:
-    """If coro_or_value is a coroutine, run it synchronously. Otherwise return as-is."""
-    if inspect.iscoroutine(coro_or_value):
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                # Cannot run coroutine on an already-running loop.
-                # Dispose it cleanly to avoid "coroutine was never awaited" warnings.
-                try:
-                    coro_or_value.close()
-                except RuntimeError:
-                    # Already completed or closed
-                    pass
-                return None
-            # No running loop — safe to create one and run it
-            loop = asyncio.new_event_loop()
-            try:
-                return asyncio.run_coroutine_threadsafe(coro_or_value, loop).result(timeout=10)
-            finally:
-                loop.close()
-        except RuntimeError:
-            # Fallback: create our own loop
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(coro_or_value)
-            finally:
-                try:
-                    coro_or_value.close()
-                except (RuntimeError, AttributeError):
-                    pass
-                loop.close()
-    return coro_or_value
-
 
 # Globals
 # ---------------------------------------------------------------------------
@@ -161,11 +120,38 @@ def _get_project_root(file_path: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: execute a synchronous callback while a file is open in the LSP
+# ---------------------------------------------------------------------------
+
+def _with_open_file(lsp, file_path: str, callback) -> Any:
+    """
+    multilspy's ``lsp.open_file`` is a ``@contextmanager``.  Calling it as
+    ``lsp.open_file(path)`` without ``with`` returns an unentered generator,
+    which means the server never learns about the file and all subsequent
+    requests silently fail (or return coroutines that are never awaited).
+
+    This helper enters the context manager, runs *callback* (which receives
+    the *lsp* object), and exits the context manager cleanly.
+    """
+    ctx = lsp.open_file(file_path)
+    ctx.__enter__()
+    try:
+        return callback(lsp)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
 def _create_server(file_path: str = "") -> Any:
-    """Create a new SyncLanguageServer and start it."""
+    """Create a new SyncLanguageServer and start it.
+
+    multilspy's ``lsp.start_server()`` is also a ``@contextmanager``.  We must
+    enter it (via ``with`` or manual ``__enter__``) so that the internal event
+    loop is created and the server process is actually launched.
+    """
     global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
 
     if not _multilspy_available:
@@ -181,7 +167,12 @@ def _create_server(file_path: str = "") -> Any:
     logger = _MultilspyLogger()
 
     lsp = _SyncLanguageServer.create(config, logger, root)
-    lsp.start_server()
+
+    # Enter the context manager so the event loop is created and the
+    # underlying language-server process is actually started.
+    ctx = lsp.start_server()
+    ctx.__enter__()
+    lsp._start_ctx = ctx          # keep alive for shutdown
 
     _LSP_SERVER = lsp
     _LSP_ROOT = root
@@ -189,6 +180,30 @@ def _create_server(file_path: str = "") -> Any:
     _LSP_LAST_ACCESS = time.time()
 
     return lsp
+
+
+def _shutdown_server(lsp) -> None:
+    """Shut down the LSP server by exiting the start_server context manager."""
+    try:
+        ctx = getattr(lsp, "_start_ctx", None)
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+            lsp._start_ctx = None
+    except Exception:
+        pass
+    # multilspy's SyncLanguageServer creates an internal event loop in
+    # ``lsp.loop``.  Close it explicitly so it does not linger after shutdown.
+    try:
+        _loop = getattr(lsp, "loop", None)
+        if _loop is not None and not _loop.is_closed():
+            _loop.close()
+    except Exception:
+        pass
+    # Fallback: try the inner server's shutdown method
+    try:
+        lsp._server.shutdown()
+    except Exception:
+        pass
 
 
 def _ensure_server(file_path: str = "") -> Any:
@@ -202,10 +217,7 @@ def _ensure_server(file_path: str = "") -> Any:
 
         # If language changed, recreate
         if _LSP_SERVER is not None and _LSP_LANGUAGE != desired_lang:
-            try:
-                _LSP_SERVER._server.shutdown()
-            except Exception:
-                pass
+            _shutdown_server(_LSP_SERVER)
             _LSP_SERVER = None
             _LSP_LANGUAGE = None
 
@@ -220,10 +232,7 @@ def shutdown() -> None:
 
     with _LSP_LOCK:
         if _LSP_SERVER is not None:
-            try:
-                _LSP_SERVER._server.shutdown()
-            except Exception:
-                pass
+            _shutdown_server(_LSP_SERVER)
             _LSP_SERVER = None
             _LSP_ROOT = None
             _LSP_LANGUAGE = None
@@ -239,10 +248,7 @@ def _check_idle_shutdown() -> None:
     if time.time() - _LSP_LAST_ACCESS > _LSP_IDLE_TIMEOUT:
         with _LSP_LOCK:
             if _LSP_SERVER is not None:
-                try:
-                    _LSP_SERVER._server.shutdown()
-                except Exception:
-                    pass
+                _shutdown_server(_LSP_SERVER)
                 _LSP_SERVER = None
                 _LSP_ROOT = None
                 _LSP_LANGUAGE = None
@@ -413,10 +419,11 @@ def lsp_diagnostics(file_path: str) -> str:
         try:
             _check_idle_shutdown()
             lsp = _ensure_server(file_path)
-            lsp.open_file(str(fp))
-            # Some LSP servers publish diagnostics after opening
-            # We check the internal server for any published diagnostics
-            time.sleep(0.5)  # brief pause for server to process
+
+            def _noop(_lsp):
+                time.sleep(0.5)  # brief pause for server to process
+
+            _with_open_file(lsp, str(fp), _noop)
         except Exception:
             pass  # LSP part is best-effort
 
@@ -445,8 +452,11 @@ def lsp_definition(file_path: str, line: int, column: int) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        result = _sync_call(lsp.request_definition(file_path, line - 1, column - 1))
+
+        def _req(_lsp):
+            return _lsp.request_definition(file_path, line - 1, column - 1)
+
+        result = _with_open_file(lsp, file_path, _req)
 
         if not result:
             return f"No definition found at {file_path}:{line}:{column}"
@@ -465,8 +475,11 @@ def lsp_references(file_path: str, line: int, column: int) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        result = _sync_call(lsp.request_references(file_path, line - 1, column - 1))
+
+        def _req(_lsp):
+            return _lsp.request_references(file_path, line - 1, column - 1)
+
+        result = _with_open_file(lsp, file_path, _req)
 
         if not result:
             return f"No references found for symbol at {file_path}:{line}:{column}"
@@ -488,8 +501,11 @@ def lsp_hover(file_path: str, line: int, column: int) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        result = _sync_call(lsp.request_hover(file_path, line - 1, column - 1))
+
+        def _req(_lsp):
+            return _lsp.request_hover(file_path, line - 1, column - 1)
+
+        result = _with_open_file(lsp, file_path, _req)
 
         if result is None:
             return f"No hover info at {file_path}:{line}:{column}"
@@ -505,8 +521,11 @@ def lsp_symbols(file_path: str) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        symbols, _ = _sync_call(lsp.request_document_symbols(file_path))
+
+        def _req(_lsp):
+            return _lsp.request_document_symbols(file_path)
+
+        symbols, _ = _with_open_file(lsp, file_path, _req)
 
         if not symbols:
             return f"No symbols found in {file_path}"
@@ -542,10 +561,11 @@ def lsp_rename(file_path: str, line: int, column: int, new_name: str) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        # multilspy does not expose request_rename directly; we can query
-        # references to show where the symbol appears
-        result = _sync_call(lsp.request_references(file_path, line - 1, column - 1))
+
+        def _req(_lsp):
+            return _lsp.request_references(file_path, line - 1, column - 1)
+
+        result = _with_open_file(lsp, file_path, _req)
 
         if not result:
             return f"No references found for rename at {file_path}:{line}:{column}"
@@ -571,8 +591,11 @@ def lsp_completion(file_path: str, line: int, column: int) -> str:
     try:
         _check_idle_shutdown()
         lsp = _ensure_server(file_path)
-        lsp.open_file(file_path)
-        result = _sync_call(lsp.request_completions(file_path, line - 1, column - 1))
+
+        def _req(_lsp):
+            return _lsp.request_completions(file_path, line - 1, column - 1)
+
+        result = _with_open_file(lsp, file_path, _req)
 
         if not result:
             return f"No completions at {file_path}:{line}:{column}"
