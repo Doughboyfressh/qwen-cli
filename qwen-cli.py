@@ -77,7 +77,41 @@ def _load_config() -> dict:
         print(f"[config] Could not parse {CONFIG_FILE}: {e}", file=sys.stderr)
         return {}
 
+def _validate_config(cfg: dict) -> None:
+    """Validate config.toml values. Warn on unknown keys or invalid types."""
+    KNOWN_KEYS = {
+        "base_url", "model", "token_limit", "max_tool_depth", "max_auto_continue",
+        "editor", "openai_api_key", "fallback_model",
+        "google_api_key", "google_cse_id", "brave_api_key",
+        "auto_search", "preset",
+    }
+    for key in cfg:
+        if key not in KNOWN_KEYS:
+            near_miss = sorted(KNOWN_KEYS - {key}, key=lambda k: len(set(k) & set(key)), reverse=True)
+            did_you_mean = f" (did you mean '{near_miss[0]}'?)" if near_miss else ""
+            print(f"[config] Unknown key '{key}' in config.toml{did_you_mean}", file=sys.stderr)
+
+    if "token_limit" in cfg:
+        val = cfg["token_limit"]
+        if not isinstance(val, int) or val <= 0:
+            print(f"[config] 'token_limit' must be a positive integer, got: {val!r}", file=sys.stderr)
+    if "max_tool_depth" in cfg:
+        val = cfg["max_tool_depth"]
+        if not isinstance(val, int) or val <= 0:
+            print(f"[config] 'max_tool_depth' must be a positive integer, got: {val!r}", file=sys.stderr)
+    if "max_auto_continue" in cfg:
+        val = cfg["max_auto_continue"]
+        if not isinstance(val, int) or val < 0:
+            print(f"[config] 'max_auto_continue' must be a non-negative integer, got: {val!r}", file=sys.stderr)
+    if "auto_search" in cfg:
+        if cfg["auto_search"] not in ("off", "smart", "aggressive"):
+            print(f"[config] 'auto_search' must be 'off', 'smart', or 'aggressive', got: {cfg['auto_search']!r}", file=sys.stderr)
+    if "preset" in cfg:
+        if cfg["preset"] not in ("thinking", "code", "instruct"):
+            print(f"[config] 'preset' must be 'thinking', 'code', or 'instruct', got: {cfg['preset']!r}", file=sys.stderr)
+
 _CFG = _load_config()
+_validate_config(_CFG)
 
 def _cfg(key: str, env: str, default: str) -> str:
     """Resolve a config value: file setting > environment variable > hardcoded default."""
@@ -132,15 +166,14 @@ for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR)
     _d.mkdir(exist_ok=True)
 
 # Shared tool implementations — configured once after paths are defined
-import qwen_tools as _qt
+_qt = __import__('qwen_tools')  # noqa: E402
 _qt.GOOGLE_API_KEY = GOOGLE_API_KEY
 _qt.GOOGLE_CSE_ID  = GOOGLE_CSE_ID
 _qt.BRAVE_API_KEY  = BRAVE_API_KEY
 _qt.BACKUPS_DIR    = BACKUPS_DIR
-from qwen_tools import (
-    _apply_diff, do_web_search, do_fetch_url, do_get_video_transcript,
-    do_search_news, _html_to_text,
-    presearch_decision,
+_apply_diff, do_web_search, do_fetch_url, do_get_video_transcript, do_search_news, _html_to_text, presearch_decision = (  # noqa: E402
+    _qt._apply_diff, _qt.do_web_search, _qt.do_fetch_url, _qt.do_get_video_transcript,
+    _qt.do_search_news, _qt._html_to_text, _qt.presearch_decision,
 )
 
 console = Console(force_terminal=True, legacy_windows=False)
@@ -200,6 +233,10 @@ _tool_call_retry_log: dict[int, list] = {}  # depth → list of (tool, error) fo
 # Error recovery: retry config for failed tool calls
 _TOOL_RETRY_MAX    = 2          # max retries per failed tool call
 _TOOL_RETRY_BASE   = 1.0        # base backoff in seconds
+_TOOL_TIMEOUT_SLOW = 60         # seconds for I/O-heavy tools (web_search, fetch_url, etc.)
+_TOOL_TIMEOUT_FAST = 15         # seconds for local tools (read_file, list_dir, team_*, etc.)
+_TOOL_TIMEOUT_NET  = 30         # seconds for network tools (fetch_url, describe_image, etc.)
+_TOOL_TIMEOUT_LLM  = 120        # seconds for LLM-dependent tools (fetch_rendered, browser_action)
 _TOOL_RETRYABLE_TOOLS = frozenset({
     "web_search", "search_news", "fetch_url", "fetch_rendered",
     "describe_image", "get_video_transcript",
@@ -1346,6 +1383,7 @@ HELP_TEXT = """
 | `/note <text>` | Inject a note into history without calling the model |
 | `/compact` | Alias for /trim — summarize old history to free context |
 | `/stats` | Show session stats: turns, tokens, uptime, memory, preset |
+| `/cleanup [what]` | Purge stale data: `teams` · `backups` · `tasks` · `all` (default) · `dry-run` |
 | `/intel` | Show live intelligence feed from background crawlers |
 | `/intel topics` | List tracked topics and last crawl time |
 | `/intel add <name>|<query>` | Track a new topic |
@@ -1475,21 +1513,28 @@ def _extract_generic_symbols(filepath: Path, ext: str) -> dict:
         s = line.strip()
         if ext in (".js", ".ts", ".tsx", ".jsx", ".mjs"):
             m = re.match(r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)", s)
-            if m: functions.append(m.group(1))
+            if m:
+                functions.append(m.group(1))
             m = re.match(r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(", s)
-            if m: functions.append(m.group(1))
+            if m:
+                functions.append(m.group(1))
             m = re.match(r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", s)
-            if m: classes.append(m.group(1))
+            if m:
+                classes.append(m.group(1))
         elif ext == ".go":
             m = re.match(r"func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(", s)
-            if m: functions.append(m.group(1))
+            if m:
+                functions.append(m.group(1))
             m = re.match(r"type\s+(\w+)\s+struct", s)
-            if m: classes.append(m.group(1))
+            if m:
+                classes.append(m.group(1))
         elif ext == ".rs":
             m = re.match(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", s)
-            if m: functions.append(m.group(1))
+            if m:
+                functions.append(m.group(1))
             m = re.match(r"(?:pub\s+)?(?:struct|enum|trait)\s+(\w+)", s)
-            if m: classes.append(m.group(1))
+            if m:
+                classes.append(m.group(1))
         elif ext in (".java", ".cs"):
             # Java/C# methods: match access modifiers, static, return type, then method name
             m = re.match(
@@ -1501,7 +1546,8 @@ def _extract_generic_symbols(filepath: Path, ext: str) -> dict:
             # Classes and structs
             m = re.match(r"(?:(?:public|private|protected|abstract|static|sealed|partial|internal|friend)\s+)*"
                          r"(?:class|struct|interface|enum)\s+(\w+)", s)
-            if m: classes.append(m.group(1))
+            if m:
+                classes.append(m.group(1))
     return {
         "functions": list(dict.fromkeys(functions)),
         "classes":   list(dict.fromkeys(classes)),
@@ -2381,7 +2427,7 @@ def cmd_stats(history: list) -> None:
     """Show session statistics."""
     turns = sum(1 for m in history if m.get("role") == "assistant")
     mem   = load_memory()
-    mem_lines = len([l for l in mem.splitlines() if l.strip()]) if mem else 0
+    mem_lines = len([ln for ln in mem.splitlines() if ln.strip()]) if mem else 0
     tok   = _last_turn_tokens
     uptime_s = time.monotonic() - _session_start if _session_start else 0
     mins, secs = int(uptime_s // 60), int(uptime_s % 60)
@@ -3293,7 +3339,8 @@ def do_browser_action(action: str, url: str = "", selector: str = "",
             last_nav_err = None
             for _attempt in range(3):
                 if _attempt > 0:
-                    import time as _time; _time.sleep(1.5 * _attempt)
+                    import time as _time
+                    _time.sleep(1.5 * _attempt)
                     console.print(f"[dim]  [browser] retry {_attempt}/2...[/dim]")
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -3542,7 +3589,8 @@ def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
         last_err = None
         for _attempt in range(3):
             if _attempt:
-                import time as _t; _t.sleep(1.5 * _attempt)
+                import time as _t
+                _t.sleep(1.5 * _attempt)
                 console.print(f"[dim]  [fetch_rendered] retry {_attempt}/2...[/dim]")
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -3666,18 +3714,23 @@ def do_run_command(command: str, cwd: str = "", timeout: int = 30,
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            cancelled.set(); proc.kill()
-            t_out.join(timeout=1); t_err.join(timeout=1)
+            cancelled.set()
+            proc.kill()
+            t_out.join(timeout=1)
+            t_err.join(timeout=1)
             partial = "".join(stdout_buf).strip()
             return f"[timed out after {timeout}s]\n\n{partial}" if partial else f"[timed out after {timeout}s]"
         except KeyboardInterrupt:
-            cancelled.set(); proc.kill()
-            t_out.join(timeout=1); t_err.join(timeout=1)
+            cancelled.set()
+            proc.kill()
+            t_out.join(timeout=1)
+            t_err.join(timeout=1)
             console.print("\n[dim][command cancelled][/dim]")
             partial = "".join(stdout_buf).strip()
             return f"[cancelled]\n\n{partial}" if partial else "[cancelled]"
 
-        t_out.join(timeout=2); t_err.join(timeout=2)
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
         elapsed = time.monotonic() - t0
 
         full_out = "".join(stdout_buf).strip()
@@ -3922,7 +3975,8 @@ def do_list_directory(path: str, recursive: bool = False) -> str:
 def do_find_files(path: str, pattern: str) -> str:
     """Handle find files operation."""
     try:
-        import os as _os, fnmatch as _fnmatch
+        import os as _os
+        import fnmatch as _fnmatch
         p = _resolve(path)
         if not p.exists():
             return f"[not found: {p}]"
@@ -3969,7 +4023,8 @@ def do_search_files(path: str, query: str, pattern: str = "**/*", context: int =
 
         # Use os.walk with in-place directory pruning so ignored dirs (e.g. .venv)
         # are never descended into, avoiding the 10,000+ file enumeration hang.
-        import os as _os, fnmatch as _fnmatch
+        import os as _os
+        import fnmatch as _fnmatch
         _name_pat = pattern.rstrip("/").split("/")[-1] if pattern else "*"
 
         def _walk_files(root: Path):
@@ -4963,7 +5018,8 @@ def cmd_git_pr(client: OpenAI) -> None:
     try:
         if console.input("[dim]  Copy to clipboard? [y/N]: [/dim]").strip().lower() == "y":
             try:
-                import pyperclip; pyperclip.copy(pr)
+                import pyperclip
+                pyperclip.copy(pr)
                 console.print("[green][copied][/green]")
             except ImportError:
                 console.print("[yellow][pip install pyperclip][/yellow]")
@@ -5324,48 +5380,73 @@ def _call_with_retry(name: str, args: dict, dispatch_fn, max_retries: int = _TOO
     return f"[tool_call_failed: {name} after {1 + max_retries} attempts\nerrors: {err_summary}\nhint: {hint}]"
 
 
+def _call_with_timeout(name: str, fn, *args, timeout: int, **kwargs) -> str:
+    """Call a tool function with a timeout. Returns the result or a timeout error string."""
+    result_holder = []
+    error_holder = []
+
+    def _target():
+        try:
+            result_holder.append(fn(*args, **kwargs))
+        except Exception as e:
+            error_holder.append(e)
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        return f"[{name}] timed out after {timeout}s. The operation took too long to complete."
+    if error_holder:
+        raise error_holder[0]
+    if result_holder:
+        return result_holder[0]
+    # Shouldn't happen, but be safe
+    return f"[{name}] returned empty result"
+
+
 def _call_tool_safe(name: str, args: dict) -> str:
     """Dispatch a parallel-safe (non-interactive) tool."""
     if name == "web_search":
         q = args.get("query", "")
         console.print(f"[dim cyan]  web_search: {q}[/dim cyan]")
-        result = do_web_search(q)
+        result = _call_with_timeout(name, do_web_search, q, timeout=_TOOL_TIMEOUT_SLOW)
         console.print(f"[dim cyan]  → {len(result.splitlines())} lines[/dim cyan]")
         return result
     if name == "search_news":
         q = args.get("query", "")
         console.print(f"[dim cyan]  search_news: {q}[/dim cyan]")
-        result = do_search_news(q, args.get("max_results", 8))
+        result = _call_with_timeout(name, do_search_news, q, args.get("max_results", 8), timeout=_TOOL_TIMEOUT_SLOW)
         console.print(f"[dim cyan]  → {len(result.splitlines())} lines[/dim cyan]")
         return result
     if name == "fetch_url":
         u = args.get("url", "")
         console.print(f"[dim cyan]  fetch_url: {u}[/dim cyan]")
-        result = do_fetch_url(u, args.get("max_chars", 20_000))
+        result = _call_with_timeout(name, do_fetch_url, u, args.get("max_chars", 20_000), timeout=_TOOL_TIMEOUT_NET)
         console.print(f"[dim cyan]  → {len(result):,} chars[/dim cyan]")
         return result
     if name == "describe_image":
         u = args.get("url", "")
         console.print(f"[dim cyan]  describe_image: {u}[/dim cyan]")
-        return do_describe_image(u)
+        return _call_with_timeout(name, do_describe_image, u, timeout=_TOOL_TIMEOUT_NET)
     if name == "get_video_transcript":
         u = args.get("url", "")
         console.print(f"[dim cyan]  get_video_transcript: {u}[/dim cyan]")
-        return do_get_video_transcript(u, args.get("lang", "en"))
+        return _call_with_timeout(name, do_get_video_transcript, u, args.get("lang", "en"), timeout=_TOOL_TIMEOUT_SLOW)
     if name == "read_file":
-        return do_read_file(args.get("path", ""), args.get("offset", 0), args.get("limit", 0))
+        return _call_with_timeout(name, do_read_file, args.get("path", ""), args.get("offset", 0), args.get("limit", 0), timeout=_TOOL_TIMEOUT_FAST)
     if name == "list_directory":
         p = args.get("path", "")
         console.print(f"[dim cyan]  list_directory: {p}[/dim cyan]")
-        return do_list_directory(p, args.get("recursive", False))
+        return _call_with_timeout(name, do_list_directory, p, args.get("recursive", False), timeout=_TOOL_TIMEOUT_FAST)
     if name == "find_files":
         p, pat = args.get("path", ""), args.get("pattern", "*")
         console.print(f"[dim cyan]  find_files: {pat} in {p}[/dim cyan]")
-        return do_find_files(p, pat)
+        return _call_with_timeout(name, do_find_files, p, pat, timeout=_TOOL_TIMEOUT_FAST)
     if name == "search_files":
         p, q2 = args.get("path", ""), args.get("query", "")
         console.print(f"[dim cyan]  search_files: '{q2}' in {p}[/dim cyan]")
-        return do_search_files(p, q2, args.get("pattern", "**/*"), args.get("context", 0))
+        return _call_with_timeout(name, do_search_files, p, q2, args.get("pattern", "**/*"), args.get("context", 0), timeout=_TOOL_TIMEOUT_FAST)
     if name == "team_task_list":
         team = args.get("team", "")
         console.print(f"[dim cyan]  team_task_list: {team}[/dim cyan]")
@@ -6781,6 +6862,109 @@ def _cmd_stats(ctx: _ReplContext, arg: str) -> None:
     cmd_stats(ctx.history)
 
 
+def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
+    """Clean up stale teams, backups, and completed tasks."""
+    import glob as _glob
+    from datetime import datetime, timedelta
+
+    sub = arg.strip().lower() if arg else "all"
+    dry_run = sub == "dry-run"
+    what = sub if sub in ("teams", "backups", "tasks", "all") else "all"
+    if dry_run:
+        what = "all"
+
+    removed = 0
+    age_label = ""
+
+    # --- Teams ---
+    if what in ("teams", "all"):
+        ct_dir = CT_DIR / "teams"
+        if ct_dir.is_dir():
+            now_ts = time.time()
+            max_age = 7 * 86400  # 7 days
+            age_label = "7d"
+            for team_dir in sorted(ct_dir.iterdir()):
+                if not team_dir.is_dir():
+                    continue
+                tasks_dir = team_dir / "tasks"
+                has_active = False
+                if tasks_dir.is_dir():
+                    try:
+                        for tf in tasks_dir.iterdir():
+                            if tf.suffix == ".json":
+                                raw = tf.read_text(encoding="utf-8", errors="replace")
+                                td = json.loads(raw)
+                                status = td.get("status", "pending").lower()
+                                if status not in ("completed", "blocked"):
+                                    has_active = True
+                                    break
+                                # even completed/blocked tasks count as recent if modified within max_age
+                                if tf.stat().st_mtime > now_ts - max_age:
+                                    has_active = True
+                                    break
+                    except (json.JSONDecodeError, OSError):
+                        has_active = True
+                if has_active:
+                    continue
+                # Remove the team directory
+                if not dry_run:
+                    try:
+                        import shutil
+                        shutil.rmtree(team_dir)
+                    except Exception:
+                        pass
+                removed += 1
+                if dry_run:
+                    console.print(f"  [dim]would remove team:[/dim] {team_dir.name}")
+
+    # --- Backups ---
+    if what in ("backups", "all"):
+        if BACKUPS_DIR.is_dir():
+            now_ts = time.time()
+            max_age = 7 * 86400  # 7 days
+            for bf in list(BACKUPS_DIR.iterdir()):
+                if bf.stat().st_mtime < now_ts - max_age:
+                    if not dry_run:
+                        try:
+                            bf.unlink()
+                        except Exception:
+                            pass
+                    removed += 1
+                    if dry_run:
+                        console.print(f"  [dim]would remove backup:[/dim] {bf.name}")
+
+    # --- Completed tasks ---
+    if what in ("tasks", "all"):
+        ct_dir = CT_DIR / "teams"
+        if ct_dir.is_dir():
+            now_ts = time.time()
+            max_age = 3 * 86400  # 3 days for completed tasks
+            for team_dir in list(ct_dir.iterdir()):
+                tasks_dir = team_dir / "tasks"
+                if not tasks_dir.is_dir():
+                    continue
+                for tf in list(tasks_dir.iterdir()):
+                    if tf.suffix != ".json":
+                        continue
+                    try:
+                        raw = tf.read_text(encoding="utf-8", errors="replace")
+                        td = json.loads(raw)
+                        status = td.get("status", "pending").lower()
+                        if status == "completed" and tf.stat().st_mtime < now_ts - max_age:
+                            if not dry_run:
+                                tf.unlink()
+                            removed += 1
+                            if dry_run:
+                                console.print(f"  [dim]would remove task:[/dim] {team_dir.name}/{tf.name}")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+    if dry_run:
+        console.print(f"[dim][dry-run: {removed} item(s) would be removed][/dim]")
+    else:
+        console.print(f"[dim][cleanup done: {removed} item(s) removed][/dim]")
+
+
 def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
     global _intel_enabled
     sub = arg.strip().lower() if arg else ""
@@ -6910,6 +7094,7 @@ _REPL_COMMANDS: dict[str, callable] = {
     "/note": _cmd_note,
     "/compact": _cmd_compact,
     "/stats": _cmd_stats,
+    "/cleanup": _cmd_cleanup,
     "/intel": _cmd_intel,
     "/cd": _cmd_cd,
 }

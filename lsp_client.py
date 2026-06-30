@@ -20,9 +20,7 @@ import inspect
 import asyncio
 
 if TYPE_CHECKING:
-    from multilspy import SyncLanguageServer
-    from multilspy.multilspy_config import MultilspyConfig, Language
-    from multilspy.multilspy_logger import MultilspyLogger
+    pass
 
 # ---------------------------------------------------------------------------
 # Lazy import — multilspy may not be installed
@@ -51,18 +49,35 @@ def _sync_call(coro_or_value) -> Any:
     """If coro_or_value is a coroutine, run it synchronously. Otherwise return as-is."""
     if inspect.iscoroutine(coro_or_value):
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Cannot run coroutine on already-running loop; dispose it
-                # cleanly to avoid "coroutine was never awaited" warnings.
-                coro_or_value.close()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                # Cannot run coroutine on an already-running loop.
+                # Dispose it cleanly to avoid "coroutine was never awaited" warnings.
+                try:
+                    coro_or_value.close()
+                except RuntimeError:
+                    # Already completed or closed
+                    pass
                 return None
-            return loop.run_until_complete(coro_or_value)
+            # No running loop — safe to create one and run it
+            loop = asyncio.new_event_loop()
+            try:
+                return asyncio.run_coroutine_threadsafe(coro_or_value, loop).result(timeout=10)
+            finally:
+                loop.close()
         except RuntimeError:
+            # Fallback: create our own loop
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(coro_or_value)
             finally:
+                try:
+                    coro_or_value.close()
+                except (RuntimeError, AttributeError):
+                    pass
                 loop.close()
     return coro_or_value
 
@@ -118,7 +133,7 @@ def _language_to_multilspy_enum(lang: str) -> Any:
     mapping = {
         "python": _Language.PYTHON,
         "typescript": _Language.TYPESCRIPT,
-        "javascript": __Language.JAVASCRIPT,
+        "javascript": _Language.JAVASCRIPT,
         "java": _Language.JAVA,
         "rust": _Language.RUST,
         "go": _Language.GO,

@@ -83,7 +83,8 @@ def _apply_diff(original: str, diff: str) -> str:
             if not body.endswith("\n"):
                 body += "\n"
             if prefix == " ":
-                old_part.append(body); new_part.append(body)
+                old_part.append(body)
+                new_part.append(body)
             elif prefix == "-":
                 old_part.append(body)
             elif prefix == "+":
@@ -93,7 +94,7 @@ def _apply_diff(original: str, diff: str) -> str:
         actual = result[target: target + len(old_part)]
 
         def _norm(ls: list[str]) -> list[str]:
-            return [l.rstrip() for l in ls]
+            return [ln.rstrip() for ln in ls]
 
         if _norm(actual) != _norm(old_part):
             raise ValueError(
@@ -157,9 +158,12 @@ def _format_search_results(query: str, results: list, source: str = "") -> str:
         body  = r.get("body") or r.get("snippet") or r.get("description") or ""
         date  = r.get("date") or r.get("published") or ""
         lines.append(f"{i}. {title}")
-        if url:  lines.append(f"   URL: {url}")
-        if date: lines.append(f"   Date: {date}")
-        if body: lines.append(f"   {body[:300]}")
+        if url:
+            lines.append(f"   URL: {url}")
+        if date:
+            lines.append(f"   Date: {date}")
+        if body:
+            lines.append(f"   {body[:300]}")
         lines.append("")
     return "\n".join(lines)
 
@@ -614,7 +618,8 @@ def do_describe_image(url: str, llm_client=None, llm_model: str = "") -> str:
     Download an image and describe it via vision API (if client provided),
     with PIL metadata as fallback.
     """
-    import base64, io
+    import base64
+    import io
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
         with urllib.request.urlopen(req, timeout=15) as r:
