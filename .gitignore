@@ -1,0 +1,28 @@
+# Runtime data — never commit
+sessions/
+backups/
+exports/
+project_indices/
+.clawteam/
+intelligence/
+
+# Sensitive files
+browser_cookies.json
+memory.md
+input_history.txt
+pt_history.txt
+handoff.json
+qwen.log
+
+# Config may contain API keys
+config.toml
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Model weights (large binaries)
+models/
+*.gguf

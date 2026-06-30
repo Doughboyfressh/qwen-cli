@@ -1,0 +1,6 @@
+# Development / test dependencies (not needed to run qwen-cli itself).
+#   pip install -r requirements-dev.txt
+#   pytest
+-r requirements.txt
+pytest
+ruff
