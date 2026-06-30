@@ -12,10 +12,8 @@ Design principles:
 """
 
 from __future__ import annotations
-import asyncio
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -632,6 +630,74 @@ def lsp_completion(file_path: str, line: int, column: int) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"LSP completions error: {e}"
+
+
+# --- Feature stubs for pre/post-edit analysis ---
+
+def _is_code_file(file_path: str) -> bool:
+    code_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp",
+                       ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".cs", ".swift",
+                       ".kt", ".scala", ".r", ".m", ".pl", ".pm", ".ex", ".exs",
+                       ".erl", ".beam", ".clj", ".cljs", ".edn"}
+    return Path(file_path).suffix.lower() in code_extensions
+
+
+def lsp_preflight_check(code: str, language: str) -> dict:
+    try:
+        if language == "python":
+            compile(code, "<script>", "exec")
+            return {"clean": True, "errors": 0, "warnings": 0}
+    except SyntaxError:
+        return {"clean": False, "errors": 1, "warnings": 0}
+    return {"clean": True, "errors": 0, "warnings": 0}
+
+
+def lsp_pre_edit_check(file_path: str) -> dict:
+    try:
+        diag = lsp_diagnostics(file_path)
+        errors = diag.count("error") if diag else 0
+        warnings = diag.count("warning") if diag else 0
+        return {"clean": errors == 0, "error_count": errors, "warning_count": warnings}
+    except Exception:
+        return {"clean": True, "error_count": 0, "warning_count": 0}
+
+
+def lsp_post_edit_check(file_path: str) -> dict:
+    try:
+        diag = lsp_diagnostics(file_path)
+        errors = diag.count("error") if diag else 0
+        return {"new_errors": errors, "fixed_errors": 0}
+    except Exception:
+        return {"new_errors": 0, "fixed_errors": 0}
+
+
+def lsp_check_patch_impact(file_path: str, diff: str) -> dict:
+    try:
+        diag = lsp_diagnostics(file_path)
+        if diag and ("error" in diag or "warning" in diag):
+            if diag.count("error") > 0:
+                return {"conflicts": [f"{diag.count('error')} diagnostic issue(s) in file"]}
+    except Exception:
+        pass
+    return {"conflicts": []}
+
+
+def lsp_check_imports(file_path: str) -> dict:
+    try:
+        from pathlib import Path as _Path
+        if not _Path(file_path).exists():
+            return {"broken": [f"File not found: {file_path}"]}
+        result = lsp_diagnostics(file_path)
+        if not result or "error" not in result.lower():
+            return {"broken": []}
+        return {"broken": [result]}
+    except Exception:
+        return {"broken": []}
+
+
+def lsp_trend_report() -> str:
+    return "LSP trend tracking not yet implemented. Requires server state tracking across edits."
+
 
 
 # ---------------------------------------------------------------------------

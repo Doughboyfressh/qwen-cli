@@ -6864,8 +6864,6 @@ def _cmd_stats(ctx: _ReplContext, arg: str) -> None:
 
 def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
     """Clean up stale teams, backups, and completed tasks."""
-    import glob as _glob
-    from datetime import datetime, timedelta
 
     sub = arg.strip().lower() if arg else "all"
     dry_run = sub == "dry-run"
@@ -6874,7 +6872,6 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
         what = "all"
 
     removed = 0
-    age_label = ""
 
     # --- Teams ---
     if what in ("teams", "all"):
@@ -6882,7 +6879,6 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
         if ct_dir.is_dir():
             now_ts = time.time()
             max_age = 7 * 86400  # 7 days
-            age_label = "7d"
             for team_dir in sorted(ct_dir.iterdir()):
                 if not team_dir.is_dir():
                     continue
