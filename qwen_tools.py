@@ -39,6 +39,8 @@ BACKUPS_DIR: Path  = _DATA_DIR_DEFAULT / "backups"
 # ---------------------------------------------------------------------------
 
 def _resolve(path: str) -> Path:
+    """Resolve a relative or absolute path string to a Path object."""
+
     p = Path(path).expanduser()
     return p.resolve(strict=False) if p.is_absolute() else (Path.cwd() / p).resolve(strict=False)
 
@@ -94,6 +96,8 @@ def _apply_diff(original: str, diff: str) -> str:
         actual = result[target: target + len(old_part)]
 
         def _norm(ls: list[str]) -> list[str]:
+            """Normalize a search result score to a 0-1 range."""
+
             return [ln.rstrip() for ln in ls]
 
         if _norm(actual) != _norm(old_part):
@@ -110,6 +114,8 @@ def _apply_diff(original: str, diff: str) -> str:
 
 
 def _backup_file(p: Path) -> None:
+    """Create a timestamped backup of a file before editing it."""
+
     stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -125,6 +131,8 @@ _FETCH_CACHE_TTL = 300  # 5 minutes
 
 
 def _cache_get(url: str) -> str | None:
+    """Retrieve a cached search result by key, if it exists and is not expired."""
+
     entry = _FETCH_CACHE.get(url)
     if entry and (time.time() - entry[0]) < _FETCH_CACHE_TTL:
         return entry[1]
@@ -132,6 +140,8 @@ def _cache_get(url: str) -> str | None:
 
 
 def _cache_set(url: str, content: str) -> None:
+    """Store a search result in the cache with an expiration time."""
+
     _FETCH_CACHE[url] = (time.time(), content)
     if len(_FETCH_CACHE) > 60:
         oldest = min(_FETCH_CACHE, key=lambda k: _FETCH_CACHE[k][0])
@@ -150,6 +160,8 @@ _BROWSER_UA = (
 
 
 def _format_search_results(query: str, results: list, source: str = "") -> str:
+    """Format raw search engine results into a readable Markdown string."""
+
     tag   = f" (via {source})" if source else ""
     lines = [f'Web search results{tag} for: "{query}"\n']
     for i, r in enumerate(results, 1):
@@ -197,6 +209,8 @@ def _merge_results(
 
 
 def _search_google(query: str, max_results: int) -> list[dict]:
+    """Perform a web search using the Google Custom Search API."""
+
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
         return []
     q   = urllib.parse.quote_plus(query)
@@ -213,6 +227,8 @@ def _search_google(query: str, max_results: int) -> list[dict]:
 
 
 def _search_brave(query: str, max_results: int) -> list[dict]:
+    """Perform a web search using the Brave Search API."""
+
     if not BRAVE_API_KEY:
         return []
     q   = urllib.parse.quote_plus(query)
@@ -232,6 +248,8 @@ def _search_brave(query: str, max_results: int) -> list[dict]:
 
 
 def _search_brave_news(query: str, max_results: int) -> list[dict]:
+    """Perform a news-specific search using the Brave Search API."""
+
     if not BRAVE_API_KEY:
         return []
     q   = urllib.parse.quote_plus(query)
@@ -251,6 +269,8 @@ def _search_brave_news(query: str, max_results: int) -> list[dict]:
 
 
 def _search_ddg(query: str, max_results: int) -> list[dict]:
+    """Perform a web search via DuckDuckGo HTML scraping."""
+
     try:
         from ddgs import DDGS
     except ImportError:
@@ -260,6 +280,8 @@ def _search_ddg(query: str, max_results: int) -> list[dict]:
 
 
 def _search_ddg_news(query: str, max_results: int) -> list[dict]:
+    """Perform a news search via DuckDuckGo HTML scraping."""
+
     try:
         try:
             from ddgs import DDGS
@@ -276,6 +298,8 @@ def _search_ddg_news(query: str, max_results: int) -> list[dict]:
 
 
 def _search_bing_scrape(query: str, max_results: int) -> list[dict]:
+    """Perform a web search via Bing HTML scraping."""
+
     url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}&count={max_results}"
     req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
     with urllib.request.urlopen(req, timeout=12) as resp:
@@ -498,6 +522,8 @@ _FETCH_HEADERS = {
 
 
 def _decompress(raw: bytes, encoding: str) -> bytes:
+    """Decompress gzip or bz2 encoded response content."""
+
     enc = encoding.lower()
     if "gzip" in enc:
         try:
@@ -529,6 +555,8 @@ def _smart_truncate(text: str, limit: int) -> str:
 
 
 def _pdf_to_text(data: bytes, max_chars: int) -> str:
+    """Extract text content from a PDF file using PyPDF2."""
+
     try:
         import io
         from pypdf import PdfReader
@@ -542,7 +570,12 @@ def _pdf_to_text(data: bytes, max_chars: int) -> str:
         return f"[PDF extraction error: {e}]"
 
 
-def do_fetch_url(url: str, max_chars: int = 20_000) -> str:
+def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
+    """Fetch the raw text content of a URL.
+    
+    Handles redirects, compression, PDF extraction, and HTML-to-text conversion.
+    Falls back to a JS-rendered fetch if plain HTTP returns empty content.
+    """
     cached = _cache_get(url)
     if cached:
         return f"[cached] {cached}"

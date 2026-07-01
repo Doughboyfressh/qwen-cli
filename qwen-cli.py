@@ -49,7 +49,7 @@ try:
     _h = _logging_handlers.RotatingFileHandler(str(Path.home() / ".qwen-cli" / "qwen.log"), maxBytes=1_048_576, backupCount=3, encoding="utf-8")
     _logger.handlers = [_h]
 except Exception:
-    pass
+    _logger.handlers = []  # logging unavailable, continue without file logging
 
 # ---------------------------------------------------------------------------
 # Config
@@ -278,6 +278,8 @@ _INTEL_INJECT_N = 6        # recent feed entries injected into system prompt
 _INTEL_CRAWLERS = 3        # number of parallel background browser threads
 
 def _intel_default_topics() -> list[dict]:
+    """Return the default set of topics for the Live Intelligence background crawlers."""
+
     year = datetime.now().year
     return [
         {"name": "AI & LLM news",           "query": "latest AI LLM model releases news today",          "last_checked": 0},
@@ -1464,7 +1466,7 @@ def load_memory() -> str:
     """Load Memory"""
     return MEMORY_FILE.read_text(encoding="utf-8").strip() if MEMORY_FILE.exists() else ""
 
-def save_memory(text: str):
+def save_memory(text: str) -> None:
     """Save Memory"""
     MEMORY_FILE.write_text(text, encoding="utf-8")
 
@@ -1894,7 +1896,7 @@ def _setup_tab_completion() -> None:
         _rl.set_completer_delims(" \t\n")
         _rl.parse_and_bind("tab: complete")
     except Exception:
-        pass
+        _logger.debug("Failed to set up readline tab completion: %s", _sys.exc_info()[1])
 
 # ---------------------------------------------------------------------------
 # Web search — multi-engine chain: Google CSE → Brave → DDG → Bing scrape
@@ -1925,7 +1927,7 @@ def _session_meta(path: Path) -> dict:
     except Exception:
         return {"topic": "", "turns": 0, "saved_at": ""}
 
-def save_session(history: list, system_prompt: str, name: str | None = None):
+def save_session(history: list, system_prompt: str, name: str | None = None) -> None:
     """Save Session"""
     user_msgs = [m for m in history if m.get("role") == "user"
                  and not (m.get("content") or "").startswith("# Project Context")]
@@ -1956,7 +1958,7 @@ def _silent_autosave(history: list, system_prompt: str) -> None:
         }
         AUTOSAVE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        pass
+        _logger.exception("Autosave failed — session data may be lost on crash")
 
 
 HANDOFF_PROMPT_TEMPLATE = """You are resuming a session that ran out of context window. Here is what happened:
@@ -1966,7 +1968,7 @@ HANDOFF_PROMPT_TEMPLATE = """You are resuming a session that ran out of context 
 Use this context to pick up where you left off. Do NOT ask the user to repeat themselves. Check memory.md for additional persistent facts."""
 
 
-def _generate_handoff(client, history, base_system):
+def _generate_handoff(client, history, base_system) -> str:
     """Generate a compact handoff summary for session resumption."""
     try:
         chat = [m for m in history if m.get("role") in ("user", "assistant")]
@@ -1991,7 +1993,7 @@ def _generate_handoff(client, history, base_system):
         return f"(handoff summary failed: {e})"
 
 
-def _write_handoff(summary, history):
+def _write_handoff(summary, history) -> None:
     """Write a handoff file for the next session to pick up."""
     try:
         chat = [m for m in history if m.get("role") in ("user", "assistant")]
@@ -2008,10 +2010,10 @@ def _write_handoff(summary, history):
         }
         HANDOFF_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        pass
+        _logger.exception("Overflow handoff write failed — session resumption may be degraded")
 
 
-def _save_exit_handoff(history):
+def _save_exit_handoff(history) -> None:
     """Save a lightweight handoff on normal exit so next session has context."""
     try:
         chat = [m for m in history if m.get("role") in ("user", "assistant")]
@@ -2035,10 +2037,10 @@ def _save_exit_handoff(history):
         }
         HANDOFF_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        pass
+        _logger.exception("Exit handoff write failed — next session will lack context")
 
 
-def _consume_handoff():
+def _consume_handoff() -> dict | None:
     """Read and remove the handoff file. Returns dict or None."""
     try:
         if not HANDOFF_FILE.exists():
@@ -2367,7 +2369,7 @@ def cmd_autosearch(arg: str) -> None:
         CONFIG_FILE.write_text(text, encoding="utf-8")
         console.print("[dim]Saved to config.toml — persists across sessions[/dim]")
     except Exception:
-        pass
+        _logger.exception("Failed to persist auto_search setting to config.toml")
 
 
 def cmd_preset(arg: str) -> None:
@@ -2726,7 +2728,7 @@ def build_project_tree(root: Path, max_depth: int = 3, max_files: int = 200) -> 
     lines: list[str] = []
     count = [0]
 
-    def walk(path: Path, depth: int, prefix: str):
+    def walk(path: Path, depth: int, prefix: str) -> None:
         """Walk"""
         if count[0] >= max_files:
             return
@@ -2782,7 +2784,7 @@ def load_project_context(arg: str, history: list) -> bool:
         f"{f', {len(key_sections)} key file(s)' if key_sections else ''}][/green]"
     )
     # Build or load symbol index in background
-    def _bg_index():
+    def _bg_index() -> None:
         """Internal helper: bg index."""
         idx = _load_symbol_index(root)
         if idx is None:
@@ -3215,7 +3217,7 @@ def _browser_save_cookies(page) -> None:
         pass
 
 
-def _get_page():
+def _get_page() -> Any:
     """Internal helper: get page."""
     if "page" not in _browser_state or _browser_state.get("closed"):
         try:
@@ -3262,7 +3264,7 @@ def _get_page():
             color_scheme="light",
         )
         # Proxy from config (optional)
-        _cfg_data = _cfg()
+        _cfg_data = _CFG
         _proxy_url = _cfg_data.get("browser_proxy", "")
         if _proxy_url:
             console.print(f"[dim]  [browser] using proxy: {_proxy_url}[/dim]")
@@ -3273,7 +3275,7 @@ def _get_page():
     return _browser_state["page"]
 
 
-def _browser_resolve_selector(page, selector: str):
+def _browser_resolve_selector(page, selector: str) -> Any:
     """Internal helper: browser resolve selector."""
     if selector.startswith("label:"):
         return page.get_by_label(selector[6:])
@@ -3527,7 +3529,7 @@ def do_browser_action(action: str, url: str = "", selector: str = "",
         return f"[browser error: {e}]"
 
 
-def _get_render_page():
+def _get_render_page() -> Any:
     """Get (or create) the dedicated headless Playwright page used by fetch_rendered."""
     if "page" not in _render_state or _render_state.get("closed"):
         try:
@@ -3698,7 +3700,7 @@ def do_run_command(command: str, cwd: str = "", timeout: int = 30,
             except BrokenPipeError:
                 pass
 
-        def _pipe(stream, buf: list[str], style: str):
+        def _pipe(stream, buf: list[str], style: str) -> None:
             """Internal helper: pipe."""
             for line in stream:
                 if cancelled.is_set():
@@ -4027,7 +4029,9 @@ def do_search_files(path: str, query: str, pattern: str = "**/*", context: int =
         import fnmatch as _fnmatch
         _name_pat = pattern.rstrip("/").split("/")[-1] if pattern else "*"
 
-        def _walk_files(root: Path):
+        def _walk_files(root: Path) -> Iterator[Path]:
+            """Recursively walk a directory, yielding file paths matching a name pattern."""
+
             if root.is_file():
                 yield root
                 return
@@ -4267,7 +4271,7 @@ def _make_pt_session() -> None:
         return
 
     class _Completer(_PtCompleter):
-        def get_completions(self, document, complete_event):
+        def get_completions(self, document, complete_event) -> Iterator[_PtCompletion]:
             """Get Completions"""
             text = document.text_before_cursor
             word = (text.split()[-1] if text.split() else text)
@@ -4302,7 +4306,7 @@ def _make_pt_session() -> None:
     )
 
 
-def _close_loitering_event_loop():
+def _close_loitering_event_loop() -> None:
     """Close a running event loop left behind by async HTTP clients (Python 3.14 issue)."""
     try:
         loop = asyncio.get_running_loop()
@@ -4348,7 +4352,7 @@ def _read_input_in_thread() -> str:
     """Read input in a sub-thread to avoid asyncio event loop conflicts."""
     result = []
     error = []
-    def _prompt_thread():
+    def _prompt_thread() -> None:
         """Internal helper: prompt thread."""
         try:
             result.append(_read_input_inline())
@@ -4387,7 +4391,7 @@ def read_input() -> str:
 _LIVE_PREVIEW_LINES  = 18
 _stream_usage_supported = True   # flipped to False if server rejects stream_options
 
-def _live_updater(live: Live, max_lines: int = _LIVE_PREVIEW_LINES):
+def _live_updater(live: Live, max_lines: int = _LIVE_PREVIEW_LINES) -> Callable[[str], None]:
     """Internal helper: live updater."""
     def update(text: str):
         """Update"""
@@ -4400,7 +4404,7 @@ def _live_updater(live: Live, max_lines: int = _LIVE_PREVIEW_LINES):
         live.update(Markdown(preview))
     return update
 
-def _create_with_retry(client: OpenAI, **kwargs):
+def _create_with_retry(client: OpenAI, **kwargs) -> Any:
     """Create a chat completion with exponential back-off on connection errors."""
     global _stream_usage_supported
 
@@ -5385,7 +5389,9 @@ def _call_with_timeout(name: str, fn, *args, timeout: int, **kwargs) -> str:
     result_holder = []
     error_holder = []
 
-    def _target():
+    def _target() -> None:
+        """Thread target function: call fn(*args, **kwargs) and store the result or exception."""
+
         try:
             result_holder.append(fn(*args, **kwargs))
         except Exception as e:
@@ -6208,7 +6214,9 @@ class _ReplContext:
     Encapsulates history, base_system, and client so command handlers
     don't need to access globals directly.
     """
-    def __init__(self, history: list[dict], base_system: str, client):
+    def __init__(self, history: list[dict], base_system: str, client) -> None:
+        """Initialize REPL context with shared history, system prompt, and client reference."""
+
         self.history = history
         self.base_system = base_system
         self.client = client
@@ -6327,6 +6335,8 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str,
 
 
 def _cmd_exit(ctx: _ReplContext, arg: str) -> None:
+    """Save the current session and exit the REPL loop."""
+
     if ctx.history:
         save_session(ctx.history, ctx.base_system)
     console.print("[dim]Bye.[/dim]")
@@ -6334,6 +6344,8 @@ def _cmd_exit(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_help(ctx: _ReplContext, arg: str) -> None:
+    """Display available commands, or search the help text for a keyword."""
+
     if arg:
         q = arg.lower()
         rows = []
@@ -6354,6 +6366,8 @@ def _cmd_help(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_clear(ctx: _ReplContext, arg: str) -> None:
+    """Clear the conversation history, optionally dropping only the last N turns."""
+
     if arg.isdigit():
         n = int(arg)
         drop = min(n * 2, len(ctx.history))
@@ -6365,6 +6379,8 @@ def _cmd_clear(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_retry(ctx: _ReplContext, arg: str) -> None:
+    """Remove the last assistant reply and re-run the last user input."""
+
     global _last_user_input, _turn_count
     if not _last_user_input:
         console.print("[yellow][nothing to retry][/yellow]")
@@ -6379,6 +6395,8 @@ def _cmd_retry(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_run(ctx: _ReplContext, arg: str) -> None:
+    """Execute a shell command, with a safety prompt for dangerous commands."""
+
     if not arg:
         console.print("[yellow][usage: /run <command>][/yellow]")
         return
@@ -6392,6 +6410,8 @@ def _cmd_run(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_edit(ctx: _ReplContext, arg: str) -> None:
+    """Open a file in the default editor ($EDITOR).""" 
+
     if not arg:
         console.print("[yellow][usage: /edit <file>][/yellow]")
         return
@@ -6407,6 +6427,8 @@ def _cmd_edit(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_system(ctx: _ReplContext, arg: str) -> None:
+    """Display or replace the system prompt; clears history when changed."""
+
     if not arg:
         console.print(f"[dim]{ctx.base_system}[/dim]")
     else:
@@ -6416,6 +6438,8 @@ def _cmd_system(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_file(ctx: _ReplContext, arg: str) -> None:
+    """Load the contents of a file into the conversation context."""
+
     if not arg:
         console.print("[yellow][usage: /file <path>][/yellow]")
     else:
@@ -6423,22 +6447,32 @@ def _cmd_file(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_project(ctx: _ReplContext, arg: str) -> None:
+    """Load project context (project_system.md, git status, file tree) into the conversation."""
+
     load_project_context(arg, ctx.history)
 
 
 def _cmd_focus(ctx: _ReplContext, arg: str) -> None:
+    """Narrow project context to a specific subdirectory or file pattern."""
+
     cmd_focus(arg, ctx.history)
 
 
 def _cmd_changes(ctx: _ReplContext, arg: str) -> None:
+    """Show recent file changes in the current project (via git diff or filesystem).""" 
+
     cmd_changes(arg)
 
 
 def _cmd_search_sessions(ctx: _ReplContext, arg: str) -> None:
+    """Search saved session files for matching text."""
+
     cmd_search_sessions(arg)
 
 
 def _cmd_undo(ctx: _ReplContext, arg: str) -> None:
+    """Restore the most recently backed-up file from the undo stack."""
+
     global _backup_stack
     if not _backup_stack:
         console.print("[yellow][no backup available][/yellow]")
@@ -6454,18 +6488,26 @@ def _cmd_undo(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_export(ctx: _ReplContext, arg: str) -> None:
+    """Export the current session to a Markdown file."""
+
     export_session(ctx.history, arg)
 
 
 def _cmd_copy(ctx: _ReplContext, arg: str) -> None:
+    """Copy the last assistant message to the clipboard."""
+
     cmd_copy(ctx.history)
 
 
 def _cmd_paste(ctx: _ReplContext, arg: str) -> None:
+    """Read text from the clipboard and append it to the conversation history."""
+
     cmd_paste(ctx.history)
 
 
 def _cmd_remember(ctx: _ReplContext, arg: str) -> None:
+    """Append a fact to persistent memory (memory.md).""" 
+
     if not arg:
         console.print("[yellow][usage: /remember <fact>][/yellow]")
     else:
@@ -6476,11 +6518,15 @@ def _cmd_remember(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_memory(ctx: _ReplContext, arg: str) -> None:
+    """Display the current persistent memory contents."""
+
     mem = load_memory()
     console.print(Markdown(mem) if mem else "[dim][memory is empty][/dim]")
 
 
 def _cmd_forget(ctx: _ReplContext, arg: str) -> None:
+    """Clear all persistent memory after user confirmation."""
+
     try:
         confirm = console.input("[red]Clear ALL persistent memory? [y/N]: [/red]").strip().lower()
     except (KeyboardInterrupt, EOFError):
@@ -6494,6 +6540,8 @@ def _cmd_forget(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_pin(ctx: _ReplContext, arg: str) -> None:
+    """Manage pinned items: list, add, or remove pins that persist across sessions."""
+
     pins = load_pins()
     if not arg or arg == "list":
         if not pins:
@@ -6516,6 +6564,8 @@ def _cmd_pin(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_branch(ctx: _ReplContext, arg: str) -> None:
+    """Manage conversation branches: list, save current state, or restore a saved branch."""
+
     global _branches
     sub_parts = arg.split(None, 1)
     sub = sub_parts[0] if sub_parts else ""
@@ -6545,6 +6595,8 @@ def _cmd_branch(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_search(ctx: _ReplContext, arg: str) -> None:
+    """Perform a web search and feed the results into the model for a response."""
+
     global _turn_count
     if not arg:
         console.print("[yellow][usage: /search <query>][/yellow]")
@@ -6557,27 +6609,39 @@ def _cmd_search(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_save(ctx: _ReplContext, arg: str) -> None:
+    """Save the current session to a JSON file."""
+
     save_session(ctx.history, ctx.base_system, arg or None)
 
 
 def _cmd_load(ctx: _ReplContext, arg: str) -> None:
+    """Load a previously saved session into the current context."""
+
     result = cmd_load_session(arg, ctx.history, ctx.base_system)
     ctx.history, ctx.base_system = result
 
 
 def _cmd_sessions(ctx: _ReplContext, arg: str) -> None:
+    """List all saved sessions."""
+
     list_sessions()
 
 
 def _cmd_context(ctx: _ReplContext, arg: str) -> None:
+    """Show a token-count breakdown of the current context (system prompt + history).""" 
+
     show_context_breakdown(ctx.base_system, ctx.history)
 
 
 def _cmd_trim(ctx: _ReplContext, arg: str) -> None:
+    """Trim the conversation history using importance-aware truncation."""
+
     ctx.history = cmd_trim(ctx.history, ctx.client)
 
 
 def _cmd_mode(ctx: _ReplContext, arg: str) -> None:
+    """Set or clear an operational mode (e.g., coding, writing, analysis).""" 
+
     global _current_mode
     if not arg:
         modes_list = " / ".join(_MODE_PROMPTS.keys())
@@ -6596,6 +6660,8 @@ def _cmd_mode(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_model(ctx: _ReplContext, arg: str) -> None:
+    """Display the current model, list available models, or switch to a different model."""
+
     global MODEL
     if not arg:
         console.print(f"[dim][model: {MODEL}][/dim]")
@@ -6612,10 +6678,14 @@ def _cmd_model(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_index(ctx: _ReplContext, arg: str) -> None:
+    """Build or rebuild the project file index for faster searching."""
+
     cmd_index(Path.cwd(), force=(arg.lower() == "force"))
 
 
 def _cmd_task(ctx: _ReplContext, arg: str) -> None:
+    """Create a multi-step task plan using the LLM and execute it step by step."""
+
     if not arg:
         console.print("[yellow][usage: /task <goal>][/yellow]")
     else:
@@ -6623,6 +6693,8 @@ def _cmd_task(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_agent(ctx: _ReplContext, arg: str) -> None:
+    """Spawn a sub-agent to autonomously execute a goal."""
+
     if not arg:
         console.print("[yellow][usage: /agent <goal>][/yellow]")
     else:
@@ -6630,6 +6702,8 @@ def _cmd_agent(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_git(ctx: _ReplContext, arg: str) -> None:
+    """Handle git subcommands: commit and PR creation."""
+
     sub_parts = arg.split(None, 1)
     sub = sub_parts[0].lower() if sub_parts else ""
     sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
@@ -6648,7 +6722,9 @@ def _cmd_lsp(ctx: _ReplContext, arg: str) -> None:
     sub = parts[0].lower() if parts else ""
     sub_args = parts[1:] if len(parts) > 1 else []
 
-    def _ensure_lsp():
+    def _ensure_lsp() -> None:
+        """Ensure the lsp_client module is imported and available."""
+
         global _lsp_client_mod
         if _lsp_client_mod is None:
             import lsp_client as _mod
@@ -6693,6 +6769,8 @@ def _cmd_lsp(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_watch(ctx: _ReplContext, arg: str) -> None:
+    """Watch files for changes; list watched files, stop watching, or add a file."""
+
     global _watch_thread
     if not arg or arg == "list":
         if _watched_files:
@@ -6725,38 +6803,56 @@ def _cmd_watch(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_preset(ctx: _ReplContext, arg: str) -> None:
+    """Apply a conversation preset (predefined system prompt template).""" 
+
     cmd_preset(arg)
 
 
 def _cmd_params(ctx: _ReplContext, arg: str) -> None:
+    """Display or modify model parameters (temperature, top_p, etc.).""" 
+
     cmd_params(arg)
 
 
 def _cmd_long(ctx: _ReplContext, arg: str) -> None:
+    """Toggle long mode for extended, detailed responses."""
+
     cmd_long(arg)
 
 
 def _cmd_autosearch(ctx: _ReplContext, arg: str) -> None:
+    """Toggle automatic web search before answering questions."""
+
     cmd_autosearch(arg)
 
 
 def _cmd_rollback(ctx: _ReplContext, arg: str) -> None:
+    """Rollback to a previous version of a modified file."""
+
     cmd_rollback()
 
 
 def _cmd_review(ctx: _ReplContext, arg: str) -> None:
+    """Ask the LLM to review code or text in the conversation."""
+
     cmd_review(arg, ctx.history, ctx.base_system, ctx.client)
 
 
 def _cmd_error(ctx: _ReplContext, arg: str) -> None:
+    """Diagnose and explain the last error that occurred."""
+
     cmd_error(ctx.history, ctx.base_system, ctx.client)
 
 
 def _cmd_config(ctx: _ReplContext, arg: str) -> None:
+    """Display the current configuration settings."""
+
     show_config()
 
 
 def _cmd_team(ctx: _ReplContext, arg: str) -> None:
+    """Manage teams: create, list, show board, or join a team."""
+
     sub_parts = arg.split(None, 2)
     sub = sub_parts[0].lower() if sub_parts else "list"
     sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
@@ -6793,6 +6889,8 @@ def _cmd_team(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_spawn(ctx: _ReplContext, arg: str) -> None:
+    """Spawn a sub-agent on a team to execute a task autonomously."""
+
     spawn_parts = arg.split(None, 2)
     if len(spawn_parts) < 3:
         console.print("[yellow][usage: /spawn <team> <agent_name> <task>][/yellow]")
@@ -6803,6 +6901,8 @@ def _cmd_spawn(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_inbox(ctx: _ReplContext, arg: str) -> None:
+    """Read or send messages in a team inbox."""
+
     inbox_parts = arg.split(None, 3)
     sub = inbox_parts[0].lower() if inbox_parts else ""
     if sub == "send":
@@ -6830,6 +6930,8 @@ def _cmd_inbox(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_board(ctx: _ReplContext, arg: str) -> None:
+    """Display the task board for a team (or all teams).""" 
+
     if not arg:
         teams = _ct_team_list()
         if not teams:
@@ -6843,10 +6945,14 @@ def _cmd_board(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_history(ctx: _ReplContext, arg: str) -> None:
+    """Search or display the conversation history."""
+
     cmd_history(arg, ctx.history)
 
 
 def _cmd_note(ctx: _ReplContext, arg: str) -> None:
+    """Add a timestamped note to the conversation or a task."""
+
     if not arg:
         console.print("[yellow][usage: /note <text>][/yellow]")
     else:
@@ -6855,10 +6961,14 @@ def _cmd_note(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_compact(ctx: _ReplContext, arg: str) -> None:
+    """Manually trigger context compaction to reduce token usage."""
+
     ctx.history = cmd_trim(ctx.history, ctx.client)
 
 
 def _cmd_stats(ctx: _ReplContext, arg: str) -> None:
+    """Display session statistics: token counts, turn count, timing."""
+
     cmd_stats(ctx.history)
 
 
@@ -6962,6 +7072,8 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
+    """Manage Live Intelligence: toggle crawlers, add/remove topics, view feed."""
+
     global _intel_enabled
     sub = arg.strip().lower() if arg else ""
     if sub == "off":
@@ -7016,6 +7128,8 @@ def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_cd(ctx: _ReplContext, arg: str) -> None:
+    """Change the working directory; display current directory if no argument given."""
+
     if not arg:
         console.print(f"[dim][cwd: {Path.cwd()}][/dim]")
     else:
@@ -7032,6 +7146,8 @@ def _cmd_cd(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_unknown(ctx: _ReplContext, directive: str) -> None:
+    """Handle unknown commands by printing an error and suggesting /help."""
+
     console.print(f"[yellow][unknown command: {directive} — try /help][/yellow]")
 
 
@@ -7116,7 +7232,7 @@ def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
 # Main Entry Point
 # ==============================================================================
 
-def main():
+def main() -> None:
     """Main entry point for qwen-cli.
 
     Initializes the client, prints the welcome banner, and enters the REPL loop.
@@ -7250,7 +7366,7 @@ def _print_turn_footer(elapsed: float) -> None:
 
 
 # Cleanup watch thread on exit
-def _cleanup_watch():
+def _cleanup_watch() -> None:
     """Internal helper: cleanup watch."""
     global _watch_thread
     _watch_stop.set()

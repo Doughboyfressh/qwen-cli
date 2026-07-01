@@ -22,7 +22,14 @@ config.toml
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 
 # Model weights (large binaries)
 models/
 *.gguf
+
+# Test artifacts
+.coverage
+
+# Stray OS files
+~/*/
