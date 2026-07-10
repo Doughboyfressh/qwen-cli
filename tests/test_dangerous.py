@@ -4,6 +4,7 @@ This is the security-sensitive gate that decides whether the CLI prompts the
 user before running a shell command the model proposed. Regressions here are
 silent and dangerous, so it gets the most thorough coverage.
 """
+
 import pytest
 
 # Commands that MUST be flagged (CLI prompts "Run anyway?" before running).
@@ -17,7 +18,7 @@ DANGEROUS = [
     "del /f /s /q C:\\data",
     "rmdir /s /q C:\\foo",
     "rd /s C:\\foo",
-    "Remove-Item -Recurse -Force C:\\stuff",   # PowerShell — primary shell here
+    "Remove-Item -Recurse -Force C:\\stuff",  # PowerShell — primary shell here
     "ri -Recurse C:\\stuff",
     "format c:",
     "git reset --hard",
@@ -37,16 +38,16 @@ DANGEROUS = [
 SAFE = [
     "del notes.txt",
     "rmdir emptydir",
-    "remove-item notes.txt",      # no -Recurse
+    "remove-item notes.txt",  # no -Recurse
     "ls -la",
     "git status",
     "git diff",
     "echo hello",
     "python script.py",
     "npm run build",
-    "format-table",               # PowerShell cmdlet, not disk format
+    "format-table",  # PowerShell cmdlet, not disk format
     "cat del.txt",
-    "rm file.txt",                # single-file rm, no -r
+    "rm file.txt",  # single-file rm, no -r
 ]
 
 

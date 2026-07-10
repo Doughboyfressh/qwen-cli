@@ -1,5 +1,4 @@
-"""
-LSP client wrapper using multilspy.
+"""LSP client wrapper using multilspy.
 
 Provides a lazy-starting, auto-shutting-down language server for diagnostics,
 definition lookup, references, hover, symbols, and rename.
@@ -12,13 +11,15 @@ Design principles:
 """
 
 from __future__ import annotations
+
+import contextlib
+import logging
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any
 
-if TYPE_CHECKING:
-    pass
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lazy import — multilspy may not be installed
@@ -32,7 +33,8 @@ _SyncLanguageServer: Any = None
 
 try:
     from multilspy import SyncLanguageServer as _SyncLanguageServer
-    from multilspy.multilspy_config import MultilspyConfig as _MultilspyConfig, Language as _Language
+    from multilspy.multilspy_config import Language as _Language
+    from multilspy.multilspy_config import MultilspyConfig as _MultilspyConfig
     from multilspy.multilspy_logger import MultilspyLogger as _MultilspyLogger
 
     # Patch multilspy's _sync_call: when called from a thread with a running
@@ -44,6 +46,7 @@ try:
 
     def _multilspy_patched_sync_call(self, coro):
         import asyncio
+
         server_loop = getattr(self, "loop", None)
         if server_loop is not None and not server_loop.is_closed():
             return asyncio.run_coroutine_threadsafe(coro, server_loop).result()
@@ -53,18 +56,18 @@ try:
 
     _multilspy_available = True
 except ImportError:
-    pass
+    _logger.debug("multilspy not installed; LSP features disabled")
 # ---------------------------------------------------------------------------
 
 # Globals
 # ---------------------------------------------------------------------------
 
-_LSP_SERVER: Optional[Any] = None
+_LSP_SERVER: Any | None = None
 _LSP_LOCK = threading.Lock()
 _LSP_LAST_ACCESS: float = 0.0
 _LSP_IDLE_TIMEOUT: int = 300  # 5 minutes
-_LSP_ROOT: Optional[str] = None
-_LSP_LANGUAGE: Optional[str] = None
+_LSP_ROOT: str | None = None
+_LSP_LANGUAGE: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +106,8 @@ def _detect_language(file_path: str) -> str:
 def _language_to_multilspy_enum(lang: str) -> Any:
     """Map a language string to the multilspy Language enum value."""
     if _Language is None:
-        raise RuntimeError("multilspy is not installed")
+        msg = "multilspy is not installed"
+        raise RuntimeError(msg)
     mapping = {
         "python": _Language.PYTHON,
         "typescript": _Language.TYPESCRIPT,
@@ -123,12 +127,21 @@ def _language_to_multilspy_enum(lang: str) -> Any:
 # Project root
 # ---------------------------------------------------------------------------
 
+
 def _get_project_root(file_path: str = "") -> str:
     """Determine the project root for the LSP server."""
     start = Path(file_path).resolve().parent if file_path else Path.cwd()
-    markers = {".git", "setup.py", "setup.cfg", "pyproject.toml",
-               "package.json", "Cargo.toml", "go.mod", "build.gradle"}
-    for p in [start] + list(start.parents):
+    markers = {
+        ".git",
+        "setup.py",
+        "setup.cfg",
+        "pyproject.toml",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "build.gradle",
+    }
+    for p in [start, *list(start.parents)]:
         if any((p / m).exists() for m in markers):
             return str(p)
     return str(start)
@@ -138,9 +151,9 @@ def _get_project_root(file_path: str = "") -> str:
 # Helper: execute a synchronous callback while a file is open in the LSP
 # ---------------------------------------------------------------------------
 
+
 def _with_open_file(lsp, file_path: str, callback) -> Any:
-    """
-    multilspy's ``lsp.open_file`` is a ``@contextmanager``.  Calling it as
+    """Multilspy's ``lsp.open_file`` is a ``@contextmanager``.  Calling it as
     ``lsp.open_file(path)`` without ``with`` returns an unentered generator,
     which means the server never learns about the file and all subsequent
     requests silently fail (or return coroutines that are never awaited).
@@ -160,6 +173,7 @@ def _with_open_file(lsp, file_path: str, callback) -> Any:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
+
 def _create_server(file_path: str = "") -> Any:
     """Create a new SyncLanguageServer and start it.
 
@@ -170,8 +184,9 @@ def _create_server(file_path: str = "") -> Any:
     global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
 
     if not _multilspy_available:
+        msg = "multilspy is not installed. Install with: pip install multilspy"
         raise RuntimeError(
-            "multilspy is not installed. Install with: pip install multilspy"
+            msg,
         )
 
     language = _detect_language(file_path)
@@ -187,7 +202,7 @@ def _create_server(file_path: str = "") -> Any:
     # underlying language-server process is actually started.
     ctx = lsp.start_server()
     ctx.__enter__()
-    lsp._start_ctx = ctx          # keep alive for shutdown
+    lsp._start_ctx = ctx  # keep alive for shutdown
 
     _LSP_SERVER = lsp
     _LSP_ROOT = root
@@ -205,7 +220,7 @@ def _shutdown_server(lsp) -> None:
             ctx.__exit__(None, None, None)
             lsp._start_ctx = None
     except Exception:
-        pass
+        _logger.debug("LSP shutdown (context exit) had an error")
     # multilspy's SyncLanguageServer creates an internal event loop in
     # ``lsp.loop``.  Close it explicitly so it does not linger after shutdown.
     try:
@@ -213,12 +228,10 @@ def _shutdown_server(lsp) -> None:
         if _loop is not None and not _loop.is_closed():
             _loop.close()
     except Exception:
-        pass
+        _logger.debug("LSP shutdown (event loop close) had an error")
     # Fallback: try the inner server's shutdown method
-    try:
+    with contextlib.suppress(Exception):
         lsp._server.shutdown()
-    except Exception:
-        pass
 
 
 def _ensure_server(file_path: str = "") -> Any:
@@ -231,7 +244,7 @@ def _ensure_server(file_path: str = "") -> Any:
         desired_lang = _detect_language(file_path)
 
         # If language changed, recreate
-        if _LSP_SERVER is not None and _LSP_LANGUAGE != desired_lang:
+        if _LSP_SERVER is not None and desired_lang != _LSP_LANGUAGE:
             _shutdown_server(_LSP_SERVER)
             _LSP_SERVER = None
             _LSP_LANGUAGE = None
@@ -274,13 +287,32 @@ def _check_idle_shutdown() -> None:
 # ---------------------------------------------------------------------------
 
 _SYMBOL_KIND_NAMES = {
-    1: "File", 2: "Module", 3: "Namespace", 4: "Package",
-    5: "Class", 6: "Method", 7: "Property", 8: "Field",
-    9: "Constructor", 10: "Enum", 11: "Interface", 12: "Function",
-    13: "Variable", 14: "Constant", 15: "String", 16: "Number",
-    17: "Boolean", 18: "Array", 19: "Object", 20: "Key",
-    21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event",
-    25: "Operator", 26: "TypeParameter",
+    1: "File",
+    2: "Module",
+    3: "Namespace",
+    4: "Package",
+    5: "Class",
+    6: "Method",
+    7: "Property",
+    8: "Field",
+    9: "Constructor",
+    10: "Enum",
+    11: "Interface",
+    12: "Function",
+    13: "Variable",
+    14: "Constant",
+    15: "String",
+    16: "Number",
+    17: "Boolean",
+    18: "Array",
+    19: "Object",
+    20: "Key",
+    21: "Null",
+    22: "EnumMember",
+    23: "Struct",
+    24: "Event",
+    25: "Operator",
+    26: "TypeParameter",
 }
 
 
@@ -342,14 +374,11 @@ def _hover_value(hover: Any) -> str:
 # Public API — LSP operations
 # ---------------------------------------------------------------------------
 
+
 def lsp_status() -> str:
     """Return human-readable status of the LSP server."""
     if not _multilspy_available:
-        return (
-            "LSP: Not available\n"
-            "  multilspy is not installed.\n"
-            "  Install with: pip install multilspy"
-        )
+        return "LSP: Not available\n  multilspy is not installed.\n  Install with: pip install multilspy"
 
     _check_idle_shutdown()
 
@@ -363,100 +392,114 @@ def lsp_status() -> str:
                 f"  Idle timeout: {_LSP_IDLE_TIMEOUT}s\n"
                 f"  Idle for: {idle:.0f}s"
             )
-        else:
-            return (
-                "LSP: Ready (not started)\n"
-                "  Server will start on first LSP call.\n"
-                "  Run /lsp diagnose <file> to start it."
-            )
+        return (
+            "LSP: Ready (not started)\n  Server will start on first LSP call.\n  Run /lsp diagnose <file> to start it."
+        )
+
+
+def _run_ruff(fp: Path, diagnostics: list) -> None:
+    """Run ruff linter on a Python file and append results."""
+    import json
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["ruff", "check", "--output-format=json", str(fp)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.stdout and r.returncode in (0, 1):
+            for rule in json.loads(r.stdout):
+                line = rule.get("location", {}).get("row", "?")
+                col = rule.get("location", {}).get("column", "?")
+                code = rule.get("code", "?")
+                msg = rule.get("message", "")
+                severity = "Error" if rule.get("fix", {}).get("applicability") == "unsafe" else "Warning"
+                if not rule.get("fix"):
+                    severity = "Error" if code.startswith(("E", "F", "W")) else "Warning"
+                diagnostics.append(
+                    f"  [{severity}] {code}: {msg} (line {line}, col {col})",
+                )
+    except Exception as e:
+        diagnostics.append(f"  [Info] ruff failed: {e}")
+
+
+def _run_pyright(fp: Path, diagnostics: list) -> None:
+    """Run pyright type checker on a Python file and append results."""
+    import json
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["pyright", "--outputjson", str(fp)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.stdout:
+            data = json.loads(r.stdout)
+            for diag in data.get("generalDiagnostics", []):
+                line = diag.get("line", "?")
+                col = diag.get("character", "?")
+                rule = diag.get("rule", "")
+                msg = diag.get("message", "")
+                sev = diag.get("severity", "info")
+                if sev == "information":
+                    sev = "Info"
+                elif sev == "warning":
+                    sev = "Warning"
+                else:
+                    sev = "Error"
+                diagnostics.append(
+                    f"  [{sev}] pyright ({rule}): {msg} (line {line}, col {col})",
+                )
+    except Exception as e:
+        diagnostics.append(f"  [Info] pyright failed: {e}")
+
+
+def _run_lsp_diagnostics(fp: Path) -> None:
+    """Run LSP server diagnostics on a file (best-effort)."""
+    try:
+        _check_idle_shutdown()
+        lsp = _ensure_server(str(fp))
+
+        _with_open_file(lsp, str(fp), lambda _lsp: time.sleep(0.5))
+    except Exception:
+        _logger.debug("LSP diagnostics pre-warm failed for %s", fp)
+
+
+def _format_diagnostics(fp: Path, diagnostics: list) -> str:
+    """Format the diagnostics output."""
+    if not diagnostics:
+        return f"Diagnostics for {fp}:\n  Clean. No issues found."
+
+    errors = sum(1 for d in diagnostics if "[Error]" in d)
+    warnings = sum(1 for d in diagnostics if "[Warning]" in d)
+
+    lines = [
+        f"Diagnostics for {fp} ({len(diagnostics)} issues):",
+        f"  Errors: {errors} | Warnings: {warnings}",
+        "",
+    ]
+    lines.extend(diagnostics)
+    return "\n".join(lines)
 
 
 def lsp_diagnostics(file_path: str) -> str:
-    """Run diagnostics on a file."""
+    """Run diagnostics on a file using ruff, pyright, and LSP."""
     try:
-        import subprocess
-        import json
-
         fp = Path(file_path).resolve()
         ext = fp.suffix.lower()
-        diagnostics = []
+        diagnostics: list[str] = []
 
-        # --- Ruff (fast linting) ---
         if ext in (".py", ".pyi"):
-            try:
-                r = subprocess.run(
-                    ["ruff", "check", "--output-format=json", str(fp)],
-                    capture_output=True, text=True, timeout=30
-                )
-                if r.stdout and r.returncode in (0, 1):  # 1 = found issues
-                    for rule in json.loads(r.stdout):
-                        line = rule.get("location", {}).get("row", "?")
-                        col = rule.get("location", {}).get("column", "?")
-                        code = rule.get("code", "?")
-                        msg = rule.get("message", "")
-                        severity = "Error" if rule.get("fix", {}).get("applicability") == "unsafe" else "Warning"
-                        if not rule.get("fix"):
-                            severity = "Error" if code.startswith(("E", "F", "W")) else "Warning"
-                        diagnostics.append(
-                            f"  [{severity}] {code}: {msg} (line {line}, col {col})"
-                        )
-            except Exception as e:
-                diagnostics.append(f"  [Info] ruff failed: {e}")
+            _run_ruff(fp, diagnostics)
+            _run_pyright(fp, diagnostics)
 
-        # --- Pyright (type checking) ---
-        if ext in (".py", ".pyi"):
-            try:
-                r = subprocess.run(
-                    ["pyright", "--outputjson", str(fp)],
-                    capture_output=True, text=True, timeout=60
-                )
-                if r.stdout:
-                    data = json.loads(r.stdout)
-                    for diag in data.get("generalDiagnostics", []):
-                        line = diag.get("line", "?")
-                        col = diag.get("character", "?")
-                        rule = diag.get("rule", "")
-                        msg = diag.get("message", "")
-                        sev = diag.get("severity", "info")
-                        if sev == "information":
-                            sev = "Info"
-                        elif sev == "warning":
-                            sev = "Warning"
-                        else:
-                            sev = "Error"
-                        diagnostics.append(
-                            f"  [{sev}] pyright ({rule}): {msg} (line {line}, col {col})"
-                        )
-            except Exception as e:
-                diagnostics.append(f"  [Info] pyright failed: {e}")
+        _run_lsp_diagnostics(fp)
 
-        # --- LSP server diagnostics (additional) ---
-        try:
-            _check_idle_shutdown()
-            lsp = _ensure_server(file_path)
-
-            def _noop(_lsp):
-                time.sleep(0.5)  # brief pause for server to process
-
-            _with_open_file(lsp, str(fp), _noop)
-        except Exception:
-            pass  # LSP part is best-effort
-
-        # --- Format output ---
-        if not diagnostics:
-            return f"Diagnostics for {fp}:\n  Clean. No issues found."
-
-        errors = sum(1 for d in diagnostics if "[Error]" in d)
-        warnings = sum(1 for d in diagnostics if "[Warning]" in d)
-
-        lines = [
-            f"Diagnostics for {fp} ({len(diagnostics)} issues):",
-            f"  Errors: {errors} | Warnings: {warnings}",
-            "",
-        ]
-        lines.extend(diagnostics)
-
-        return "\n".join(lines)
+        return _format_diagnostics(fp, diagnostics)
 
     except Exception as e:
         return f"Diagnostics error: {e}"
@@ -634,11 +677,39 @@ def lsp_completion(file_path: str, line: int, column: int) -> str:
 
 # --- Feature stubs for pre/post-edit analysis ---
 
+
 def _is_code_file(file_path: str) -> bool:
-    code_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp",
-                       ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".cs", ".swift",
-                       ".kt", ".scala", ".r", ".m", ".pl", ".pm", ".ex", ".exs",
-                       ".erl", ".beam", ".clj", ".cljs", ".edn"}
+    code_extensions = {
+        ".py",
+        ".js",
+        ".ts",
+        ".jsx",
+        ".tsx",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".cs",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".r",
+        ".m",
+        ".pl",
+        ".pm",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".beam",
+        ".clj",
+        ".cljs",
+        ".edn",
+    }
     return Path(file_path).suffix.lower() in code_extensions
 
 
@@ -678,13 +749,14 @@ def lsp_check_patch_impact(file_path: str, diff: str) -> dict:
             if diag.count("error") > 0:
                 return {"conflicts": [f"{diag.count('error')} diagnostic issue(s) in file"]}
     except Exception:
-        pass
+        _logger.debug("LSP patch-impact check failed for %s", file_path)
     return {"conflicts": []}
 
 
 def lsp_check_imports(file_path: str) -> dict:
     try:
         from pathlib import Path as _Path
+
         if not _Path(file_path).exists():
             return {"broken": [f"File not found: {file_path}"]}
         result = lsp_diagnostics(file_path)
@@ -699,50 +771,82 @@ def lsp_trend_report() -> str:
     return "LSP trend tracking not yet implemented. Requires server state tracking across edits."
 
 
-
 # ---------------------------------------------------------------------------
 # Dispatch helper for the tool interface
 # ---------------------------------------------------------------------------
 
-def lsp_query(action: str, file_path: str = "", line: int = 0,
-              column: int = 0, new_name: str = "") -> str:
+
+def lsp_query(action: str, file_path: str = "", line: int = 0, column: int = 0, new_name: str = "") -> str:
     """Unified entry point for LSP queries. Used by the tool schema."""
     action = action.lower().strip()
 
-    if action == "status":
-        return lsp_status()
-    elif action in ("diagnostics", "diagnose"):
-        if not file_path:
-            return "Usage: lsp_query(action='diagnostics', file_path='path/to/file.py')"
-        return lsp_diagnostics(file_path)
-    elif action in ("definition", "define", "goto_definition"):
-        if not file_path:
-            return "Usage: lsp_query(action='definition', file_path='path/to/file.py', line=42, column=10)"
-        return lsp_definition(file_path, line, column)
-    elif action in ("references", "refs"):
-        if not file_path:
-            return "Usage: lsp_query(action='references', file_path='path/to/file.py', line=42, column=10)"
-        return lsp_references(file_path, line, column)
-    elif action == "hover":
-        if not file_path:
-            return "Usage: lsp_query(action='hover', file_path='path/to/file.py', line=42, column=10)"
-        return lsp_hover(file_path, line, column)
-    elif action in ("symbols", "document_symbols"):
-        if not file_path:
-            return "Usage: lsp_query(action='symbols', file_path='path/to/file.py')"
-        return lsp_symbols(file_path)
-    elif action == "rename":
-        if not file_path or not new_name:
-            return "Usage: lsp_query(action='rename', file_path='path/to/file.py', line=42, column=10, new_name='foo')"
-        return lsp_rename(file_path, line, column, new_name)
-    elif action == "completion" or action == "completions":
-        if not file_path:
-            return "Usage: lsp_query(action='completion', file_path='path/to/file.py', line=42, column=10)"
-        return lsp_completion(file_path, line, column)
-    else:
-        return (
-            "Usage: lsp_query(action, file_path, line, column, new_name)\n"
-            f"  Unknown action: '{action}'\n"
-            "  Valid actions: status, diagnostics, definition, references,\n"
-            "  hover, symbols, rename, completion"
-        )
+    _DISPATCH = {
+        "status": lambda _fp, _ln, _col, _nm: lsp_status(),
+        "diagnostics": lambda _fp, _ln, _col, _nm: (
+            lsp_diagnostics(_fp) if _fp else "Usage: lsp_query(action='diagnostics', file_path='path/to/file.py')"
+        ),
+        "diagnose": lambda _fp, _ln, _col, _nm: (
+            lsp_diagnostics(_fp) if _fp else "Usage: lsp_query(action='diagnostics', file_path='path/to/file.py')"
+        ),
+        "definition": lambda fp, ln, col, _nm: (
+            lsp_definition(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='definition', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "define": lambda fp, ln, col, _nm: (
+            lsp_definition(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='definition', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "goto_definition": lambda fp, ln, col, _nm: (
+            lsp_definition(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='definition', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "references": lambda fp, ln, col, _nm: (
+            lsp_references(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='references', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "refs": lambda fp, ln, col, _nm: (
+            lsp_references(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='references', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "hover": lambda fp, ln, col, _nm: (
+            lsp_hover(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='hover', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "symbols": lambda _fp, _ln, _col, _nm: (
+            lsp_symbols(_fp) if _fp else "Usage: lsp_query(action='symbols', file_path='path/to/file.py')"
+        ),
+        "document_symbols": lambda _fp, _ln, _col, _nm: (
+            lsp_symbols(_fp) if _fp else "Usage: lsp_query(action='symbols', file_path='path/to/file.py')"
+        ),
+        "rename": lambda fp, ln, col, nm: (
+            lsp_rename(fp, ln, col, nm)
+            if fp and nm
+            else "Usage: lsp_query(action='rename', file_path='path/to/file.py', line=42, column=10, new_name='foo')"
+        ),
+        "completion": lambda fp, ln, col, _nm: (
+            lsp_completion(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='completion', file_path='path/to/file.py', line=42, column=10)"
+        ),
+        "completions": lambda fp, ln, col, _nm: (
+            lsp_completion(fp, ln, col)
+            if fp
+            else "Usage: lsp_query(action='completion', file_path='path/to/file.py', line=42, column=10)"
+        ),
+    }
+
+    handler = _DISPATCH.get(action)
+    if handler:
+        return handler(file_path, line, column, new_name)
+    return (
+        "Usage: lsp_query(action, file_path, line, column, new_name)\n"
+        f"  Unknown action: '{action}'\n"
+        "  Valid actions: status, diagnostics, definition, references,\n"
+        "  hover, symbols, rename, completion"
+    )

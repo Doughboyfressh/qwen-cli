@@ -1,4 +1,5 @@
 """Tests for stream_once mid-stream resilience (salvage partial reply on a dropped stream)."""
+
 import pytest
 
 
@@ -26,6 +27,7 @@ def _client(contents, raise_at_end=False, raise_immediately=False, finish_reason
     The final chunk carries `finish_reason` (the real SDK reports it on the last
     chunk) so we can exercise truncation detection.
     """
+
     def gen():
         if raise_immediately:
             raise ConnectionError("reset by peer")
@@ -61,7 +63,8 @@ def test_stream_once_salvages_partial_on_drop(qwen_cli):
     # instead of losing the whole turn, and drop any (truncated) tool call.
     text, calls, _usage = qwen_cli.stream_once(
         _client(["Partial ", "answer"], raise_at_end=True),
-        [{"role": "user", "content": "hi"}], use_tools=False,
+        [{"role": "user", "content": "hi"}],
+        use_tools=False,
     )
     assert text == "Partial answer"
     assert calls == []
@@ -73,7 +76,8 @@ def test_stream_once_reraises_when_nothing_received(qwen_cli):
     with pytest.raises(Exception):
         qwen_cli.stream_once(
             _client([], raise_immediately=True),
-            [{"role": "user", "content": "hi"}], use_tools=False,
+            [{"role": "user", "content": "hi"}],
+            use_tools=False,
         )
 
 
@@ -81,7 +85,8 @@ def test_stream_once_reports_complete(qwen_cli):
     # finish_reason == "stop" -> the answer is whole, not truncated.
     _text, _calls, usage = qwen_cli.stream_once(
         _client(["all done"], finish_reason="stop"),
-        [{"role": "user", "content": "hi"}], use_tools=False,
+        [{"role": "user", "content": "hi"}],
+        use_tools=False,
     )
     assert usage["finish_reason"] == "stop"
     assert usage["truncated"] is False
@@ -91,7 +96,8 @@ def test_stream_once_flags_length_truncation(qwen_cli):
     # finish_reason == "length" -> the token cap cut the model off mid-output.
     _text, _calls, usage = qwen_cli.stream_once(
         _client(["this got cut o"], finish_reason="length"),
-        [{"role": "user", "content": "hi"}], use_tools=False,
+        [{"role": "user", "content": "hi"}],
+        use_tools=False,
     )
     assert usage["finish_reason"] == "length"
     assert usage["truncated"] is True
@@ -101,7 +107,8 @@ def test_stream_once_flags_dropped_stream_as_truncated(qwen_cli):
     # A dropped connection mid-stream is also an incomplete answer.
     _text, _calls, usage = qwen_cli.stream_once(
         _client(["partial ", "answer"], raise_at_end=True),
-        [{"role": "user", "content": "hi"}], use_tools=False,
+        [{"role": "user", "content": "hi"}],
+        use_tools=False,
     )
     assert usage["truncated"] is True
     assert usage["finish_reason"] == "interrupted"

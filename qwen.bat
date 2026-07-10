@@ -17,11 +17,5 @@ if errorlevel 1 (
     echo.
 )
 
-REM --- Web UI (skip if already running on 7860) ---
-netstat -ano | findstr ":7860 " >nul 2>&1
-if errorlevel 1 (
-    start "Qwen Web" /min "%USERPROFILE%\.qwen-cli\.venv\Scripts\python.exe" "%USERPROFILE%\.qwen-cli\qwen-web.py"
-)
-
 REM --- CLI in foreground (pass through any args) ---
 "%USERPROFILE%\.qwen-cli\.venv\Scripts\python.exe" "%USERPROFILE%\.qwen-cli\qwen-cli.py" %*

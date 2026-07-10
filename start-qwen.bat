@@ -71,11 +71,5 @@ goto after_ready
 echo [start-qwen] LLM server is ready.
 :after_ready
 
-REM --- Web UI ---
-netstat -ano | findstr ":7860 " >nul 2>&1
-if errorlevel 1 (
-    start "Qwen Web" /min "%USERPROFILE%\.qwen-cli\.venv\Scripts\python.exe" "%USERPROFILE%\.qwen-cli\qwen-web.py"
-)
-
 REM --- CLI ---
 start "Qwen CLI" "%USERPROFILE%\.qwen-cli\.venv\Scripts\python.exe" "%USERPROFILE%\.qwen-cli\qwen-cli.py"

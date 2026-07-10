@@ -36,7 +36,7 @@ def test_invalidate_forces_recompute(qwen_cli, monkeypatch):
     monkeypatch.setattr(qwen_cli, "_compute_git_context", fake_compute)
 
     assert qwen_cli.get_git_context() == "state-1"
-    qwen_cli._invalidate_git_cache()           # e.g. just committed
+    qwen_cli._invalidate_git_cache()  # e.g. just committed
     assert qwen_cli.get_git_context() == "state-2"
     assert calls["n"] == 2
 
@@ -45,12 +45,13 @@ def test_ttl_expiry_recomputes(qwen_cli, monkeypatch):
     calls = {"n": 0}
     clock = {"t": 1000.0}
 
-    monkeypatch.setattr(qwen_cli, "_compute_git_context",
-                        lambda: f"v{(calls.__setitem__('n', calls['n'] + 1)) or calls['n']}")
+    monkeypatch.setattr(
+        qwen_cli, "_compute_git_context", lambda: f"v{(calls.__setitem__('n', calls['n'] + 1)) or calls['n']}"
+    )
     monkeypatch.setattr(qwen_cli.time, "monotonic", lambda: clock["t"])
 
     qwen_cli._invalidate_git_cache()
-    qwen_cli.get_git_context()                 # computes at t=1000
-    clock["t"] += qwen_cli._GIT_CTX_TTL + 1    # advance past the TTL
-    qwen_cli.get_git_context()                 # recomputes
+    qwen_cli.get_git_context()  # computes at t=1000
+    clock["t"] += qwen_cli._GIT_CTX_TTL + 1  # advance past the TTL
+    qwen_cli.get_git_context()  # recomputes
     assert calls["n"] == 2

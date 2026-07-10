@@ -72,6 +72,7 @@ def test_query_extracted_from_long_message(qwen_tools):
     do_search, query = qwen_tools.presearch_decision(long, "aggressive")
     assert do_search is True
     import datetime
+
     expected = f"What is the current price of an RTX 5090? {datetime.datetime.now().year}"
     assert query == expected
     assert len(query) <= 200

@@ -1,0 +1,101 @@
+target-version = "py313"
+line-length = 120
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "D",      # pydocstyle — style preferences
+    "ANN",    # missing annotations — nice-to-have
+    "COM812", # trailing commas — style
+    "Q000",   # quotes — style
+    "Q003",   # quotes — style
+    "D200",   # docstyle
+    "D205",   # docstyle
+    "D212",   # docstyle  
+    "D400",   # docstyle
+    "D401",   # docstyle
+    "D404",   # docstyle
+    "D413",   # docstyle
+    "D415",   # docstyle
+    "E501",   # line-too-long — known limitation
+    "C901",   # complexity — tracked separately
+    "PLR2004", # magic-value-comparison
+    "PLR0911", # too-many-return-statements
+    "PLR0912", # too-many-branches
+    "PLR0913", # too-many-arguments
+    "PLR0915", # too-many-statements
+    "BLE001", # blind-except — intentional for robustness
+    "S110",   # try-except-pass — reviewed
+    "SLF001", # private-member-access
+    "ARG001", # unused-function-argument — dispatch stub pattern
+    "ARG002", # unused-method-argument
+    "N806",   # non-lowercase-variable
+    "N814",   # camelcase-imported-as-constant
+    "T201",   # print — CLI uses print extensively
+    "FBT001", # boolean-type-hint-positional-argument
+    "FBT002", # boolean-default-value-positional-argument
+    "FBT003", # boolean-positional-value-in-call
+    "RUF005", # collection-literal-concatenation
+    "RUF001", # ambiguous-unicode-character-string
+    "UP035",  # deprecated-import — alias pattern
+    "UP045",  # non-pep604-annotation-optional
+    "SIM105", # suppressible-exception — contextlib.suppress preference
+    "SIM300", # yoda-conditions
+    "PERF401", # manual-list-comprehension
+    "PERF402", # manual-list-copy
+    "PERF203", # try-except-in-loop
+    "PLW0602", # global-variable-not-assigned
+    "PLW0603", # global-statement
+    "TRY300", # try-consider-else
+    "TRY203", # useless-try-except
+    "RET503", # implicit-return
+    "RET505", # superfluous-else-return
+    "RET507", # superfluous-else-continue
+    "PIE790", # unnecessary-placeholder
+    "PIE810", # multiple-starts-ends-with
+    "EM101",  # raw-string-in-exception
+    "EM102",  # f-string-in-exception
+    "PGH003", # blanket-type-ignore
+    "S311",   # suspicious-non-cryptographic-random-usage
+    "S310",   # suspicious-url-open-usage
+    "S324",   # hashlib-insecure-hash-function
+    "S602",   # subprocess-popen-with-shell-equals-true
+    "S603",   # subprocess-without-shell-equals-true
+    "S607",   # start-process-with-partial-path
+    "DTZ005", # call-datetime-now-without-tzinfo
+    "DTZ006", # call-datetime-fromtimestamp
+    "A002",   # builtin-argument-shadowing
+    "B007",   # unused-loop-control-variable
+    "B905",   # zip-without-explicit-strict
+    "UP015",  # redundant-open-modes
+    "UP034",  # extraneous-parentheses
+    "FIX002", # line-contains-todo
+    "TD002",  # missing-todo-author
+    "TD003",  # missing-todo-link
+    "TD004",  # missing-todo-colon
+    "RUF010", # explicit-f-string-type-conversion
+    "RUF100", # unused-noqa
+    "C416",   # unnecessary-comprehension
+    "C408",   # unnecessary-collection-call
+    "FURB110",# if-exp-instead-of-or-operator
+    "FURB171",# single-item-membership-test
+    "PLC0415",# import-outside-top-level — lazy import pattern
+    "SIM102", # collapsible-if
+    "SIM108", # if-else-block-instead-of-if-exp
+    "SIM103", # needless-bool
+    "TRY003", # raise-vanilla-args
+    "PTH123", # builtin-open
+    "PTH105", # os-replace
+    "TC005",  # empty-type-checking-block
+    "B904",   # raise-without-from-inside-except
+    "PLW1510",# subprocess-run-without-check
+    "PLW2901",# redefined-loop-name
+    "ERA001", # commented-out-code
+    "I001",   # unsorted-imports
+    "W293",   # blank-line-with-whitespace
+    "W291",   # trailing-whitespace
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["ALL"]
+"test_*.py" = ["ALL"]

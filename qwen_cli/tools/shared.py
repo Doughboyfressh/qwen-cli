@@ -1,19 +1,19 @@
-"""
-Shared tool implementations used by both qwen-cli.py and qwen-web.py.
+"""Shared tool implementations (web search, URL fetch, diff, backup).
 
 Importers must set the config vars below before calling any function that
 needs them (search keys, BACKUPS_DIR, etc.).  The simplest pattern:
 
-    import qwen_tools
-    qwen_tools.GOOGLE_API_KEY = GOOGLE_API_KEY
-    qwen_tools.BACKUPS_DIR    = DATA_DIR / "backups"
-    from qwen_tools import do_web_search, do_fetch_url, ...
+    from qwen_cli.tools import shared as _qt
+    _qt.GOOGLE_API_KEY = GOOGLE_API_KEY
+    _qt.BACKUPS_DIR    = DATA_DIR / "backups"
+    from qwen_cli.tools.shared import do_web_search, do_fetch_url, ...
 """
 
 from __future__ import annotations
 
 import gzip as _gzip
 import json
+import logging
 import os
 import re
 import time
@@ -24,23 +24,25 @@ import zlib as _zlib
 from datetime import datetime
 from pathlib import Path
 
+_logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Config vars — set by importers after import
 # ---------------------------------------------------------------------------
 GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
-GOOGLE_CSE_ID: str  = os.environ.get("GOOGLE_CSE_ID",  "")
-BRAVE_API_KEY: str  = os.environ.get("BRAVE_API_KEY",  "")
+GOOGLE_CSE_ID: str = os.environ.get("GOOGLE_CSE_ID", "")
+BRAVE_API_KEY: str = os.environ.get("BRAVE_API_KEY", "")
 
 _DATA_DIR_DEFAULT = Path.home() / ".qwen-cli"
-BACKUPS_DIR: Path  = _DATA_DIR_DEFAULT / "backups"
+BACKUPS_DIR: Path = _DATA_DIR_DEFAULT / "backups"
 
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
 
+
 def _resolve(path: str) -> Path:
     """Resolve a relative or absolute path string to a Path object."""
-
     p = Path(path).expanduser()
     return p.resolve(strict=False) if p.is_absolute() else (Path.cwd() / p).resolve(strict=False)
 
@@ -54,9 +56,9 @@ def _apply_diff(original: str, diff: str) -> str:
     if orig_lines and not orig_lines[-1].endswith("\n"):
         orig_lines[-1] += "\n"
 
-    result     = list(orig_lines)
+    result = list(orig_lines)
     diff_lines = diff.splitlines(keepends=True)
-    hunk_re    = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
 
     i = 0
     while i < len(diff_lines) and not hunk_re.match(diff_lines[i]):
@@ -71,7 +73,7 @@ def _apply_diff(original: str, diff: str) -> str:
             continue
 
         src_start = int(m.group(1)) - 1
-        i        += 1
+        i += 1
         old_part: list[str] = []
         new_part: list[str] = []
 
@@ -81,7 +83,7 @@ def _apply_diff(original: str, diff: str) -> str:
             if dl.startswith("\\"):
                 continue
             prefix = dl[0] if dl else " "
-            body   = dl[1:] if len(dl) > 1 else "\n"
+            body = dl[1:] if len(dl) > 1 else "\n"
             if not body.endswith("\n"):
                 body += "\n"
             if prefix == " ":
@@ -93,21 +95,23 @@ def _apply_diff(original: str, diff: str) -> str:
                 new_part.append(body)
 
         target = src_start + offset
-        actual = result[target: target + len(old_part)]
+        actual = result[target : target + len(old_part)]
 
         def _norm(ls: list[str]) -> list[str]:
-            """Normalize a search result score to a 0-1 range."""
-
+            """Strip trailing whitespace from lines for diff comparison."""
             return [ln.rstrip() for ln in ls]
 
         if _norm(actual) != _norm(old_part):
-            raise ValueError(
+            msg = (
                 f"Hunk at original line {src_start + 1} does not match.\n"
                 f"Expected:\n{''.join(old_part)}"
                 f"Got:\n{''.join(actual)}"
             )
+            raise ValueError(
+                msg,
+            )
 
-        result[target: target + len(old_part)] = new_part
+        result[target : target + len(old_part)] = new_part
         offset += len(new_part) - len(old_part)
 
     return "".join(result)
@@ -115,8 +119,7 @@ def _apply_diff(original: str, diff: str) -> str:
 
 def _backup_file(p: Path) -> None:
     """Create a timestamped backup of a file before editing it."""
-
-    stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     backup.write_text(p.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
@@ -130,18 +133,16 @@ _FETCH_CACHE: dict[str, tuple[float, str]] = {}
 _FETCH_CACHE_TTL = 300  # 5 minutes
 
 
-def _cache_get(url: str) -> str | None:
-    """Retrieve a cached search result by key, if it exists and is not expired."""
-
+def _fetch_cache_get(url: str) -> str | None:
+    """Retrieve a cached URL fetch result, if it exists and is not expired."""
     entry = _FETCH_CACHE.get(url)
     if entry and (time.time() - entry[0]) < _FETCH_CACHE_TTL:
         return entry[1]
     return None
 
 
-def _cache_set(url: str, content: str) -> None:
-    """Store a search result in the cache with an expiration time."""
-
+def _fetch_cache_set(url: str, content: str) -> None:
+    """Cache a URL fetch result with an expiration time."""
     _FETCH_CACHE[url] = (time.time(), content)
     if len(_FETCH_CACHE) > 60:
         oldest = min(_FETCH_CACHE, key=lambda k: _FETCH_CACHE[k][0])
@@ -153,22 +154,19 @@ def _cache_set(url: str, content: str) -> None:
 # ---------------------------------------------------------------------------
 
 _BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 
 def _format_search_results(query: str, results: list, source: str = "") -> str:
     """Format raw search engine results into a readable Markdown string."""
-
-    tag   = f" (via {source})" if source else ""
+    tag = f" (via {source})" if source else ""
     lines = [f'Web search results{tag} for: "{query}"\n']
     for i, r in enumerate(results, 1):
         title = r.get("title") or r.get("name") or f"Result {i}"
-        url   = r.get("href") or r.get("url") or ""
-        body  = r.get("body") or r.get("snippet") or r.get("description") or ""
-        date  = r.get("date") or r.get("published") or ""
+        url = r.get("href") or r.get("url") or ""
+        body = r.get("body") or r.get("snippet") or r.get("description") or ""
+        date = r.get("date") or r.get("published") or ""
         lines.append(f"{i}. {title}")
         if url:
             lines.append(f"   URL: {url}")
@@ -181,12 +179,13 @@ def _format_search_results(query: str, results: list, source: str = "") -> str:
 
 
 def _merge_results(
-    all_results: list[tuple[str, list[dict]]], max_results: int
+    all_results: list[tuple[str, list[dict]]],
+    max_results: int,
 ) -> tuple[str, list[dict]]:
     """Merge multi-engine results via Reciprocal Rank Fusion (RRF, k=60)."""
-    scores: dict[str, float]  = {}
+    scores: dict[str, float] = {}
     url_to_result: dict[str, dict] = {}
-    sources_used: list[str]   = []
+    sources_used: list[str] = []
 
     for source_name, results in all_results:
         if not results:
@@ -210,67 +209,80 @@ def _merge_results(
 
 def _search_google(query: str, max_results: int) -> list[dict]:
     """Perform a web search using the Google Custom Search API."""
-
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
         return []
-    q   = urllib.parse.quote_plus(query)
-    url = (f"https://www.googleapis.com/customsearch/v1"
-           f"?cx={GOOGLE_CSE_ID}&q={q}&num={min(max_results, 10)}")
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "qwen-tools/1.0",
-        "X-goog-api-key": GOOGLE_API_KEY,
-    })
+    q = urllib.parse.quote_plus(query)
+    url = f"https://www.googleapis.com/customsearch/v1?cx={GOOGLE_CSE_ID}&q={q}&num={min(max_results, 10)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "qwen-tools/1.0",
+            "X-goog-api-key": GOOGLE_API_KEY,
+        },
+    )
     with urllib.request.urlopen(req, timeout=10) as r:
         data = json.loads(r.read())
-    return [{"title": it.get("title", ""), "href": it.get("link", ""),
-             "body": it.get("snippet", "")} for it in (data.get("items") or [])]
+    return [
+        {"title": it.get("title", ""), "href": it.get("link", ""), "body": it.get("snippet", "")}
+        for it in (data.get("items") or [])
+    ]
 
 
 def _search_brave(query: str, max_results: int) -> list[dict]:
     """Perform a web search using the Brave Search API."""
-
     if not BRAVE_API_KEY:
         return []
-    q   = urllib.parse.quote_plus(query)
+    q = urllib.parse.quote_plus(query)
     url = f"https://api.search.brave.com/res/v1/web/search?q={q}&count={min(max_results, 20)}"
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": BRAVE_API_KEY,
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
+        },
+    )
     with urllib.request.urlopen(req, timeout=10) as r:
-        raw  = r.read()
-        enc  = r.headers.get("Content-Encoding") or ""
+        raw = r.read()
+        enc = r.headers.get("Content-Encoding") or ""
         data = json.loads(_gzip.decompress(raw) if "gzip" in enc else raw)
-    return [{"title": it.get("title", ""), "href": it.get("url", ""),
-             "body": it.get("description", "")}
-            for it in ((data.get("web") or {}).get("results") or [])]
+    return [
+        {"title": it.get("title", ""), "href": it.get("url", ""), "body": it.get("description", "")}
+        for it in ((data.get("web") or {}).get("results") or [])
+    ]
 
 
 def _search_brave_news(query: str, max_results: int) -> list[dict]:
     """Perform a news-specific search using the Brave Search API."""
-
     if not BRAVE_API_KEY:
         return []
-    q   = urllib.parse.quote_plus(query)
+    q = urllib.parse.quote_plus(query)
     url = f"https://api.search.brave.com/res/v1/news/search?q={q}&count={min(max_results, 20)}"
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": BRAVE_API_KEY,
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
+        },
+    )
     with urllib.request.urlopen(req, timeout=10) as r:
-        raw  = r.read()
-        enc  = r.headers.get("Content-Encoding") or ""
+        raw = r.read()
+        enc = r.headers.get("Content-Encoding") or ""
         data = json.loads(_gzip.decompress(raw) if "gzip" in enc else raw)
-    return [{"title": it.get("title", ""), "href": it.get("url", ""),
-             "body": it.get("description", ""), "date": it.get("age", "")}
-            for it in (data.get("results") or [])]
+    return [
+        {
+            "title": it.get("title", ""),
+            "href": it.get("url", ""),
+            "body": it.get("description", ""),
+            "date": it.get("age", ""),
+        }
+        for it in (data.get("results") or [])
+    ]
 
 
 def _search_ddg(query: str, max_results: int) -> list[dict]:
     """Perform a web search via DuckDuckGo HTML scraping."""
-
     try:
         from ddgs import DDGS
     except ImportError:
@@ -281,7 +293,6 @@ def _search_ddg(query: str, max_results: int) -> list[dict]:
 
 def _search_ddg_news(query: str, max_results: int) -> list[dict]:
     """Perform a news search via DuckDuckGo HTML scraping."""
-
     try:
         try:
             from ddgs import DDGS
@@ -289,22 +300,27 @@ def _search_ddg_news(query: str, max_results: int) -> list[dict]:
             from duckduckgo_search import DDGS  # type: ignore
         with DDGS(timeout=15) as ddgs:
             raw = list(ddgs.news(query, max_results=max_results))
-        return [{"title": r.get("title", ""),
-                 "href":  r.get("url", "") or r.get("link", ""),
-                 "body":  r.get("body", "") or r.get("excerpt", ""),
-                 "date":  r.get("date", "")} for r in raw]
+        return [
+            {
+                "title": r.get("title", ""),
+                "href": r.get("url", "") or r.get("link", ""),
+                "body": r.get("body", "") or r.get("excerpt", ""),
+                "date": r.get("date", ""),
+            }
+            for r in raw
+        ]
     except Exception:
         return []
 
 
 def _search_bing_scrape(query: str, max_results: int) -> list[dict]:
     """Perform a web search via Bing HTML scraping."""
-
     url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}&count={max_results}"
     req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
     with urllib.request.urlopen(req, timeout=12) as resp:
         html_body = resp.read().decode("utf-8", errors="replace")
     import html as html_mod
+
     results: list[dict] = []
     for pattern in [
         r'<h2[^>]*><a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a></h2>.*?<p[^>]*>(.*?)</p>',
@@ -313,9 +329,9 @@ def _search_bing_scrape(query: str, max_results: int) -> list[dict]:
         if results:
             break
         for block in re.findall(pattern, html_body, re.DOTALL)[:max_results]:
-            href  = block[0]
+            href = block[0]
             title = html_mod.unescape(re.sub(r"<[^>]+>", "", block[1] if len(block) > 1 else "")).strip()
-            snip  = html_mod.unescape(re.sub(r"<[^>]+>", "", block[2] if len(block) > 2 else "")).strip()
+            snip = html_mod.unescape(re.sub(r"<[^>]+>", "", block[2] if len(block) > 2 else "")).strip()
             if href and "bing.com" not in href:
                 results.append({"href": href, "title": title, "body": snip})
     return results
@@ -327,17 +343,17 @@ def do_web_search(query: str, max_results: int = 6, type: str = "web") -> str:
 
     if type == "news":
         engines = [
-            ("DDG-news",   _search_ddg_news),
+            ("DDG-news", _search_ddg_news),
             ("Brave-news", _search_brave_news),
-            ("Google",     _search_google),
-            ("Brave",      _search_brave),
+            ("Google", _search_google),
+            ("Brave", _search_brave),
         ]
     else:
         engines = [
             ("Google", _search_google),
-            ("Brave",  _search_brave),
-            ("DDG",    _search_ddg),
-            ("Bing",   _search_bing_scrape),
+            ("Brave", _search_brave),
+            ("DDG", _search_ddg),
+            ("Bing", _search_bing_scrape),
         ]
 
     all_results: list[tuple[str, list[dict]]] = []
@@ -353,9 +369,9 @@ def do_web_search(query: str, max_results: int = 6, type: str = "web") -> str:
                     if items:
                         all_results.append((name, items))
                 except Exception:
-                    pass
+                    _logger.debug("Search engine '%s' failed", name)
         except TimeoutError:
-            pass
+            _logger.debug("Web search timed out after 20s")
     finally:
         ex.shutdown(wait=False)
 
@@ -427,7 +443,7 @@ def _presearch_query(text: str) -> str:
     """Pick a concise search query and add year context when the query is time-sensitive."""
     t = " ".join(text.strip().split())
     if len(t) > 180:
-        parts  = re.split(r"(?<=[.?!])\s+", t)
+        parts = re.split(r"(?<=[.?!])\s+", t)
         chosen = next((p for p in parts if "?" in p), parts[0] if parts else t)
         t = chosen.strip()
     # Append the current year to time-sensitive queries that don't already name a year
@@ -437,8 +453,7 @@ def _presearch_query(text: str) -> str:
 
 
 def presearch_decision(text: str, mode: str = "aggressive") -> tuple[bool, str]:
-    """
-    Decide whether to auto-run a web search before the model's first reply.
+    """Decide whether to auto-run a web search before the model's first reply.
 
         mode = "off"        -> never auto-search
                "smart"      -> search only when the message shows factual intent
@@ -447,7 +462,7 @@ def presearch_decision(text: str, mode: str = "aggressive") -> tuple[bool, str]:
 
     Returns (should_search, query).
     """
-    t    = (text or "").strip()
+    t = (text or "").strip()
     mode = (mode or "aggressive").lower()
     if mode not in ("off", "smart", "aggressive"):
         mode = "aggressive"
@@ -470,12 +485,14 @@ def presearch_decision(text: str, mode: str = "aggressive") -> tuple[bool, str]:
 # HTML extraction — readability → trafilatura → regex fallback
 # ---------------------------------------------------------------------------
 
+
 def _html_to_text(html: str, url: str = "") -> str:
     """Extract clean readable text from HTML using the best available library."""
     # readability-lxml: strips boilerplate, extracts article body
     try:
         from readability import Document
-        doc  = Document(html)
+
+        doc = Document(html)
         body = doc.summary(html_partial=True)
         text = re.sub(r"<[^>]+>", " ", body)
         text = re.sub(r"[ \t]+", " ", text)
@@ -483,23 +500,27 @@ def _html_to_text(html: str, url: str = "") -> str:
         if len(text) > 200:
             return text
     except ImportError:
-        pass
+        _logger.debug("readability not installed, skipping")
     except Exception:
-        pass
+        _logger.debug("readability extraction failed for %s", url or "<unknown>")
 
     # trafilatura: good general-purpose extraction
     try:
         import trafilatura
+
         extracted = trafilatura.extract(
-            html, url=url or None, include_tables=True,
-            include_links=False, favor_recall=True,
+            html,
+            url=url or None,
+            include_tables=True,
+            include_links=False,
+            favor_recall=True,
         )
         if extracted and len(extracted.strip()) > 100:
             return extracted
     except ImportError:
-        pass
+        _logger.debug("trafilatura not installed, skipping")
     except Exception:
-        pass
+        _logger.debug("trafilatura extraction failed for %s", url or "<unknown>")
 
     # regex fallback
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
@@ -513,23 +534,22 @@ def _html_to_text(html: str, url: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 _FETCH_HEADERS = {
-    "User-Agent":      _BROWSER_UA,
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": _BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
-    "DNT":             "1",
+    "DNT": "1",
 }
 
 
 def _decompress(raw: bytes, encoding: str) -> bytes:
     """Decompress gzip or bz2 encoded response content."""
-
     enc = encoding.lower()
     if "gzip" in enc:
         try:
             return _gzip.decompress(raw)
         except Exception:
-            pass
+            _logger.debug("gzip decompression failed, trying next method")
     if "deflate" in enc:
         try:
             return _zlib.decompress(raw)
@@ -537,7 +557,7 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
             try:
                 return _zlib.decompress(raw, -15)
             except Exception:
-                pass
+                _logger.debug("deflate decompression failed")
     return raw
 
 
@@ -545,21 +565,19 @@ def _smart_truncate(text: str, limit: int) -> str:
     """Truncate at a sentence boundary near limit, falling back to hard cut."""
     if len(text) <= limit:
         return text
-    window = text[max(0, limit - 600): limit]
+    window = text[max(0, limit - 600) : limit]
     last_break = max(window.rfind(". "), window.rfind(".\n"), window.rfind("\n\n"))
-    if last_break > 0:
-        cut = max(0, limit - 600) + last_break + 1
-    else:
-        cut = limit
+    cut = max(0, limit - 600) + last_break + 1 if last_break > 0 else limit
     return text[:cut] + f"\n\n... [truncated at {limit:,} chars]"
 
 
 def _pdf_to_text(data: bytes, max_chars: int) -> str:
     """Extract text content from a PDF file using PyPDF2."""
-
     try:
         import io
+
         from pypdf import PdfReader
+
         reader = PdfReader(io.BytesIO(data))
         pages = [p.extract_text() or "" for p in reader.pages]
         text = "\n\n".join(p.strip() for p in pages if p.strip())
@@ -572,11 +590,11 @@ def _pdf_to_text(data: bytes, max_chars: int) -> str:
 
 def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
     """Fetch the raw text content of a URL.
-    
+
     Handles redirects, compression, PDF extraction, and HTML-to-text conversion.
     Falls back to a JS-rendered fetch if plain HTTP returns empty content.
     """
-    cached = _cache_get(url)
+    cached = _fetch_cache_get(url)
     if cached:
         return f"[cached] {cached}"
 
@@ -587,17 +605,17 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
         try:
             req = urllib.request.Request(url, headers=dict(_FETCH_HEADERS))
             with urllib.request.urlopen(req, timeout=15) as resp:
-                raw      = resp.read()
-                ctype    = (resp.headers.get("Content-Type") or "").lower()
+                raw = resp.read()
+                ctype = (resp.headers.get("Content-Type") or "").lower()
                 encoding = resp.headers.get("Content-Encoding") or ""
 
             raw = _decompress(raw, encoding)
 
             # PDF
             if "pdf" in ctype or url.lower().endswith(".pdf"):
-                text   = _pdf_to_text(raw, max_chars)
+                text = _pdf_to_text(raw, max_chars)
                 result = f"URL: {url}\n\n{text}"
-                _cache_set(url, result)
+                _fetch_cache_set(url, result)
                 return result
 
             text = raw.decode("utf-8", errors="replace")
@@ -609,15 +627,15 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
                     parsed = json.loads(text)
                     pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
                     result = f"URL: {url}\n[JSON response]\n\n{_smart_truncate(pretty, max_chars)}"
-                    _cache_set(url, result)
+                    _fetch_cache_set(url, result)
                     return result
                 except Exception:
-                    pass
+                    _logger.debug("JSON parse failed for %s, trying XML", url)
 
             # XML
             if "xml" in ctype or stripped[:5].lower() in ("<?xml", "<rss ", "<feed"):
                 result = f"URL: {url}\n[XML/RSS]\n\n{_smart_truncate(text, max_chars)}"
-                _cache_set(url, result)
+                _fetch_cache_set(url, result)
                 return result
 
             # HTML extraction
@@ -625,7 +643,7 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
                 text = _html_to_text(text, url=url)
 
             result = f"URL: {url}\n\n{_smart_truncate(text, max_chars)}"
-            _cache_set(url, result)
+            _fetch_cache_set(url, result)
             return result
 
         except urllib.error.HTTPError as e:
@@ -646,17 +664,18 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
 # Vision / image description
 # ---------------------------------------------------------------------------
 
+
 def do_describe_image(url: str, llm_client=None, llm_model: str = "") -> str:
-    """
-    Download an image and describe it via vision API (if client provided),
+    """Download an image and describe it via vision API (if client provided),
     with PIL metadata as fallback.
     """
     import base64
     import io
+
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
         with urllib.request.urlopen(req, timeout=15) as r:
-            data  = r.read()
+            data = r.read()
             ctype = r.headers.get_content_type() or "image/jpeg"
     except Exception as e:
         return f"[image fetch error: {e}]"
@@ -665,27 +684,34 @@ def do_describe_image(url: str, llm_client=None, llm_model: str = "") -> str:
 
     try:
         from PIL import Image
+
         with Image.open(io.BytesIO(data)) as img:
             lines.append(f"Format: {img.format}  Size: {img.size[0]}x{img.size[1]}  Mode: {img.mode}")
             exif = img._getexif() if hasattr(img, "_getexif") else None
             if exif:
                 from PIL.ExifTags import TAGS
+
                 for tag_id, val in exif.items():
                     tag = TAGS.get(tag_id, tag_id)
                     if tag in ("Make", "Model", "DateTime", "GPSInfo", "ImageDescription"):
                         lines.append(f"EXIF {tag}: {val}")
     except Exception:
-        pass
+        _logger.debug("PIL/EXIF metadata extraction failed for %s", url)
 
     if llm_client:
         try:
-            b64  = base64.b64encode(data).decode()
+            b64 = base64.b64encode(data).decode()
             resp = llm_client.chat.completions.create(
                 model=llm_model or "Qwen3.6-27B",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": "Describe this image in detail."},
-                    {"type": "image_url", "image_url": {"url": f"data:{ctype};base64,{b64}"}},
-                ]}],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image in detail."},
+                            {"type": "image_url", "image_url": {"url": f"data:{ctype};base64,{b64}"}},
+                        ],
+                    }
+                ],
                 max_tokens=600,
                 stream=False,
             )
@@ -703,15 +729,18 @@ def do_describe_image(url: str, llm_client=None, llm_model: str = "") -> str:
 # YouTube / video transcript
 # ---------------------------------------------------------------------------
 
+
 def do_get_video_transcript(url: str, lang: str = "en") -> str:
     """Get transcript of a YouTube video, trying multiple language fallbacks."""
     yt_id_match = re.search(
-        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})", url
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
+        url,
     )
     if yt_id_match:
         video_id = yt_id_match.group(1)
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
+
             api = YouTubeTranscriptApi()
             tl = None
             for attempt in ([lang, "en"], ["en"], None):
@@ -719,6 +748,7 @@ def do_get_video_transcript(url: str, lang: str = "en") -> str:
                     tl = api.fetch(video_id, languages=attempt) if attempt else next(iter(api.list(video_id))).fetch()
                     break
                 except Exception:
+                    _logger.debug("YouTube transcript fetch failed for %s (attempt %s)", video_id, attempt)
                     continue
             if tl:
                 text = " ".join(s.get("text", "") for s in tl)
@@ -726,5 +756,5 @@ def do_get_video_transcript(url: str, lang: str = "en") -> str:
                     text = text[:15_000] + "\n...[truncated]"
                 return f"YouTube transcript for: {url}\n\n{text}"
         except Exception:
-            pass
+            _logger.debug("YouTubeTranscriptApi failed for %s", url)
     return f"[No transcript available — page content follows]\n{do_fetch_url(url, max_chars=8_000)}"

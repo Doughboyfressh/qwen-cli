@@ -4,9 +4,6 @@ duckduckgo-search
 pyreadline3; sys_platform == "win32"
 tomli; python_version < "3.11"
 prompt_toolkit
-flask
-playwright
-waitress
 youtube-transcript-api
 trafilatura
 pypdf

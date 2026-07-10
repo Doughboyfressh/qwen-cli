@@ -4,6 +4,7 @@ do_delete_file, do_move_file.
 These run against real temp files so the path-resolution and backup logic is
 exercised without touching the user's actual workspace.
 """
+
 import json
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _auto_confirm(monkeypatch, qwen_cli, answer="y"):
     """Patch console.input so confirmation prompts auto-answer."""
@@ -27,6 +29,7 @@ def _patch_backups(monkeypatch, qwen_cli, tmp_path):
 # ---------------------------------------------------------------------------
 # do_write_file
 # ---------------------------------------------------------------------------
+
 
 class TestWriteFile:
     def test_creates_new_file(self, qwen_cli, tmp_path, monkeypatch):
@@ -69,6 +72,7 @@ class TestWriteFile:
 # do_patch_file
 # ---------------------------------------------------------------------------
 
+
 class TestPatchFile:
     def test_applies_simple_diff(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "code.txt"
@@ -106,6 +110,7 @@ class TestPatchFile:
 # do_delete_file
 # ---------------------------------------------------------------------------
 
+
 class TestDeleteFile:
     def test_deletes_with_confirmation(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "todelete.txt"
@@ -136,6 +141,7 @@ class TestDeleteFile:
 # ---------------------------------------------------------------------------
 # do_move_file
 # ---------------------------------------------------------------------------
+
 
 class TestMoveFile:
     def test_renames_file(self, qwen_cli, tmp_path, monkeypatch):

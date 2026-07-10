@@ -1,5 +1,6 @@
 """Tests for session persistence: save_session, load_session, _session_meta,
 _silent_autosave, and the _fuzzy_find_session helper."""
+
 import json
 from pathlib import Path
 
@@ -20,10 +21,11 @@ def sessions_dir(qwen_cli, tmp_path, monkeypatch):
 # save_session / load_session round-trip
 # ---------------------------------------------------------------------------
 
+
 class TestSaveLoad:
     def _history(self):
         return [
-            {"role": "user",      "content": "what is 2+2?"},
+            {"role": "user", "content": "what is 2+2?"},
             {"role": "assistant", "content": "4"},
         ]
 
@@ -50,8 +52,10 @@ class TestSaveLoad:
 
     def test_meta_turns_counts_assistant_messages(self, qwen_cli, sessions_dir):
         history = [
-            {"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
         ]
         qwen_cli.save_session(history, "SYS", name="turns_test")
         meta = qwen_cli._session_meta(sessions_dir / "turns_test.json")
@@ -69,6 +73,7 @@ class TestSaveLoad:
 # _silent_autosave
 # ---------------------------------------------------------------------------
 
+
 class TestAutosave:
     def test_writes_autosave_file(self, qwen_cli, sessions_dir):
         history = [{"role": "user", "content": "auto"}, {"role": "assistant", "content": "saved"}]
@@ -85,6 +90,7 @@ class TestAutosave:
 # ---------------------------------------------------------------------------
 # _fuzzy_find_session
 # ---------------------------------------------------------------------------
+
 
 class TestFuzzyFind:
     def test_finds_by_stem(self, qwen_cli, sessions_dir):

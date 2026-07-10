@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""Browser automation module — Playwright-based stealth browser for qwen-cli."""
+
+import contextlib
+import json
+import random as _r
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from rich.console import Console
+
+from qwen_cli.core.config import DATA_DIR, _load_config
+from qwen_cli.tools.shared import _html_to_text
+
+console = Console(force_terminal=True, legacy_windows=False)
+_CFG = _load_config()
+
+# ---------------------------------------------------------------------------
+# Browser automation (Playwright) — stealth, smart waits, CAPTCHA pause, cookies
+# ---------------------------------------------------------------------------
+
+_browser_state: dict = {}
+_render_state: dict = {}  # dedicated headless page for fetch_rendered (separate from browser_action)
+COOKIE_FILE = DATA_DIR / "browser_cookies.json"
+
+_STEALTH_JS = """// === Comprehensive Anti-Detection ===
+
+// 0. Block Playwright-specific Function.toString leak
+(function() {
+  const _origToString = Function.prototype.toString;
+  Function.prototype.toString = function() {
+    if (typeof this === 'function' && this.name) {
+      return 'function ' + this.name + '() { [native code] }';
+    }
+    return _origToString.apply(this, arguments);
+  };
+  Function.prototype.toString.toString = () => 'function toString() { [native code] }';
+})();
+
+// 1. Hide webdriver flag — multiple detection vectors
+Object.defineProperty(navigator, 'webdriver', {
+  get: () => undefined,
+  configurable: true,
+  enumerable: true,
+});
+
+// 1b. hasOwnProperty('webdriver') detection bypass
+(function() {
+  const _origHas = Object.prototype.hasOwnProperty;
+  Object.prototype.hasOwnProperty = function(prop) {
+    if (this === navigator && prop === 'webdriver') return false;
+    return _origHas.apply(this, arguments);
+  };
+})();
+
+// 2. Full chrome object (with missing app, support, runtime)
+window.chrome = {
+  runtime: {
+    onMessage: { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+    connect: () => ({ onMessage: { addListener: () => {}, removeListener: () => {} } }),
+    sendMessage: () => {},
+    executionContext: 1,
+  },
+  app: {
+    isInstalled: false,
+    InstallState: { disabled: 'disabled', installed: 'installed', not_installed: 'not_installed' },
+    RunningState: { running: 'running', not_running: 'not_running' },
+    getDetails: () => ({ id: '' }),
+  },
+  loadTimes: function() {},
+  csi: function() {},
+  support: { createScript: () => {}, removeScript: () => {} },
+};
+
+// 3. Plugin and MimeType arrays
+const _plugins = [
+  {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format', length:1},
+  {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:'Chrome PDF Plugin', length:1},
+  {name:'Widevine Content Decryption Module', filename:'widevinecdm.dll', description:'Widevine', length:1},
+];
+Object.defineProperty(navigator, 'plugins', {
+  get: () => {
+    const arr = Object.values(_plugins).map(p => Object.assign({}, p, { enabled: true }));
+    arr.length = _plugins.length;
+    return arr;
+  },
+  configurable: true,
+});
+
+const _mimeTypes = [
+  {type:'application/pdf', suffixes:'pdf', description:'Portable Document Format'},
+  {type:'application/x-google-chrome-pdf', suffixes:'pdf', description:'Portable Document Format'},
+];
+Object.defineProperty(navigator, 'mimeTypes', {
+  get: () => {
+    const arr = Object.values(_mimeTypes).map(m => Object.assign({}, m));
+    arr.length = _mimeTypes.length;
+    return arr;
+  },
+  configurable: true,
+});
+
+// 4. Standard navigator properties
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4, configurable: true });
+Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 1, configurable: true });
+Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
+Object.defineProperty(navigator, 'pdfViewer', { get: () => true, configurable: true });
+
+// 4b. WebRTC IP leak prevention
+try {
+  const _origRTCPeer = window.RTCPeerConnection;
+  if (_origRTCPeer) {
+    window.RTCPeerConnection = function(config) {
+      if (config && config.iceServers) config.iceServers = [];
+      return new _origRTCPeer(config);
+    };
+    window.RTCPeerConnection.prototype = _origRTCPeer.prototype;
+  }
+} catch(e) {}
+
+// 5. Screen properties and outer dimensions (headless browsers leak outerWidth=0)
+const _screenProps = { colorDepth: 24, pixelDepth: 24 };
+Object.defineProperty(window, 'screen', {
+  get: () => Object.assign({}, screen, _screenProps, {
+    orientation: { type: 'landscape-primary', angle: 0, onchange: null },
+  }),
+  configurable: true,
+  enumerable: true,
+});
+if (window.outerWidth === 0 || window.outerHeight === 0) {
+  Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth + 16, configurable: true });
+  Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 78, configurable: true });
+}
+
+// 5b. Screen position offsets (real browsers are rarely exactly 0,0)
+if (window.screenLeft === 0 && window.screenTop === 0) {
+  Object.defineProperty(window, 'screenLeft', { value: 20, configurable: true });
+  Object.defineProperty(window, 'screenTop', { value: 20, configurable: true });
+  Object.defineProperty(window, 'screenX', { value: 20, configurable: true });
+  Object.defineProperty(window, 'screenY', { value: 20, configurable: true });
+}
+
+// 6. navigator.permissions override
+const origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (params) =>
+    params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : origQuery(params);
+
+// 6b. TrustedTypes — present in real Chrome, absent in headless
+try {
+  if (!window.trustedTypes) {
+    window.trustedTypes = {
+      createPolicy: (name, config) => ({
+        createScript: (s) => s,
+        createScriptUrl: (s) => s,
+        createScriptElement: (s) => null,
+        createStyle: (s) => s,
+        createURL: (s) => s,
+      }),
+      isHTML: () => false,
+      isScriptURL: () => false,
+    };
+  }
+} catch(e) {}
+
+// 7. WebGL 1.0 and 2.0 vendor/renderer spoofing
+const glParam = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(param) {
+  if (param === 37445) return 'Google Inc. (NVIDIA)';
+  if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce, Direct3D)';
+  return glParam.apply(this, arguments);
+};
+try {
+  const gl2Param = WebGL2RenderingContext.prototype.getParameter;
+  WebGL2RenderingContext.prototype.getParameter = function(param) {
+    if (param === 37445) return 'Google Inc. (NVIDIA)';
+    if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce, Direct3D12)';
+    return gl2Param.apply(this, arguments);
+  };
+} catch(e) {}
+
+// 8. Canvas fingerprint noise — perturb sub-pixel rendering
+const _origGetContext = HTMLCanvasElement.prototype.getContext;
+HTMLCanvasElement.prototype.getContext = function(type) {
+  const ctx = _origGetContext.apply(this, arguments);
+  if (!ctx || type !== '2d') return ctx;
+  const _fillText = ctx.fillText.bind(ctx);
+  ctx.fillText = function(...args) {
+    ctx.imageSmoothingEnabled = false;
+    return _fillText(...args);
+  };
+  return ctx;
+};
+
+// 9. AudioContext fingerprint noise
+try {
+  const _origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
+  AnalyserNode.prototype.getFloatFrequencyData = function(freqData) {
+    _origGetFloat.call(this, freqData);
+    for (let i = 0; i < freqData.length; i++) {
+      if (!isNaN(freqData[i])) {
+        freqData[i] += (Math.random() - 0.5) * 1e-30;
+      }
+    }
+  };
+} catch(e) {}
+
+// 10. navigator.connection
+Object.defineProperty(navigator, 'connection', {
+  get: () => ({ downlink: 10, effectiveType: '4g', rtt: 50, saveData: false }),
+  configurable: true,
+});
+
+// 11. Remove iframe sandbox detection
+try { delete HTMLIFrameElement.prototype.sandbox; } catch(e) {}
+
+// 12. Performance entries — filter out devtools/CDP URLs
+const _origPerfEntries = performance.getEntriesByType.bind(performance);
+performance.getEntriesByType = function(type) {
+  if (type === 'resource') {
+    return _origPerfEntries(type).filter(e =>
+      !e.name.includes('/devtools/') && !e.name.includes('chrome-devtools')
+    );
+  }
+  return _origPerfEntries(type);
+};
+
+// 13. Deep toString override for patched objects
+[
+  [window.navigator, ['plugins', 'mimeTypes', 'languages', 'permissions', 'connection', 'hardwareConcurrency', 'deviceMemory']],
+  [window, ['chrome', 'screen']],
+].forEach(([obj, keys]) => {
+  keys.forEach(key => {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (desc && desc.get) {
+        Object.defineProperty(desc.get, 'toString', {
+          value: () => `function ${key}() { [native code] }`,
+          configurable: true,
+        });
+      }
+    } catch(e) {}
+  });
+});
+
+// 14. Constructor toString override
+[window.navigator, window].forEach(obj => {
+  Object.getOwnPropertyNames(obj.constructor).forEach(key => {
+    try {
+      Object.defineProperty(obj.constructor[key], 'toString', {
+        value: () => `function ${key}() { [native code] }`,
+        configurable: true,
+      });
+    } catch(e) {}
+  });
+});
+
+// 15. navigator.serviceWorker — suppress errors gracefully
+if (navigator.serviceWorker) {
+  const _swReg = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+  navigator.serviceWorker.register = function(...args) {
+    return _swReg(...args).catch(() => {});
+  };
+}
+
+// 16. IntersectionObserver timing — headless fires immediately, real browsers defer
+try {
+  const _origIO = window.IntersectionObserver;
+  window.IntersectionObserver = function(callback, options) {
+    const observer = new _origIO(callback, options);
+    const _origObserve = observer.observe.bind(observer);
+    observer.observe = (el) => setTimeout(() => _origObserve(el), 50);
+    return observer;
+  };
+  window.IntersectionObserver.prototype = _origIO.prototype;
+} catch(e) {}
+"""
+
+_CAPTCHA_SIGNALS = [
+    "captcha",
+    "verify you are human",
+    "i am not a robot",
+    "hcaptcha",
+    "recaptcha",
+    "cf-challenge",
+    "cloudflare",
+    "bot verification",
+    "security check",
+]
+
+
+_ANTIBOT_RESPONSE_PATTERNS = [
+    "challenge",
+    "blocked",
+    "forbidden",
+    "access denied",
+    "rate limit",
+    "too many requests",
+    "please try again later",
+    "suspicious activity",
+    "cf-turnstile",
+    "cloudflare turnstile",
+    "checking your browser",
+    "under attack mode",
+    "ddos protection",
+    "waf block",
+    "perimeter x",
+    "datadome",
+    "imperva",
+    "shape security",
+    "you need to enable javascript",
+    "blocked by firewall",
+]
+
+
+def _browser_detect_antibot(page) -> str:
+    """Check if the page is showing an anti-bot block page. Returns hint string or empty."""
+    try:
+        title = page.title().lower()
+        body = ""
+        with contextlib.suppress(Exception):
+            body = page.inner_text("body", timeout=3000).lower()
+        content = title + " " + body
+        for pat in _ANTIBOT_RESPONSE_PATTERNS:
+            if pat in content:
+                return pat
+    except Exception:
+        pass
+    return ""
+
+
+def _browser_random_viewport() -> dict:
+    """Return a randomized viewport to avoid fingerprint matching."""
+    widths = [1280, 1366, 1440, 1536, 1600, 1920]
+    heights = [720, 768, 800, 900, 1024, 1080, 1200]
+    return {"width": _r.choice(widths), "height": _r.choice(heights)}
+
+
+def _browser_random_ua() -> str:
+    """Return a randomized but realistic user-agent string."""
+    major = _r.choice(["131", "130", "129", "128", "127"])
+    minor = _r.randint(0, 999)
+    return (
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.{minor}.0.0 Safari/537.36"
+    )
+
+
+def _browser_random_delay(min_ms: float = 100, max_ms: float = 600) -> None:
+    """Introduce a small random delay to simulate human timing."""
+    time.sleep(_r.uniform(min_ms / 1000, max_ms / 1000))
+
+
+def _browser_jitter_mouse(page) -> None:
+    """Move mouse slightly in a natural-looking pattern before interactions."""
+    _steps = _r.randint(2, 5)
+    for _ in range(_steps):
+        _dx = _r.randint(-30, 30)
+        _dy = _r.randint(-10, 10)
+        page.mouse.move(_dx, _dy, steps=_r.randint(3, 8))
+
+
+def _browser_has_captcha(page) -> bool:
+    """Internal helper: browser has captcha."""
+    try:
+        content = (page.title() + " " + page.inner_text("body", timeout=3000)).lower()
+        return any(kw in content for kw in _CAPTCHA_SIGNALS)
+    except Exception:
+        return False
+
+
+def _browser_load_cookies(context) -> None:
+    """Internal helper: browser load cookies."""
+    if COOKIE_FILE.exists():
+        with contextlib.suppress(Exception):
+            context.add_cookies(json.loads(COOKIE_FILE.read_text()))
+
+
+def _browser_save_cookies(page) -> None:
+    """Internal helper: browser save cookies."""
+    with contextlib.suppress(Exception):
+        COOKIE_FILE.write_text(json.dumps(page.context.cookies()))
+
+
+def _get_page() -> Any:
+    """Internal helper: get page."""
+    if "page" not in _browser_state or _browser_state.get("closed"):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            msg = "playwright not installed — run: pip install playwright && playwright install chromium"
+            raise RuntimeError(msg)
+        pw = sync_playwright().start()
+        _ua = _browser_random_ua()
+        _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
+        browser = pw.chromium.launch(
+            headless=False,  # headed mode is harder to detect
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-infobars",
+                "--disable-extensions",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-accelerated-2d-canvas",
+                "--disable-dev-shm-usage",
+                "--lang=en-US",
+            ],
+        )
+        ctx = browser.new_context(
+            user_agent=_ua,
+            viewport=_browser_random_viewport(),
+            locale="en-US",
+            timezone_id="America/New_York",
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},
+            permissions=["geolocation"],
+            extra_http_headers={
+                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "accept-language": "en-US,en;q=0.9",
+            },
+            color_scheme="light",
+        )
+        # Proxy from config (optional)
+        _cfg_data = _CFG
+        _proxy_url = _cfg_data.get("browser_proxy", "")
+        if _proxy_url:
+            console.print(f"[dim]  [browser] using proxy: {_proxy_url}[/dim]")
+        ctx.add_init_script(_STEALTH_JS)
+        _browser_load_cookies(ctx)
+        page = ctx.new_page()
+        _browser_state.update(playwright=pw, browser=browser, context=ctx, page=page, closed=False)
+    return _browser_state["page"]
+
+
+def _browser_resolve_selector(page, selector: str) -> Any:
+    """Internal helper: browser resolve selector."""
+    if selector.startswith("label:"):
+        return page.get_by_label(selector[6:])
+    if selector.startswith("button:"):
+        return page.get_by_role("button", name=selector[7:])
+    if selector.startswith("link:"):
+        return page.get_by_role("link", name=selector[5:])
+    if selector.startswith("text:"):
+        return page.get_by_text(selector[5:])
+    return page.locator(selector)
+
+
+def _browser_smart_wait(page, timeout: int = 8000) -> None:
+    """Wait for the page to settle — networkidle with domcontentloaded fallback."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        with contextlib.suppress(Exception):
+            page.wait_for_load_state("domcontentloaded", timeout=timeout)
+
+
+def _browser_check_captcha_pause(page) -> str:
+    """If a CAPTCHA is detected, pause and let the user solve it. Returns status string."""
+    if not _browser_has_captcha(page):
+        return ""
+    console.print("[bold yellow]  [browser] CAPTCHA / human-verification detected.[/bold yellow]")
+    console.print("[bold yellow]  Solve it in the browser window, then press Enter to continue.[/bold yellow]")
+    with contextlib.suppress(KeyboardInterrupt, EOFError):
+        console.input("")
+    _browser_save_cookies(page)
+    return "[captcha-paused: user resolved]"
+
+
+def _browser_do_close(url="", selector="", value="", screenshot_path=""):
+    if "browser" in _browser_state:
+        _browser_save_cookies(_browser_state["page"])
+        _browser_state["browser"].close()
+    if "playwright" in _browser_state:
+        _browser_state["playwright"].stop()
+    _browser_state.clear()
+    _browser_state["closed"] = True
+    return "[browser closed — cookies saved]"
+
+
+def _browser_do_navigate(page, url, selector="", value="", screenshot_path=""):
+    if not url:
+        return "[navigate requires a url]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] navigate → {url}")
+    last_nav_err = None
+    for _attempt in range(3):
+        if _attempt > 0:
+            import time as _time
+
+            _time.sleep(1.5 * _attempt)
+            console.print(f"[dim]  [browser] retry {_attempt}/2...[/dim]")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            last_nav_err = None
+            break
+        except Exception as _nav_err:
+            last_nav_err = _nav_err
+            _e = str(_nav_err)
+            if "net::" not in _e and "ERR_" not in _e and "timeout" not in _e.lower():
+                break
+    if last_nav_err:
+        return f"[browser navigation failed: {last_nav_err}]"
+    _browser_smart_wait(page, timeout=12000)
+    antibot_pat = _browser_detect_antibot(page)
+    if antibot_pat:
+        console.print(f"[bold yellow]  [browser] anti-bot signal detected: {antibot_pat}[/bold yellow]")
+        _browser_random_delay()
+    captcha_note = _browser_check_captcha_pause(page)
+    _browser_save_cookies(page)
+    title = page.title()
+    result = f"[navigated to: {url}]\nPage title: {title}"
+    if antibot_pat:
+        result += f"\n[anti-bot signal: {antibot_pat} — proceeding with caution]"
+    if captcha_note:
+        result += f"\n{captcha_note}"
+    return result
+
+
+def _browser_do_fill(page, url="", selector="", value="", screenshot_path=""):
+    if not selector or value is None:
+        return "[fill requires selector and value]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] fill {selector!r} = {value!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.wait_for(state="visible", timeout=8000)
+    _browser_random_delay(200, 500)
+    _browser_jitter_mouse(page)
+    loc.first.fill(value)
+    return f"[filled {selector!r} with {value!r}]"
+
+
+def _browser_do_type(page, url="", selector="", value="", screenshot_path=""):
+    if not selector or value is None:
+        return "[type requires selector and value]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] type {selector!r} = {value!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.wait_for(state="visible", timeout=8000)
+    loc.first.click()
+    loc.first.type(value, delay=60)
+    return f"[typed into {selector!r}]"
+
+
+def _browser_do_click(page, url="", selector="", value="", screenshot_path=""):
+    if not selector:
+        return "[click requires a selector]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] click {selector!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.wait_for(state="visible", timeout=8000)
+    _browser_random_delay(150, 400)
+    _browser_jitter_mouse(page)
+    loc.first.click()
+    _browser_smart_wait(page)
+    captcha_note = _browser_check_captcha_pause(page)
+    _browser_save_cookies(page)
+    result = f"[clicked {selector!r} — now at: {page.url}]"
+    if captcha_note:
+        result += f"\n{captcha_note}"
+    return result
+
+
+def _browser_do_select(page, url="", selector="", value="", screenshot_path=""):
+    if not selector or not value:
+        return "[select requires selector and value]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] select {selector!r} = {value!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.wait_for(state="visible", timeout=8000)
+    loc.first.select_option(label=value)
+    return f"[selected {value!r} in {selector!r}]"
+
+
+def _browser_do_submit(page, url="", selector="", value="", screenshot_path=""):
+    target = selector or "form"
+    console.print(f"[bold cyan]  [browser][/bold cyan] submit {target!r}")
+    if selector:
+        _browser_resolve_selector(page, selector).first.press("Enter")
+    else:
+        page.locator("form").first.evaluate("f => f.submit()")
+    _browser_smart_wait(page, timeout=15000)
+    captcha_note = _browser_check_captcha_pause(page)
+    _browser_save_cookies(page)
+    result = f"[form submitted — now at: {page.url}]"
+    if captcha_note:
+        result += f"\n{captcha_note}"
+    return result
+
+
+def _browser_do_wait_for(page, url="", selector="", value="", screenshot_path=""):
+    if not selector:
+        return "[wait_for requires a selector]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] wait_for {selector!r}")
+    _browser_resolve_selector(page, selector).first.wait_for(state="visible", timeout=15000)
+    return f"[element visible: {selector!r}]"
+
+
+def _browser_do_scroll(page, url="", selector="", value="", screenshot_path=""):
+    if selector:
+        console.print(f"[bold cyan]  [browser][/bold cyan] scroll to {selector!r}")
+        _browser_resolve_selector(page, selector).first.scroll_into_view_if_needed()
+        return f"[scrolled to {selector!r}]"
+    pixels = int(value) if value and value.lstrip("-").isdigit() else 0
+    if pixels:
+        console.print(f"[bold cyan]  [browser][/bold cyan] scroll {pixels}px")
+        page.evaluate(f"window.scrollBy(0, {pixels})")
+        return f"[scrolled by {pixels}px]"
+    console.print("[bold cyan]  [browser][/bold cyan] scroll down")
+    page.evaluate("window.scrollBy(0, window.innerHeight)")
+    return "[scrolled down one page]"
+
+
+def _browser_do_hover(page, url="", selector="", value="", screenshot_path=""):
+    if not selector:
+        return "[hover requires a selector]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] hover {selector!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.wait_for(state="visible", timeout=8000)
+    _browser_random_delay()
+    loc.first.hover()
+    return f"[hovered over {selector!r}]"
+
+
+def _browser_do_press_key(page, url="", selector="", value="", screenshot_path=""):
+    if not value:
+        return "[press_key requires a value (e.g. 'Enter', 'Tab', 'Escape', 'Control+A')]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] press_key {value!r}")
+    if selector:
+        _browser_resolve_selector(page, selector).first.press(value)
+    else:
+        page.keyboard.press(value)
+    return f"[pressed {value!r}]"
+
+
+def _browser_do_get_url(page, url="", selector="", value="", screenshot_path=""):
+    return f"[current URL: {page.url}]"
+
+
+def _browser_do_get_links(page, url="", selector="", value="", screenshot_path=""):
+    console.print("[bold cyan]  [browser][/bold cyan] get_links")
+    links = page.evaluate(
+        "() => Array.from(document.querySelectorAll('a[href]'))"
+        ".map(a => ({text: a.innerText.trim().slice(0,100), href: a.href}))"
+        ".filter(l => l.href.startsWith('http')).slice(0, 50)",
+    )
+    if not links:
+        return "[no links found on page]"
+    lines = [f"[links on {page.url}]"]
+    for lnk in links:
+        lines.append(f"  {lnk['text'][:40]!r:42} → {lnk['href']}")
+    return "\n".join(lines)
+
+
+def _browser_do_screenshot(page, url="", selector="", value="", screenshot_path=""):
+    path = screenshot_path or str(Path.home() / "screenshot.png")
+    console.print(f"[bold cyan]  [browser][/bold cyan] screenshot → {path}")
+    page.screenshot(path=path, full_page=True)
+    return f"[screenshot saved: {path}]\nURL: {page.url}\nTitle: {page.title()}"
+
+
+def _browser_do_get_text(page, url="", selector="", value="", screenshot_path=""):
+    console.print("[bold cyan]  [browser][/bold cyan] get_text")
+    if selector:
+        text = _browser_resolve_selector(page, selector).first.inner_text()
+    else:
+        text = page.inner_text("body")
+    if len(text) > 16000:
+        text = text[:16000] + "\n...[truncated]"
+    return f"[page text — {page.url}]\n{text}"
+
+
+_BROWSER_HANDLERS: dict[str, Callable] = {
+    "close": lambda _page, url="", selector="", value="", screenshot_path="": _browser_do_close(
+        url, selector, value, screenshot_path
+    ),  # noqa: ARG005
+    "navigate": lambda page, url="", selector="", value="", screenshot_path="": _browser_do_navigate(
+        page, url, selector, value, screenshot_path
+    ),
+    "fill": _browser_do_fill,
+    "type": _browser_do_type,
+    "click": _browser_do_click,
+    "select": _browser_do_select,
+    "submit": _browser_do_submit,
+    "wait_for": _browser_do_wait_for,
+    "scroll": _browser_do_scroll,
+    "hover": _browser_do_hover,
+    "press_key": _browser_do_press_key,
+    "get_url": _browser_do_get_url,
+    "get_links": _browser_do_get_links,
+    "screenshot": _browser_do_screenshot,
+    "get_text": _browser_do_get_text,
+}
+
+
+def do_browser_action(
+    action: str, url: str = "", selector: str = "", value: str = "", screenshot_path: str = ""
+) -> str:
+    """Control a real Chromium browser via playwright automation.
+
+    Actions: navigate, fill, type, click, select, submit, wait_for, scroll,
+    hover, press_key, screenshot, get_text, get_url, get_links, close.
+    Returns output text or status messages.
+    """
+    try:
+        page = _get_page()
+        handler = _BROWSER_HANDLERS.get(action)
+        if handler is None:
+            return f"[unknown browser action: {action}]"
+        return handler(page, url, selector, value, screenshot_path)
+
+    except Exception as e:
+        _emsg = str(e)
+        if "net::" in _emsg or "ERR_" in _emsg:
+            return (
+                f"[browser network error: {e}]\n"
+                "Tip: Check the URL or your connection. Try a different URL or use fetch_url instead."
+            )
+        if "timeout" in _emsg.lower():
+            return (
+                f"[browser timeout: {e}]\n"
+                "Tip: The page may be JS-heavy or slow — try increasing wait time or use get_text after waiting."
+            )
+        if "closed" in _emsg.lower() or "Target page" in _emsg:
+            _browser_state.clear()
+            _browser_state["closed"] = True
+            return f"[browser closed unexpectedly: {e}]\nTip: Use navigate action to reopen the browser."
+        if "captcha" in _emsg.lower() or "challenge" in _emsg.lower():
+            return (
+                f"[browser blocked (anti-bot): {e}]\n"
+                "Tip: The site may require manual CAPTCHA solving — navigate there first."
+            )
+        return f"[browser error: {e}]"
+
+
+def _get_render_page() -> Any:
+    """Get (or create) the dedicated headless Playwright page used by fetch_rendered."""
+    if "page" not in _render_state or _render_state.get("closed"):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            msg = "playwright not installed — run: pip install playwright && playwright install chromium"
+            raise RuntimeError(msg)
+        pw = sync_playwright().start()
+        _ua = _browser_random_ua()
+        _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
+        bro = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-accelerated-2d-canvas",
+                "--disable-dev-shm-usage",
+                "--lang=en-US",
+            ],
+        )
+        ctx = bro.new_context(
+            user_agent=_ua,
+            viewport=_browser_random_viewport(),
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={
+                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "accept-language": "en-US,en;q=0.9",
+            },
+            color_scheme="light",
+        )
+        ctx.add_init_script(_STEALTH_JS)
+        page = ctx.new_page()
+        _render_state.update(playwright=pw, browser=bro, context=ctx, page=page, closed=False)
+    return _render_state["page"]
+
+
+def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
+    """Fetch a URL with full JS rendering via a dedicated headless Playwright instance.
+    Separate from browser_action so it never shares state or interferes.
+    Uses trafilatura/readability on the rendered HTML for clean text extraction.
+    """
+    try:
+        page = _get_render_page()
+        console.print(f"[dim cyan]  fetch_rendered: {url}[/dim cyan]")
+
+        # Navigate with retry for transient network errors
+        last_err = None
+        for _attempt in range(3):
+            if _attempt:
+                import time as _t
+
+                _t.sleep(1.5 * _attempt)
+                console.print(f"[dim]  [fetch_rendered] retry {_attempt}/2...[/dim]")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                last_err = None
+                break
+            except Exception as _nav_err:
+                last_err = _nav_err
+                _e = str(_nav_err)
+                if "net::" not in _e and "ERR_" not in _e and "timeout" not in _e.lower():
+                    break
+        if last_err:
+            return f"[fetch_rendered navigation failed: {last_err}]"
+
+        # Wait for JS content to settle
+        _browser_smart_wait(page, timeout=10000)
+
+        # Check for CAPTCHA (headless triggers it less, but still possible)
+        captcha_note = _browser_check_captcha_pause(page)
+
+        # Extract text: prefer trafilatura/readability on full rendered HTML
+        try:
+            html = page.content()
+            text = _html_to_text(html, url=url)
+        except Exception:
+            text = page.inner_text("body")
+
+        if len(text) > max_chars:
+            # Smart truncate at sentence boundary
+            window = text[max(0, max_chars - 500) : max_chars]
+            last_break = max(window.rfind(". "), window.rfind("\n\n"))
+            cut = (max(0, max_chars - 500) + last_break + 1) if last_break > 0 else max_chars
+            text = text[:cut] + "\n...[truncated]"
+
+        title = page.title()
+        result = f"[Rendered: {url}]\nTitle: {title}\n\n{text}"
+        if captcha_note:
+            result += f"\n{captcha_note}"
+        return result
+
+    except Exception as e:
+        _emsg = str(e)
+        if "closed" in _emsg.lower() or "Target page" in _emsg:
+            _render_state.clear()
+            _render_state["closed"] = True
+        return f"[fetch_rendered error: {e}]"

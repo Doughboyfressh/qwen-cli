@@ -5,6 +5,7 @@ exports/
 project_indices/
 .clawteam/
 intelligence/
+context_snapshots/
 
 # Sensitive files
 browser_cookies.json
@@ -13,6 +14,7 @@ input_history.txt
 pt_history.txt
 handoff.json
 qwen.log
+qwen.log.*
 
 # Config may contain API keys
 config.toml
@@ -31,5 +33,6 @@ models/
 # Test artifacts
 .coverage
 
-# Stray OS files
-~/*/
+# OS files
+Thumbs.db
+.DS_Store

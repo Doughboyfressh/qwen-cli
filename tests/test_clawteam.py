@@ -1,4 +1,5 @@
 """Tests for the ClawTeam coordination layer: teams, tasks, inbox."""
+
 import json
 import threading
 from pathlib import Path
@@ -9,13 +10,16 @@ import pytest
 @pytest.fixture()
 def ct(qwen_cli, tmp_path, monkeypatch):
     """Patch CT_DIR to a temp location so tests don't touch ~/.qwen-cli/.clawteam."""
-    monkeypatch.setattr(qwen_cli, "CT_DIR", tmp_path / ".clawteam")
+    import qwen_cli.core.config as _cfg_mod
+
+    monkeypatch.setattr(_cfg_mod, "CT_DIR", tmp_path / ".clawteam")
     return qwen_cli
 
 
 # ---------------------------------------------------------------------------
 # Teams
 # ---------------------------------------------------------------------------
+
 
 class TestTeams:
     def test_create_team_produces_config(self, ct, tmp_path):
@@ -24,7 +28,7 @@ class TestTeams:
         assert (tmp_path / ".clawteam" / "teams" / "alpha" / "config.json").exists()
 
     def test_create_team_is_idempotent(self, ct):
-        first  = ct._ct_team_create("beta")
+        first = ct._ct_team_create("beta")
         second = ct._ct_team_create("beta")
         assert first["createdAt"] == second["createdAt"]
 
@@ -55,6 +59,7 @@ class TestTeams:
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
+
 
 class TestTasks:
     def test_add_task_creates_file(self, ct, tmp_path):
@@ -118,6 +123,7 @@ class TestTasks:
 # Inbox
 # ---------------------------------------------------------------------------
 
+
 class TestInbox:
     def test_send_and_receive(self, ct):
         ct._ct_team_create("chat")
@@ -137,7 +143,7 @@ class TestInbox:
     def test_peek_does_not_consume(self, ct):
         ct._ct_team_create("chat")
         ct._ct_inbox_send("chat", "bob", "peek me")
-        first  = ct._ct_inbox_receive("chat", "bob", peek=True)
+        first = ct._ct_inbox_receive("chat", "bob", peek=True)
         second = ct._ct_inbox_receive("chat", "bob", peek=True)
         assert len(first) == 1 and len(second) == 1
 
@@ -179,24 +185,27 @@ class TestInbox:
         results: list[list] = [[], []]
         barrier = threading.Barrier(2)
         lock = threading.Lock()
+
         def reader(idx):
             barrier.wait()
             with lock:
                 results[idx] = ct._ct_inbox_receive("chat", "frank")
+
         t0 = threading.Thread(target=reader, args=(0,))
         t1 = threading.Thread(target=reader, args=(1,))
-        t0.start(); t1.start()
-        t0.join();  t1.join()
+        t0.start()
+        t1.start()
+        t0.join()
+        t1.join()
         combined = results[0] + results[1]
         bodies = sorted(m["body"] for m in combined)
-        assert bodies == [f"msg{i}" for i in range(6)], (
-            f"expected 6 unique messages, got: {bodies}"
-        )
+        assert bodies == [f"msg{i}" for i in range(6)], f"expected 6 unique messages, got: {bodies}"
 
 
 # ---------------------------------------------------------------------------
 # Board render
 # ---------------------------------------------------------------------------
+
 
 class TestBoard:
     def test_board_shows_team_name(self, ct):

@@ -1,4 +1,5 @@
 """Tests for LSP integration — command parsing, fallbacks, and error handling."""
+
 import io
 import sys
 from types import SimpleNamespace
@@ -17,16 +18,19 @@ def _mock_ctx():
 
 def _run_cmd(ctx, qwen_cli, arg):
     """Run a command, monkey-patching the rich Console to capture output."""
+    from qwen_cli.core.commands import _cmd_lsp
+
     buf = io.StringIO()
     qwen_cli.console = Console(file=buf, force_terminal=True, legacy_windows=False)
     try:
-        qwen_cli._cmd_lsp(ctx, arg)
+        _cmd_lsp(ctx, arg)
     finally:
         pass
     return buf.getvalue() + "\n".join(ctx._out)
 
 
 # --- Fallback / multilspy unavailable tests ---
+
 
 def test_lsp_query_returns_fallback_when_not_installed(lsp_client):
     msg = lsp_client.lsp_query("status", "/tmp/dummy.py")
@@ -79,6 +83,7 @@ def test_lsp_client_has_query_dispatcher(lsp_client):
 
 # --- Language detection ---
 
+
 def test_detect_language_from_extension(lsp_client):
     assert lsp_client._detect_language("file.py") == "python"
     assert lsp_client._detect_language("file.js") == "javascript"
@@ -100,6 +105,7 @@ def test_detect_language_defaults_to_python_for_unknown(lsp_client):
 
 # --- Project root detection ---
 
+
 def test_get_project_root_returns_path(lsp_client):
     root = lsp_client._get_project_root(__file__)
     assert root is not None
@@ -108,11 +114,13 @@ def test_get_project_root_returns_path(lsp_client):
 
 # --- Shutdown safety ---
 
+
 def test_shutdown_does_not_crash(lsp_client):
     lsp_client.shutdown()
 
 
 # --- Query dispatcher routing ---
+
 
 def test_lsp_query_routes_status(lsp_client):
     result = lsp_client.lsp_query("status")
@@ -160,6 +168,7 @@ def test_lsp_query_unknown_action(lsp_client):
 
 
 # --- Command parsing tests for _cmd_lsp ---
+
 
 def test_cmd_lsp_no_args_shows_usage(qwen_cli):
     ctx = _mock_ctx()
@@ -235,3 +244,67 @@ def test_cmd_lsp_unknown_subcommand(qwen_cli):
     output = _run_cmd(ctx, qwen_cli, "unknown_thing")
     assert len(output) > 0
     assert "usage" in output.lower() or "lsp" in output.lower() or "unknown" in output.lower()
+
+
+# --- Formatting helpers ---
+
+
+def test_symbol_kind_name_known_value(lsp_client):
+    result = lsp_client._symbol_kind_name(5)
+    assert result == "Class"
+
+
+def test_symbol_kind_name_unknown_value(lsp_client):
+    result = lsp_client._symbol_kind_name(999)
+    assert result == "Kind(999)"
+
+
+def test_symbol_kind_name_enum_with_value(lsp_client):
+    kind = type("MockKind", (), {"value": 12})()
+    result = lsp_client._symbol_kind_name(kind)
+    assert result == "Function"
+
+
+def test_uri_to_path_absolute_unix(lsp_client):
+    assert lsp_client._uri_to_path("file:///home/user/file.py") == "/home/user/file.py"
+
+
+def test_uri_to_path_windows(lsp_client):
+    result = lsp_client._uri_to_path("file:///C:/Users/user/file.py")
+    assert isinstance(result, str)
+
+
+def test_uri_to_path_non_uri(lsp_client):
+    assert lsp_client._uri_to_path("/plain/path") == "/plain/path"
+
+
+def test_hover_value_markup_content(lsp_client):
+    hover = type("MockHover", (), {"contents": type("MC", (), {"value": "def foo()"})()})()
+    assert lsp_client._hover_value(hover) == "def foo()"
+
+
+def test_hover_value_string(lsp_client):
+    hover = type("MockHover", (), {"contents": "plain string"})()
+    assert lsp_client._hover_value(hover) == "plain string"
+
+
+def test_hover_value_list(lsp_client):
+    item1 = type("Obj", (), {"value": "part1"})()
+    hover = type("MockHover", (), {"contents": ["partA", item1]})()
+    assert lsp_client._hover_value(hover) == "partA\npart1"
+
+
+def test_hover_value_none(lsp_client):
+    hover = type("MockHover", (), {"contents": None})()
+    assert lsp_client._hover_value(hover) == "<no hover info>"
+
+
+def test_language_to_multilspy_enum_returns_mapping(lsp_client):
+    import pytest
+
+    if lsp_client._Language is None:
+        with pytest.raises(RuntimeError, match="multilspy is not installed"):
+            lsp_client._language_to_multilspy_enum("python")
+    else:
+        result = lsp_client._language_to_multilspy_enum("python")
+        assert result is not None
