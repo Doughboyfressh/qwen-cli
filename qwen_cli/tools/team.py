@@ -9,10 +9,12 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import qwen_cli.core.config as _config
+
+UTC = timezone.utc  # noqa: UP017 — datetime.UTC exists only on 3.11+; alias keeps 3.10 compat
 
 _logger = logging.getLogger("qwen.team")
 
@@ -44,7 +46,7 @@ def _ct_atomic_write(path: Path, data: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
-        os.replace(tmp, str(path))
+        Path(tmp).replace(path)
     except Exception:
         Path(tmp).unlink(missing_ok=True)
         raise

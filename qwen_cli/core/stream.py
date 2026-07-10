@@ -3,11 +3,11 @@
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
 
-from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -547,6 +547,7 @@ TOOLS = [
     },
 ]
 
+_HEARTBEAT_SEC = 30  # print "still waiting" after this many seconds with no token
 _LIVE_PREVIEW_LINES = 18
 
 
@@ -606,7 +607,7 @@ def _live_updater(live: Live, max_lines: int = _LIVE_PREVIEW_LINES) -> Callable[
     return update
 
 
-def _create_with_retry(client: OpenAI, **kwargs) -> Any:
+def _create_with_retry(client: object, **kwargs) -> Any:
     """Create a chat completion with exponential back-off on connection errors."""
     import qwen_cli.main as _main
 
@@ -651,7 +652,7 @@ def _create_with_retry(client: OpenAI, **kwargs) -> Any:
     return None
 
 
-def stream_once(client: OpenAI, messages: list, use_tools: bool, update_fn=None) -> tuple[str, list, dict]:
+def stream_once(client: object, messages: list, use_tools: bool, update_fn=None) -> tuple[str, list, dict]:
     """Returns (text, tool_calls, usage_dict)."""
     import qwen_cli.main as _main
 
@@ -682,10 +683,43 @@ def stream_once(client: OpenAI, messages: list, use_tools: bool, update_fn=None)
         kwargs["tools"] = TOOLS
         kwargs["tool_choice"] = "auto"
 
-    stream = _create_with_retry(client, **kwargs)
     interrupted = False
     try:
+        stream = _create_with_retry(client, **kwargs)
+    except Exception as e:
+        if not content_parts:
+            return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
+        interrupted = True
+        console.print(f"\n[yellow]  [stream error \u2014 {type(e).__name__}: {e}][/yellow]")
+        full_text = "".join(content_parts)
+        api_calls = [] if interrupted else list(tc_buf.values())
+        usage["finish_reason"] = "interrupted" if interrupted else finish_reason
+        usage["truncated"] = interrupted or finish_reason == "length"
+        if not api_calls and use_tools and "<tool_call>" in full_text.lower():
+            clean_text, xml_calls = _parse_xml_tool_calls(full_text)
+            if xml_calls:
+                return clean_text, xml_calls, usage
+        return full_text, api_calls, usage
+    if stream is None:
+        return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
+
+    _hb_stop = threading.Event()
+    _last_chunk_time = time.monotonic()
+    _last_hb_print = 0.0
+
+    def _hb_loop() -> None:
+        nonlocal _last_hb_print
+        while not _hb_stop.wait(timeout=5):
+            elapsed = time.monotonic() - _last_chunk_time
+            if elapsed > _HEARTBEAT_SEC and time.monotonic() - _last_hb_print > _HEARTBEAT_SEC:
+                _last_hb_print = time.monotonic()
+                console.print(f"\n[dim]  still waiting for response ({int(elapsed)}s)...[/dim]")
+
+    threading.Thread(target=_hb_loop, daemon=True).start()
+
+    try:
         for chunk in stream:
+            _last_chunk_time = time.monotonic()
             if hasattr(chunk, "usage") and chunk.usage:
                 usage = {
                     "prompt": getattr(chunk.usage, "prompt_tokens", 0) or 0,
@@ -714,13 +748,12 @@ def stream_once(client: OpenAI, messages: list, use_tools: bool, update_fn=None)
                         if tc.function.arguments:
                             tc_buf[idx]["function"]["arguments"] += tc.function.arguments
     except Exception as e:
-        # Connection dropped mid-stream (e.g. the model server restarted). Salvage
-        # whatever text we have rather than losing the whole turn; drop any partial
-        # tool call since its JSON arguments would be truncated and unusable.
         if not content_parts:
-            raise
+            return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
         interrupted = True
         console.print(f"\n[yellow]  [stream interrupted \u2014 keeping partial reply ({type(e).__name__})][/yellow]")
+    finally:
+        _hb_stop.set()
 
     full_text = "".join(content_parts)
     api_calls = [] if interrupted else list(tc_buf.values())

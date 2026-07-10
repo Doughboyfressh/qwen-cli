@@ -11,6 +11,7 @@ needs them (search keys, BACKUPS_DIR, etc.).  The simplest pattern:
 
 from __future__ import annotations
 
+import contextlib
 import gzip as _gzip
 import json
 import logging
@@ -117,12 +118,23 @@ def _apply_diff(original: str, diff: str) -> str:
     return "".join(result)
 
 
+def _cleanup_backups(keep: int = 50) -> None:
+    """Keep only the most recent N backup files, deleting the rest."""
+    if not BACKUPS_DIR.exists():
+        return
+    files = sorted(BACKUPS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in files[keep:]:
+        with contextlib.suppress(Exception):
+            old.unlink()
+
+
 def _backup_file(p: Path) -> None:
     """Create a timestamped backup of a file before editing it."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     backup.write_text(p.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    _cleanup_backups()
 
 
 # ---------------------------------------------------------------------------

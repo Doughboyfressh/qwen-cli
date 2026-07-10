@@ -394,9 +394,9 @@ def _get_page() -> Any:
     if "page" not in _browser_state or _browser_state.get("closed"):
         try:
             from playwright.sync_api import sync_playwright
-        except ImportError:
+        except ImportError as e:
             msg = "playwright not installed — run: pip install playwright && playwright install chromium"
-            raise RuntimeError(msg)
+            raise RuntimeError(msg) from e
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
@@ -614,7 +614,7 @@ def _browser_do_scroll(page, url="", selector="", value="", screenshot_path=""):
     pixels = int(value) if value and value.lstrip("-").isdigit() else 0
     if pixels:
         console.print(f"[bold cyan]  [browser][/bold cyan] scroll {pixels}px")
-        page.evaluate(f"window.scrollBy(0, {pixels})")
+        page.evaluate("window.scrollBy(0, {})", pixels)
         return f"[scrolled by {pixels}px]"
     console.print("[bold cyan]  [browser][/bold cyan] scroll down")
     page.evaluate("window.scrollBy(0, window.innerHeight)")
@@ -748,9 +748,9 @@ def _get_render_page() -> Any:
     if "page" not in _render_state or _render_state.get("closed"):
         try:
             from playwright.sync_api import sync_playwright
-        except ImportError:
+        except ImportError as e:
             msg = "playwright not installed — run: pip install playwright && playwright install chromium"
-            raise RuntimeError(msg)
+            raise RuntimeError(msg) from e
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"

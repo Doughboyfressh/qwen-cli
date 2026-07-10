@@ -1,14 +1,13 @@
 """REPL module — interactive loop, input, watch, setup, turn execution."""
 
-import asyncio
 import atexit
+import contextlib
 import logging
 import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
@@ -17,7 +16,7 @@ console = Console(force_terminal=True, legacy_windows=False)
 
 
 class _ReplContext:
-    def __init__(self, history: list[dict], base_system: str, client) -> None:
+    def __init__(self, history: list[dict], base_system: str, client: object) -> None:
         self.history = history
         self.base_system = base_system
         self.client = client
@@ -70,6 +69,7 @@ def _make_pt_session() -> None:
     from prompt_toolkit.completion import Completer as _PtCompleter
     from prompt_toolkit.completion import Completion as _PtCompletion
     from prompt_toolkit.history import FileHistory as _PtFileHistory
+
     from qwen_cli.core.config import PT_HISTORY_FILE
 
     class _Completer(_PtCompleter):
@@ -103,25 +103,6 @@ def _make_pt_session() -> None:
         complete_while_typing=False,
         enable_history_search=True,
     )
-
-
-def _close_loitering_event_loop() -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        try:
-            loop.close()
-        except RuntimeError:
-            pass
-    except RuntimeError:
-        pass
-    try:
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-    except Exception:
-        pass
 
 
 def _read_input_inline() -> str:
@@ -171,12 +152,7 @@ def _read_input_in_thread() -> str:
 
 
 def read_input() -> str:
-    _close_loitering_event_loop()
-    try:
-        asyncio.get_running_loop()
-        return _read_input_in_thread()
-    except RuntimeError:
-        return _read_input_inline()
+    return _read_input_inline()
 
 
 def _watch_worker(mtimes: dict[str, float]) -> None:
@@ -240,32 +216,16 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
 
     ctx.history = _main._maybe_autocompact(ctx.history, ctx.base_system, ctx.client)
 
-    if _main._turn_count % _main.AUTO_SAVE_INTERVAL == 0:
+    from qwen_cli.core.config import AUTO_SAVE_INTERVAL
+
+    if _main._turn_count % AUTO_SAVE_INTERVAL == 0:
         _main._silent_autosave(ctx.history, ctx.base_system)
 
     threading.Thread(
-        target=_main._auto_extract_memory,
-        args=(ctx.client, user_input, reply),
+        target=_main._run_background_tasks,
+        args=(ctx.client, user_input, reply, list(ctx.history), _main._turn_count),
         daemon=True,
     ).start()
-
-    threading.Thread(
-        target=_main._intel_process_queue,
-        args=(ctx.client,),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=_main._intel_extract_topics,
-        args=(ctx.client, user_input, reply),
-        daemon=True,
-    ).start()
-
-    if _main._turn_count == 1:
-        threading.Thread(
-            target=_main._generate_session_title,
-            args=(ctx.client, list(ctx.history)),
-            daemon=True,
-        ).start()
 
     runnable = _main._extract_runnable_code(reply)
     if runnable:
@@ -298,7 +258,7 @@ def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
     return False
 
 
-def _repl_setup(client: OpenAI) -> tuple[str, list, _ReplContext]:
+def _repl_setup(client: object) -> tuple[str, list, _ReplContext]:
     import qwen_cli.main as _main
 
     _setup_tab_completion()
@@ -363,6 +323,9 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
             console.print()
             if history:
                 _main.save_session(history, base_system)
+            with contextlib.suppress(Exception):
+                _main.record_session_changes_memory(ctx.client)
+            _cleanup_watch()
             console.print("[dim]Bye.[/dim]")
             break
 
@@ -374,6 +337,7 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
             directive = parts[0].lower()
             arg = parts[1].strip() if len(parts) > 1 else ""
             if _dispatch_command(ctx, directive, arg):
+                _cleanup_watch()
                 break
             continue
 
@@ -384,18 +348,27 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
 
         user_input = _main.expand_at_refs(user_input)
         _main._last_user_input = user_input
-        _run_turn_and_handle_reply(ctx, user_input, allow_tools=not no_tools)
+        try:
+            _run_turn_and_handle_reply(ctx, user_input, allow_tools=not no_tools)
+        except Exception as _repl_err:
+            _logger.exception("Unhandled error in turn")
+            console.print(f"\n[red]  [error] {_repl_err}[/red]")
+            console.print("[dim]  Type /retry to try again.[/dim]")
 
 
 def _cleanup_watch() -> None:
     import qwen_cli.main as _main
 
+    if not hasattr(_main, "_watch_stop"):
+        return
     _main._watch_stop.set()
     if _main._watch_thread and _main._watch_thread.is_alive():
         _main._watch_thread.join(timeout=2)
     _main._watch_stop.clear()
-    _main._watched_files.clear()
-    _main._watch_pending.clear()
+    if hasattr(_main, "_watched_files"):
+        _main._watched_files.clear()
+    if hasattr(_main, "_watch_pending"):
+        _main._watch_pending.clear()
     _main._watch_thread = None
 
 

@@ -56,12 +56,12 @@ ignore = [
     "EM101",  # raw-string-in-exception
     "EM102",  # f-string-in-exception
     "PGH003", # blanket-type-ignore
-    "S311",   # suspicious-non-cryptographic-random-usage
-    "S310",   # suspicious-url-open-usage
-    "S324",   # hashlib-insecure-hash-function
-    "S602",   # subprocess-popen-with-shell-equals-true
-    "S603",   # subprocess-without-shell-equals-true
-    "S607",   # start-process-with-partial-path
+    "S311",   # suspicious-non-cryptographic-random-usage — reviewed
+    "S310",   # suspicious-url-open-usage — reviewed
+    "S324",   # hashlib-insecure-hash-function — reviewed
+    "S602",   # subprocess-popen-with-shell-equals-true — intentional metacharacter fallback in run_command
+    "S603",   # subprocess-without-shell-equals-true — by design: AI agent runs user/AI commands
+    "S607",   # start-process-with-partial-path — git in PATH is trusted
     "DTZ005", # call-datetime-now-without-tzinfo
     "DTZ006", # call-datetime-fromtimestamp
     "A002",   # builtin-argument-shadowing

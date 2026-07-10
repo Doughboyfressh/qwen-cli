@@ -20,12 +20,10 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
 import contextlib
 import logging as _logging
 import logging.handlers as _logging_handlers
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 
-
-from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -33,6 +31,14 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
+
+
+def _get_openai():
+    """Lazy-load openai module (heavy import: httpx, pydantic, etc.)."""
+    import openai as _openai_mod
+    return _openai_mod.OpenAI
+
+
 _logging.basicConfig(
     filename=str(Path.home() / ".qwen-cli" / "qwen.log"),
     level=_logging.INFO,
@@ -122,8 +128,12 @@ _apply_diff, do_web_search, do_fetch_url, do_get_video_transcript, do_search_new
     _qt.presearch_decision,
 )
 
-from qwen_cli.tools.browser import do_browser_action, do_fetch_rendered  # noqa: E402
-
+from qwen_cli.core.repl import (  # noqa: E402
+    _repl_loop,
+    _repl_setup,
+    _run_turn_and_handle_reply,  # noqa: F401 — accessed via _main. in commands.py
+    _watch_worker,  # noqa: F401 — accessed via _main. in commands.py
+)
 from qwen_cli.core.stream import (  # noqa: E402
     TOOLS,
     _live_updater,
@@ -131,13 +141,7 @@ from qwen_cli.core.stream import (  # noqa: E402
     _strip_think,
     stream_once,
 )
-
-from qwen_cli.core.repl import (  # noqa: E402
-    _repl_loop,
-    _repl_setup,
-    _run_turn_and_handle_reply,  # noqa: F401 — accessed via _main. in commands.py
-    _watch_worker,  # noqa: F401 — accessed via _main. in commands.py
-)
+from qwen_cli.tools.browser import do_browser_action, do_fetch_rendered  # noqa: E402
 
 console = Console(force_terminal=True, legacy_windows=False)
 
@@ -161,7 +165,7 @@ except Exception:
 
 _pt_session = None
 
-_cli_client: "OpenAI | None" = None  # set in main(); allows tool fns to make direct API calls
+_cli_client: object | None = None  # set in main(); allows tool fns to make direct API calls
 
 _backup_stack: list[dict] = []  # stack of backups; /undo pops the most recent
 _MAX_BACKUP_STACK = 10
@@ -203,6 +207,16 @@ _focus_set: list[str] = []  # files loaded via /focus this session
 _session_changes: dict[str, str] = {}  # path → original content before first edit
 _tool_call_retry_log: dict[int, list] = {}  # depth → list of (tool, error) for retry context
 
+# --- Enforced verification (agent mode) -------------------------------------
+# Tools that mutate files; after any of these, /agent will not accept AGENT_DONE
+# until at least one verifying tool has run.
+_MUTATING_FILE_TOOLS = frozenset({"patch_file", "write_file", "move_file", "delete_file"})
+# Tools that count as verification (checking real state after a change).
+_VERIFYING_TOOLS = frozenset(
+    {"read_file", "run_command", "run_script", "lsp_query", "search_files", "find_files", "list_directory"}
+)
+_last_turn_tool_names: list[str] = []  # tool names executed during the current run_turn, in order
+
 _model_params: dict = {}  # runtime overrides — layered on top of active preset
 
 _active_preset: str = _CFG.get("preset", "thinking") if _CFG.get("preset") in SAMPLING_PRESETS else "thinking"
@@ -219,6 +233,16 @@ _intel_enabled = threading.Event()  # thread-safe flag for intel crawlers
 _INTEL_INTERVAL = 240  # seconds between each crawler's crawl cycles
 _INTEL_INJECT_N = 6  # recent feed entries injected into system prompt
 _INTEL_CRAWLERS = 3  # number of parallel background browser threads
+
+# Module-level thread pool for parallel tool execution — avoids per-turn pool creation
+_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="qwen-tool")
+
+
+def _get_pool() -> concurrent.futures.ThreadPoolExecutor:
+    return _POOL
+
+
+atexit.register(lambda: _POOL.shutdown(wait=False))
 
 
 def _intel_default_topics() -> list[dict]:
@@ -241,9 +265,6 @@ def _intel_default_topics() -> list[dict]:
 _INTEL_DEFAULT_TOPICS: list[dict] = _intel_default_topics()
 
 MEMORY_CURATE_INTERVAL = 10  # consolidate memory.md every N auto-extractions
-
-
-
 
 
 _PARALLEL_TOOLS = frozenset(
@@ -392,8 +413,6 @@ from qwen_cli.tools.team import (  # noqa: E402, F401  — re-exported for tests
     do_team_task_add,
 )
 
-
-
 BASE_SYSTEM = (
     "You are a helpful AI assistant running locally via llama.cpp. "
     "You DO have persistent memory across sessions: facts from conversations are automatically "
@@ -456,7 +475,21 @@ BASE_SYSTEM = (
     "statistic, quote, or technical detail — if you have any uncertainty at all, call web_search first. "
     "Do not say 'I think' or 'I believe' and then state an unverified fact. Search and verify first. "
     "If you search and still cannot find a reliable source, say explicitly 'I couldn't verify this' "
-    "rather than guessing. It is always better to say 'let me check' than to state something wrong confidently."
+    "rather than guessing. It is always better to say 'let me check' than to state something wrong confidently.\n\n"
+    "WORKING DISCIPLINE — how to execute any non-trivial task:\n"
+    "1. PLAN: state a short plan (2-5 steps) before acting. Revise it if you learn something that changes it.\n"
+    "2. GROUND: read a file before editing it; check real state with run_command instead of assuming. "
+    "Never edit code you have not read this session.\n"
+    "3. ACT: make the smallest change that solves the problem. One logical change at a time.\n"
+    "4. VERIFY: after every change, prove it worked — run the tests, run the code, re-read the file, "
+    "or check the output. A step is not done until verified. Never claim success without evidence.\n"
+    "5. REPORT: end with 1-3 sentences on what changed and how you verified it. No filler, "
+    "no restating the plan, no apologizing.\n"
+    "If a step fails: read the actual error, form a hypothesis, fix, re-verify. "
+    "If still stuck after 3 distinct attempts, stop and tell the user what you tried, what you observed, "
+    "and what you would try next — do not loop on the same failing approach.\n"
+    "Style: be direct and concise. Lead with the answer, then supporting detail. "
+    "Do not narrate every tool call. Do not pad responses with caveats or summaries of what you are about to do."
 )
 
 HELP_TEXT = """
@@ -682,7 +715,7 @@ def _detect_test_command(root: Path) -> str | None:
 # that interactive edits show up promptly; _invalidate_git_cache() forces a
 # refresh the instant we know state changed (e.g. after committing).
 _GIT_CTX_CACHE: dict[str, tuple[float, str]] = {}  # cwd -> (monotonic_ts, context)
-_GIT_CTX_TTL = 3.0
+_GIT_CTX_TTL = 5.0
 
 
 def _invalidate_git_cache() -> None:
@@ -703,43 +736,26 @@ def get_git_context() -> str:
 
 
 def _compute_git_context() -> str:
-    """Internal helper: compute git context."""
     try:
-        check = subprocess.run(
-            "git rev-parse --is-inside-work-tree",
-            shell=True,
-            capture_output=True,
-            timeout=5,
+        result = subprocess.run(
+            ["git", "status", "-b", "--porcelain"],
+            capture_output=True, text=True, timeout=5, encoding="utf-8",
         )
-        if check.returncode != 0:
+        if result.returncode != 0:
             return ""
-        branch = subprocess.run(
-            "git branch --show-current",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            encoding="utf-8",
-        ).stdout.strip()
-        status = subprocess.run(
-            "git status --short",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            encoding="utf-8",
-        ).stdout.strip()
+        lines = result.stdout.strip().splitlines()
+        parts = []
+        branch_line = lines[0] if lines else ""
+        if branch_line.startswith("## "):
+            branch = branch_line[3:].split("...")[0]
+            parts.append(f"Branch: {branch}")
+        status_lines = [line for line in lines[1:] if line.strip()] if len(lines) > 1 else []
+        if status_lines:
+            parts.append("Status:\n" + "\n".join(status_lines))
         diff_stat = subprocess.run(
-            "git diff --stat HEAD",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            encoding="utf-8",
+            ["git", "diff", "--stat", "HEAD"],
+            capture_output=True, text=True, timeout=5, encoding="utf-8",
         ).stdout.strip()
-        parts = [f"Branch: {branch}"]
-        if status:
-            parts.append(f"Status:\n{status}")
         if diff_stat:
             parts.append(f"Diff stat:\n{diff_stat}")
         return "\n".join(parts)
@@ -898,7 +914,6 @@ _COMMANDS = [
     "/board",
     "/intel",
 ]
-
 
 
 # ---------------------------------------------------------------------------
@@ -1292,8 +1307,8 @@ def cmd_search_sessions(query: str) -> None:
 def cmd_params(arg: str) -> None:
     """Get or set runtime model parameters (temperature, top_p, max_tokens, presence_penalty)."""
     global _model_params, _active_preset
-    _PARAM_ALIASES = {"temp": "temperature", "topp": "top_p", "max": "max_tokens", "pp": "presence_penalty"}
-    _VALID = ("temperature", "top_p", "max_tokens", "presence_penalty")
+    _param_aliases = {"temp": "temperature", "topp": "top_p", "max": "max_tokens", "pp": "presence_penalty"}
+    _valid = ("temperature", "top_p", "max_tokens", "presence_penalty")
     if not arg or arg in ("list", "show", ""):
         preset = SAMPLING_PRESETS.get(_active_preset, {})
         console.print(f"[bold]Preset:[/bold] [cyan]{_active_preset}[/cyan]  (thinking · code · instruct)")
@@ -1322,9 +1337,9 @@ def cmd_params(arg: str) -> None:
         console.print("[yellow][usage: /params <name> <value>  or  /params reset][/yellow]")
         return
     name, val_str = parts[0].lower(), parts[1]
-    name = _PARAM_ALIASES.get(name, name)
-    if name not in _VALID:
-        console.print(f"[yellow][unknown param: {name} — valid: {', '.join(_VALID)}][/yellow]")
+    name = _param_aliases.get(name, name)
+    if name not in _valid:
+        console.print(f"[yellow][unknown param: {name} — valid: {', '.join(_valid)}][/yellow]")
         return
     try:
         val = int(val_str) if name == "max_tokens" else float(val_str)
@@ -1493,7 +1508,7 @@ def cmd_stats(history: list) -> None:
     console.print(t)
 
 
-def cmd_review(arg: str, history: list, base_system: str, client: OpenAI) -> None:
+def cmd_review(arg: str, history: list, base_system: str, client: object) -> None:
     """Structured code review targeting a file or the current /focus set."""
     targets: list[Path] = []
     if arg:
@@ -1551,7 +1566,7 @@ def cmd_review(arg: str, history: list, base_system: str, client: OpenAI) -> Non
             pass
 
 
-def cmd_error(history: list, base_system: str, client: OpenAI) -> None:
+def cmd_error(history: list, base_system: str, client: object) -> None:
     """Paste clipboard content as an error and immediately diagnose it."""
     global _turn_count
     error_text = ""
@@ -1912,8 +1927,6 @@ def _is_dangerous(command: str) -> bool:
     return bool(_re.search(r"\|\s*(bash|sh|zsh|fish|python\d*|perl|ruby)\b", command))
 
 
-
-
 _MAX_CMD_OUTPUT = 25_000
 
 _SCRIPT_INTERP: dict[str, tuple[str, str]] = {
@@ -1960,9 +1973,9 @@ def do_run_command(
     cancelled = threading.Event()
     t0 = time.monotonic()
 
-    _SHELL_META = re.compile(r"[|;&$`<>()\[\]{}!\\\n]")
+    _shell_meta = re.compile(r"[|;&$`<>()\[\]{}!\\\n]")
     try:
-        if _SHELL_META.search(command):
+        if _shell_meta.search(command):
             _logger.warning("shell=True for command with metacharacters: %.120s", command)
             proc = subprocess.Popen(
                 command,
@@ -2540,7 +2553,7 @@ def do_delete_file(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def list_models(client: OpenAI) -> list[str]:
+def list_models(client: object) -> list[str]:
     """List Models."""
     try:
         return [m.id for m in client.models.list().data]
@@ -2588,19 +2601,95 @@ def cmd_paste(history: list) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_background_tasks(client, user_msg: str, reply: str, history_snapshot: list, turn_count: int) -> None:
+    with _BG_LLM_SEM:
+        _auto_extract_memory(client, user_msg, reply)
+        _intel_process_queue(client)
+        if turn_count == 1:
+            _generate_session_title(client, history_snapshot)
+    _intel_extract_topics(client, user_msg, reply)
 
 
+def record_session_changes_memory(client: object | None = None) -> None:
+    """Session-end hook: if files were modified this session, log a dated entry to memory.md.
+
+    Always writes a deterministic entry (file list). If the model is reachable, the
+    entry is upgraded to a one-line summary of what actually changed, built from the
+    real diffs (original content is kept in _session_changes).
+    """
+    if not _session_changes:
+        return
+    names = sorted({Path(p).name for p in _session_changes})
+    shown = ", ".join(names[:12]) + (f" (+{len(names) - 12} more)" if len(names) > 12 else "")
+    date = datetime.now().strftime("%Y-%m-%d")
+    line = f"- {date}: modified {shown}"
+
+    if client is not None:
+        try:
+            import difflib
+
+            chunks = []
+            for path_str, original in list(_session_changes.items())[:8]:
+                try:
+                    current = Path(path_str).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                diff = "\n".join(
+                    difflib.unified_diff(
+                        original.splitlines(),
+                        current.splitlines(),
+                        fromfile=Path(path_str).name,
+                        tofile=Path(path_str).name,
+                        lineterm="",
+                        n=1,
+                    )
+                )
+                if diff:
+                    chunks.append(diff[:1200])
+            if chunks:
+                prompt = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize these code diffs in ONE line under 120 characters: "
+                            "what changed, past tense, no filler. Reply with only the line."
+                        ),
+                    },
+                    {"role": "user", "content": "\n\n".join(chunks)[:6000]},
+                ]
+                resp = client.chat.completions.create(
+                    model=MODEL, messages=prompt, stream=False, max_tokens=80, timeout=AUX_LLM_TIMEOUT
+                )
+                summary = (resp.choices[0].message.content or "").strip().splitlines()[0].strip()
+                if 10 < len(summary) <= 200:
+                    line = f"- {date}: {summary} (files: {shown})"
+        except Exception:
+            _logger.debug("Session-change summary via model failed; using file list")
+
+    marker = "# Recent Changes"
+    with _memory_lock:
+        mem = load_memory()
+        # Dedup: skip if an entry for the same date and file set is already logged
+        # (prevents repeated identical entries from tool-test or short sessions).
+        prefix = f"- {date}:"
+        for existing in mem.splitlines():
+            if existing.startswith(prefix) and shown in existing:
+                return
+        if marker in mem:
+            idx = mem.index(marker) + len(marker)
+            mem = mem[:idx] + "\n\n" + line + mem[idx:]
+        else:
+            mem = (mem + f"\n\n{marker}\n\n{line}").strip()
+        save_memory(mem.strip())
+    console.print(f"[dim][memory: logged session changes — {shown}][/dim]")
 
 
-def _auto_extract_memory(client: OpenAI, user_msg: str, assistant_msg: str) -> None:
-    """Background: pull memorable facts from this exchange and append to memory.md."""
+def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
+    """Pull memorable facts from this exchange and append to memory.md."""
     global _auto_memory_count
     with _main_llm_busy_lock:
         if _main_llm_busy:
             return
-        return
-    if not _BG_LLM_SEM.acquire(blocking=False):
-        return
     try:
         excerpt = f"User: {user_msg[:600]}\n\nAssistant: {assistant_msg[:1000]}"
         prompt = [
@@ -2634,11 +2723,9 @@ def _auto_extract_memory(client: OpenAI, user_msg: str, assistant_msg: str) -> N
                     _curate_memory(client, locked=True)
     except Exception:
         _logger.debug("Auto-memory extraction failed")
-    finally:
-        _BG_LLM_SEM.release()
 
 
-def _curate_memory(client: OpenAI, locked: bool = False) -> None:
+def _curate_memory(client: object, locked: bool = False) -> None:
     """Background: deduplicate and consolidate memory.md when it grows noisy."""
     if not locked:
         lock_ctx = _memory_lock
@@ -2770,7 +2857,7 @@ def _intel_crawl_once() -> None:
         _logger.debug("Intel background crawl failed for topic '%s'", topic.get("name", "?"))
 
 
-def _intel_process_queue(client: OpenAI) -> None:
+def _intel_process_queue(client) -> None:
     """Post-turn: LLM-summarize queued raw results, update feed, train memory."""
     items = _intel_dequeue_all()
     if not items:
@@ -2778,42 +2865,36 @@ def _intel_process_queue(client: OpenAI) -> None:
     with _main_llm_busy_lock:
         if _main_llm_busy:
             return
-    if not _BG_LLM_SEM.acquire(blocking=False):
-        return
-    try:
-        for item in items:
-            try:
-                prompt = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize these web search results into 3-5 concise bullet points "
-                            "(max 90 chars each). Focus on concrete facts, releases, and updates. "
-                            "No preamble, just the bullets."
-                        ),
-                    },
-                    {"role": "user", "content": f"Topic: {item['topic']}\n\n{item['raw'][:3000]}"},
-                ]
-                resp = client.chat.completions.create(
-                    model=MODEL,
-                    messages=prompt,
-                    stream=False,
-                    max_tokens=250,
-                    timeout=AUX_LLM_TIMEOUT,
-                )
-                summary = (resp.choices[0].message.content or "").strip()
-                if not summary or len(summary) < 20:
-                    continue
-                _intel_prepend_entry(item["topic"], summary)
-                # Training: persist durable facts (versions, releases, alerts) to memory
-                _intel_train_memory(client, item["topic"], summary)
-            except Exception:
-                _logger.debug("Intel queue item '%s' failed", item.get("topic", "?"))
-    finally:
-        _BG_LLM_SEM.release()
+    for item in items:
+        try:
+            prompt = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize these web search results into 3-5 concise bullet points "
+                        "(max 90 chars each). Focus on concrete facts, releases, and updates. "
+                        "No preamble, just the bullets."
+                    ),
+                },
+                {"role": "user", "content": f"Topic: {item['topic']}\n\n{item['raw'][:3000]}"},
+            ]
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=prompt,
+                stream=False,
+                max_tokens=250,
+                timeout=AUX_LLM_TIMEOUT,
+            )
+            summary = (resp.choices[0].message.content or "").strip()
+            if not summary or len(summary) < 20:
+                continue
+            _intel_prepend_entry(item["topic"], summary)
+            _intel_train_memory(client, item["topic"], summary)
+        except Exception:
+            _logger.debug("Intel queue item '%s' failed", item.get("topic", "?"))
 
 
-def _intel_train_memory(client: OpenAI, topic_name: str, summary: str) -> None:
+def _intel_train_memory(client: object, topic_name: str, summary: str) -> None:
     """If the intel summary contains durable facts, add them to persistent memory."""
     today = datetime.now().strftime("%Y-%m-%d")
     if _intel_memory_written.get(topic_name) == today:
@@ -2849,13 +2930,11 @@ def _intel_train_memory(client: OpenAI, topic_name: str, summary: str) -> None:
         _logger.debug("Intel memory training failed for '%s'", topic_name)
 
 
-def _intel_extract_topics(client: OpenAI, user_msg: str, reply: str) -> None:
+def _intel_extract_topics(client, user_msg: str, reply: str) -> None:
     """Post-turn: extract new search-worthy topics from this exchange and track them."""
     with _main_llm_busy_lock:
         if _main_llm_busy:
             return
-    if not _BG_LLM_SEM.acquire(blocking=False):
-        return
     try:
         prompt = [
             {
@@ -2895,8 +2974,6 @@ def _intel_extract_topics(client: OpenAI, user_msg: str, reply: str) -> None:
         _intel_save_topics(topics)
     except Exception:
         _logger.debug("Intel topic extraction failed")
-    finally:
-        _BG_LLM_SEM.release()
 
 
 def _intel_crawler_thread(delay_s: int) -> None:
@@ -2969,12 +3046,33 @@ def _confidence_warning(text: str) -> None:
         )
 
 
-def cmd_agent(goal: str, history: list, base_system: str, client: OpenAI, max_iter: int = 20) -> None:
-    """Autonomous agent loop: model iterates with tools until it emits AGENT_DONE."""
+def _verification_pending(tool_names: list, pending: bool = False) -> bool:
+    """Track whether a file mutation happened without a subsequent verifying tool call.
+
+    Scans tool names in order: a mutating tool sets the pending flag; any verifying
+    tool that runs AFTER it clears the flag. Carries state across turns via `pending`.
+    """
+    for name in tool_names:
+        if name in _MUTATING_FILE_TOOLS:
+            pending = True
+        elif pending and name in _VERIFYING_TOOLS:
+            pending = False
+    return pending
+
+
+def cmd_agent(goal: str, history: list, base_system: str, client: object, max_iter: int = 20) -> None:
+    """Autonomous agent loop: model iterates with tools until it emits AGENT_DONE.
+
+    Completion is ENFORCED, not just prompted: if the agent modified files, AGENT_DONE
+    is rejected until at least one verifying tool (tests, execution, re-read) has run
+    after the last mutation.
+    """
     agent_suffix = (
         "\n\nYou are running in autonomous agent mode. Work toward the goal using tools. "
         "After each action, briefly verify the result is correct before moving on — "
         "do not assume success; check the output or re-read the file. "
+        "ENFORCEMENT: if you modify any file, AGENT_DONE will be REJECTED until you verify "
+        "the change afterward (run the tests, execute the code, or re-read the file and check it). "
         "DELEGATION: if the goal has 3+ independent subtasks, or any subtask would take 5+ tool calls, "
         "spawn subagents via team_spawn_agent instead of doing everything yourself. "
         "Subagents have full access to all the same tools. You coordinate, they execute in parallel. "
@@ -2986,6 +3084,8 @@ def cmd_agent(goal: str, history: list, base_system: str, client: OpenAI, max_it
     working = list(history)
     working.append({"role": "user", "content": f"[Agent task] {goal}"})
 
+    pending_verify = False
+    verify_rejections = 0
     for iteration in range(1, max_iter + 1):
         console.print(Rule(f"[dim]Agent {iteration}/{max_iter}[/dim]", style="dim"))
         # Keep the agent going across many iterations — summarize+preserve the task
@@ -3006,7 +3106,31 @@ def cmd_agent(goal: str, history: list, base_system: str, client: OpenAI, max_it
         history.append({"role": "user", "content": f"[Agent task] {goal}" if iteration == 1 else "[continue]"})
         history.append({"role": "assistant", "content": reply})
 
+        pending_verify = _verification_pending(list(_last_turn_tool_names), pending_verify)
+
         if re.search(r"\bAGENT_DONE\b", reply):
+            if pending_verify and verify_rejections < 3:
+                verify_rejections += 1
+                console.print(
+                    f"[yellow]  \\[AGENT_DONE rejected ({verify_rejections}/3) — "
+                    f"files were modified but never verified][/yellow]"
+                )
+                working.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "STOP — your AGENT_DONE was REJECTED. You modified files but never verified "
+                            "the changes. Verify now: run the tests, execute the code, or re-read the "
+                            "modified file(s) and confirm they are correct. State the evidence you found, "
+                            "then emit AGENT_DONE again."
+                        ),
+                    }
+                )
+                continue
+            if pending_verify:
+                console.print(
+                    "[yellow]  \\[agent finished WITHOUT verification after 3 rejections — review changes manually][/yellow]"
+                )
             console.print(f"[green]  \\[agent done in {iteration} iteration{'s' if iteration != 1 else ''}][/green]")
             break
 
@@ -3015,11 +3139,10 @@ def cmd_agent(goal: str, history: list, base_system: str, client: OpenAI, max_it
         console.print(f"[yellow]  \\[agent reached max iterations ({max_iter}) — goal may be unfinished][/yellow]")
 
 
-def cmd_git_commit(client: OpenAI, msg: str = "") -> None:
+def cmd_git_commit(client: object, msg: str = "") -> None:
     """Generate a commit message from staged diff and commit."""
     diff = subprocess.run(
-        "git diff --staged",
-        shell=True,
+        ["git", "diff", "--staged"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -3064,20 +3187,18 @@ def cmd_git_commit(client: OpenAI, msg: str = "") -> None:
         pass
 
 
-def cmd_git_pr(client: OpenAI) -> None:
+def cmd_git_pr(client: object) -> None:
     """Generate a PR description from commits ahead of main/origin/main."""
     for base in ("main", "origin/main", "master", "origin/master"):
         log = subprocess.run(
-            f"git log {base}..HEAD --oneline",
-            shell=True,
+            ["git", "log", f"{base}..HEAD", "--oneline"],
             capture_output=True,
             text=True,
             encoding="utf-8",
         ).stdout.strip()
         if log:
             stat = subprocess.run(
-                f"git diff {base}...HEAD --stat",
-                shell=True,
+                ["git", "diff", f"{base}...HEAD", "--stat"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -3117,7 +3238,7 @@ def cmd_git_pr(client: OpenAI) -> None:
         pass
 
 
-def cmd_task(goal: str, history: list, base_system: str, client: OpenAI) -> None:
+def cmd_task(goal: str, history: list, base_system: str, client: object) -> None:
     """Plan-approve-execute-test agentic task loop."""
     root = Path.cwd()
     test_cmd = _detect_test_command(root)
@@ -3265,7 +3386,7 @@ def cmd_task(goal: str, history: list, base_system: str, client: OpenAI) -> None
 _title_lock = threading.Lock()  # prevents duplicate title generation
 
 
-def _generate_session_title(client: OpenAI, history: list) -> None:
+def _generate_session_title(client: object, history: list) -> None:
     """Background: generate a short session title after the first exchange."""
     global _session_title
     with _main_llm_busy_lock:
@@ -3351,7 +3472,7 @@ def _run_code_block(lang: str, code: str) -> None:
     console.print(result)
 
 
-def _smart_cap(client: OpenAI, result: str, name: str, context: str = "") -> str:
+def _smart_cap(client: object, result: str, name: str, context: str = "") -> str:
     """Cap a tool result. Summarizes web/fetch results via LLM; hard-truncates others."""
     if len(result) <= TOOL_RESULT_LIMIT:
         return result
@@ -3498,123 +3619,98 @@ def _call_with_retry(name: str, args: dict, dispatch_fn, max_retries: int = _TOO
     return f"[tool_call_failed: {name} after {1 + max_retries} attempts\nerrors: {err_summary}\nhint: {hint}]"
 
 
+_TIMEOUT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="qwen-timeout")
+atexit.register(lambda: _TIMEOUT_POOL.shutdown(wait=False))
+
+
 def _call_with_timeout(name: str, fn, *args, timeout: int, **kwargs) -> str:
-    """Call a tool function with a timeout. Returns the result or a timeout error string."""
-    result_holder = []
-    error_holder = []
-
-    def _target() -> None:
-        """Thread target function: call fn(*args, **kwargs) and store the result or exception."""
-        try:
-            result_holder.append(fn(*args, **kwargs))
-        except Exception as e:
-            error_holder.append(e)
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-
-    if t.is_alive():
+    """Call a tool function with a timeout using a shared thread pool."""
+    fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
         return f"[{name}] timed out after {timeout}s. The operation took too long to complete."
-    if error_holder:
-        raise error_holder[0]
-    if result_holder:
-        return result_holder[0]
-    # Shouldn't happen, but be safe
-    return f"[{name}] returned empty result"
+    except Exception:
+        raise
+
+
+_TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
+    "web_search": lambda a: _call_with_timeout(
+        "web_search", do_web_search, a.get("query", ""), timeout=_TOOL_TIMEOUT_SLOW
+    ),
+    "search_news": lambda a: _call_with_timeout(
+        "search_news", do_search_news, a.get("query", ""), a.get("max_results", 8), timeout=_TOOL_TIMEOUT_SLOW
+    ),
+    "fetch_url": lambda a: _call_with_timeout(
+        "fetch_url", do_fetch_url, a.get("url", ""), a.get("max_chars", 20_000), timeout=_TOOL_TIMEOUT_NET
+    ),
+    "describe_image": lambda a: _call_with_timeout(
+        "describe_image", do_describe_image, a.get("url", ""), timeout=_TOOL_TIMEOUT_NET
+    ),
+    "get_video_transcript": lambda a: _call_with_timeout(
+        "get_video_transcript", do_get_video_transcript, a.get("url", ""), a.get("lang", "en"),
+        timeout=_TOOL_TIMEOUT_SLOW,
+    ),
+    "read_file": lambda a: _call_with_timeout(
+        "read_file", do_read_file, a.get("path", ""), a.get("offset", 0), a.get("limit", 0),
+        timeout=_TOOL_TIMEOUT_FAST,
+    ),
+    "list_directory": lambda a: _call_with_timeout(
+        "list_directory", do_list_directory, a.get("path", ""), a.get("recursive", False),
+        timeout=_TOOL_TIMEOUT_FAST,
+    ),
+    "find_files": lambda a: _call_with_timeout(
+        "find_files", do_find_files, a.get("path", ""), a.get("pattern", "*"), timeout=_TOOL_TIMEOUT_FAST
+    ),
+    "search_files": lambda a: _call_with_timeout(
+        "search_files", do_search_files, a.get("path", ""), a.get("query", ""),
+        a.get("pattern", "**/*"), a.get("context", 0), timeout=_TOOL_TIMEOUT_FAST,
+    ),
+    "team_task_list": lambda a: _ct_render_task_list(
+        a.get("team", ""), a.get("owner", ""), a.get("status", "")
+    ),
+    "team_task_add": lambda a: do_team_task_add(
+        a.get("team", ""), a.get("subject", ""), a.get("owner", ""), a.get("priority", "medium")
+    ),
+    "team_board": lambda a: do_team_board(a.get("team", "")),
+    "team_list": lambda _: do_team_list(),
+    "team_inbox_receive": lambda a: _ct_render_inbox(
+        a.get("team", ""), a.get("agent", ""), a.get("peek", False)
+    ),
+}
+
+
+def _ct_render_task_list(team: str, owner: str, status: str) -> str:
+    console.print(f"[dim cyan]  team_task_list: {team}[/dim cyan]")
+    tasks = _ct_task_list(team, owner, status)
+    if not tasks:
+        return f"[no tasks in team '{team}']"
+    lines = [f"Tasks for team '{team}' ({len(tasks)} total):"]
+    for t in tasks:
+        owner_tag = f" [{t['owner']}]" if t.get("owner") else ""
+        lines.append(f"  [{t['id'][:6]}] [{t['status']}] {t['subject']}{owner_tag}")
+    return "\n".join(lines)
+
+
+def _ct_render_inbox(team: str, agent: str, peek: bool = False) -> str:
+    console.print(f"[dim cyan]  team_inbox_receive: {team}/{agent}{'  (peek)' if peek else ''}[/dim cyan]")
+    msgs = _ct_inbox_receive(team, agent, peek=peek)
+    if not msgs:
+        return f"[inbox empty for {agent} in team '{team}']"
+    lines = [f"Messages for {agent} in team '{team}':"]
+    for m in msgs:
+        lines.append(f"  From: {m.get('from', '?')}  |  {m.get('body', '')}")
+    return "\n".join(lines)
 
 
 def _call_tool_safe(name: str, args: dict) -> str:
     """Dispatch a parallel-safe (non-interactive) tool."""
-    if name == "web_search":
-        q = args.get("query", "")
-        console.print(f"[dim cyan]  web_search: {q}[/dim cyan]")
-        result = _call_with_timeout(name, do_web_search, q, timeout=_TOOL_TIMEOUT_SLOW)
-        console.print(f"[dim cyan]  → {len(result.splitlines())} lines[/dim cyan]")
-        return result
-    if name == "search_news":
-        q = args.get("query", "")
-        console.print(f"[dim cyan]  search_news: {q}[/dim cyan]")
-        result = _call_with_timeout(name, do_search_news, q, args.get("max_results", 8), timeout=_TOOL_TIMEOUT_SLOW)
-        console.print(f"[dim cyan]  → {len(result.splitlines())} lines[/dim cyan]")
-        return result
-    if name == "fetch_url":
-        u = args.get("url", "")
-        console.print(f"[dim cyan]  fetch_url: {u}[/dim cyan]")
-        result = _call_with_timeout(name, do_fetch_url, u, args.get("max_chars", 20_000), timeout=_TOOL_TIMEOUT_NET)
-        console.print(f"[dim cyan]  → {len(result):,} chars[/dim cyan]")
-        return result
-    if name == "describe_image":
-        u = args.get("url", "")
-        console.print(f"[dim cyan]  describe_image: {u}[/dim cyan]")
-        return _call_with_timeout(name, do_describe_image, u, timeout=_TOOL_TIMEOUT_NET)
-    if name == "get_video_transcript":
-        u = args.get("url", "")
-        console.print(f"[dim cyan]  get_video_transcript: {u}[/dim cyan]")
-        return _call_with_timeout(name, do_get_video_transcript, u, args.get("lang", "en"), timeout=_TOOL_TIMEOUT_SLOW)
-    if name == "read_file":
-        return _call_with_timeout(
-            name,
-            do_read_file,
-            args.get("path", ""),
-            args.get("offset", 0),
-            args.get("limit", 0),
-            timeout=_TOOL_TIMEOUT_FAST,
-        )
-    if name == "list_directory":
-        p = args.get("path", "")
-        console.print(f"[dim cyan]  list_directory: {p}[/dim cyan]")
-        return _call_with_timeout(name, do_list_directory, p, args.get("recursive", False), timeout=_TOOL_TIMEOUT_FAST)
-    if name == "find_files":
-        p, pat = args.get("path", ""), args.get("pattern", "*")
-        console.print(f"[dim cyan]  find_files: {pat} in {p}[/dim cyan]")
-        return _call_with_timeout(name, do_find_files, p, pat, timeout=_TOOL_TIMEOUT_FAST)
-    if name == "search_files":
-        p, q2 = args.get("path", ""), args.get("query", "")
-        console.print(f"[dim cyan]  search_files: '{q2}' in {p}[/dim cyan]")
-        return _call_with_timeout(
-            name,
-            do_search_files,
-            p,
-            q2,
-            args.get("pattern", "**/*"),
-            args.get("context", 0),
-            timeout=_TOOL_TIMEOUT_FAST,
-        )
-    if name == "team_task_list":
-        team = args.get("team", "")
-        console.print(f"[dim cyan]  team_task_list: {team}[/dim cyan]")
-        tasks = _ct_task_list(team, args.get("owner", ""), args.get("status", ""))
-        if not tasks:
-            return f"[no tasks in team '{team}']"
-        lines = [f"Tasks for team '{team}' ({len(tasks)} total):"]
-        for t in tasks:
-            owner_tag = f" [{t['owner']}]" if t.get("owner") else ""
-            lines.append(f"  [{t['id'][:6]}] [{t['status']}] {t['subject']}{owner_tag}")
-        return "\n".join(lines)
-    if name == "team_task_add":
-        team, subject = args.get("team", ""), args.get("subject", "")
-        console.print(f"[dim cyan]  team_task_add: {team}[/dim cyan]")
-        return do_team_task_add(team, subject, args.get("owner", ""), args.get("priority", "medium"))
-    if name == "team_board":
-        team = args.get("team", "")
-        console.print(f"[dim cyan]  team_board: {team}[/dim cyan]")
-        return do_team_board(team)
-    if name == "team_list":
-        console.print("[dim cyan]  team_list[/dim cyan]")
-        return do_team_list()
-    if name == "team_inbox_receive":
-        team, agent = args.get("team", ""), args.get("agent", "")
-        peek = args.get("peek", False)
-        console.print(f"[dim cyan]  team_inbox_receive: {team}/{agent}{'  (peek)' if peek else ''}[/dim cyan]")
-        msgs = _ct_inbox_receive(team, agent, peek=peek)
-        if not msgs:
-            return f"[inbox empty for {agent} in team '{team}']"
-        lines = [f"Messages for {agent} in team '{team}':"]
-        for m in msgs:
-            lines.append(f"  From: {m.get('from', '?')}  |  {m.get('body', '')}")
-        return "\n".join(lines)
-    return f"[unknown tool: {name}]"
+    handler = _TOOL_HANDLERS_SAFE.get(name)
+    if handler is None:
+        return f"[unknown tool: {name}]"
+    _last_turn_tool_names.append(name)
+    return handler(args)
 
 
 def do_ask_user(question: str) -> str:
@@ -3627,79 +3723,75 @@ def do_ask_user(question: str) -> str:
         return "[user cancelled]"
 
 
+def _ct_do_task_update(args: dict) -> str:
+    team, task_id = args.get("team", ""), args.get("task_id", "")
+    console.print(f"[dim cyan]  team_task_update: {team}/{task_id}[/dim cyan]")
+    task = _ct_task_update(team, task_id, args.get("status"), args.get("owner"), args.get("note", ""))
+    if not task:
+        return f"[task '{task_id}' not found in team '{team}']"
+    nn = len(task.get("notes", []))
+    notes_tag = f"  ({nn} note{'s' if nn != 1 else ''})" if nn else ""
+    return f"[updated: {task['id'][:6]}] {task['subject']} → {task['status']}{notes_tag}"
+
+
+def _ct_do_inbox_send(args: dict) -> str:
+    team, to = args.get("team", ""), args.get("to", "")
+    msg = args.get("message", "")
+    from_agent = args.get("from_agent", "user")
+    console.print(f"[dim cyan]  team_inbox_send: {team}/{to}[/dim cyan]")
+    msg_id = _ct_inbox_send(team, to, msg, from_agent)
+    return f"[sent message {msg_id[:8]} to {to} in team '{team}']"
+
+
+def _ct_do_spawn_agent(args: dict) -> str:
+    team, agent_name = args.get("team", ""), args.get("agent_name", "")
+    task = args.get("task", "")
+    cwd = args.get("cwd", "")
+    console.print(f"[dim cyan]  team_spawn_agent: {team}/{agent_name}[/dim cyan]")
+    return _ct_spawn(team, agent_name, task, cwd)
+
+
+_TOOL_HANDLERS_INTERACTIVE: dict[str, Callable[[dict], str]] = {
+    "fetch_rendered": lambda a: do_fetch_rendered(a.get("url", ""), a.get("max_chars", 15000)),
+    "browser_action": lambda a: do_browser_action(
+        action=a.get("action", ""),
+        url=a.get("url", ""),
+        selector=a.get("selector", ""),
+        value=a.get("value", ""),
+        screenshot_path=a.get("screenshot_path", ""),
+    ),
+    "run_command": lambda a: do_run_command(
+        a.get("command", ""), a.get("cwd", ""), a.get("timeout", 30),
+        env=a.get("env") or None, stdin=a.get("stdin", ""),
+    ),
+    "run_script": lambda a: do_run_script(
+        a.get("language", ""), a.get("code", ""), cwd=a.get("cwd", ""), timeout=a.get("timeout", 30),
+    ),
+    "patch_file": lambda a: do_patch_file(a.get("path", ""), a.get("diff", "")),
+    "write_file": lambda a: do_write_file(a.get("path", ""), a.get("content", "")),
+    "move_file": lambda a: do_move_file(a.get("src", ""), a.get("dst", "")),
+    "delete_file": lambda a: do_delete_file(a.get("path", "")),
+    "ask_user": lambda a: do_ask_user(a.get("question", "")),
+    "team_task_update": _ct_do_task_update,
+    "team_inbox_send": _ct_do_inbox_send,
+    "team_spawn_agent": _ct_do_spawn_agent,
+}
+
+
 def _dispatch_interactive(name: str, args: dict) -> str:
     """Dispatch an interactive tool (may prompt user — must run on main thread)."""
-    if name == "fetch_rendered":
-        u = args.get("url", "")
-        console.print(f"[bold cyan]  [fetch_rendered][/bold cyan] {u}")
-        return do_fetch_rendered(u, args.get("max_chars", 15000))
-    if name == "browser_action":
-        action = args.get("action", "")
-        console.print(f"[bold cyan]  [browser_action][/bold cyan] {action}")
-        return do_browser_action(
-            action=action,
-            url=args.get("url", ""),
-            selector=args.get("selector", ""),
-            value=args.get("value", ""),
-            screenshot_path=args.get("screenshot_path", ""),
-        )
-    if name == "run_command":
-        return do_run_command(
-            args.get("command", ""),
-            args.get("cwd", ""),
-            args.get("timeout", 30),
-            env=args.get("env") or None,
-            stdin=args.get("stdin", ""),
-        )
-    if name == "run_script":
-        return do_run_script(
-            args.get("language", ""),
-            args.get("code", ""),
-            cwd=args.get("cwd", ""),
-            timeout=args.get("timeout", 30),
-        )
-    if name == "patch_file":
-        return do_patch_file(args.get("path", ""), args.get("diff", ""))
-    if name == "write_file":
-        return do_write_file(args.get("path", ""), args.get("content", ""))
-    if name == "move_file":
-        return do_move_file(args.get("src", ""), args.get("dst", ""))
-    if name == "delete_file":
-        return do_delete_file(args.get("path", ""))
-    if name == "ask_user":
-        return do_ask_user(args.get("question", ""))
-    if name == "team_task_update":
-        team, task_id = args.get("team", ""), args.get("task_id", "")
-        console.print(f"[dim cyan]  team_task_update: {team}/{task_id}[/dim cyan]")
-        task = _ct_task_update(team, task_id, args.get("status"), args.get("owner"), args.get("note", ""))
-        if not task:
-            return f"[task '{task_id}' not found in team '{team}']"
-        nn = len(task.get("notes", []))
-        notes_tag = f"  ({nn} note{'s' if nn != 1 else ''})" if nn else ""
-        return f"[updated: {task['id'][:6]}] {task['subject']} → {task['status']}{notes_tag}"
-    if name == "team_inbox_send":
-        team, to = args.get("team", ""), args.get("to", "")
-        msg = args.get("message", "")
-        from_agent = args.get("from_agent", "user")
-        console.print(f"[dim cyan]  team_inbox_send: {team}/{to}[/dim cyan]")
-        msg_id = _ct_inbox_send(team, to, msg, from_agent)
-        return f"[sent message {msg_id[:8]} to {to} in team '{team}']"
-    if name == "team_spawn_agent":
-        team = args.get("team", "")
-        agent_name = args.get("agent_name", "")
-        task = args.get("task", "")
-        cwd = args.get("cwd", "")
-        console.print(f"[dim cyan]  team_spawn_agent: {team}/{agent_name}[/dim cyan]")
-        return _ct_spawn(team, agent_name, task, cwd)
-    return f"[unknown tool: {name}]"
+    handler = _TOOL_HANDLERS_INTERACTIVE.get(name)
+    if handler is None:
+        return f"[unknown tool: {name}]"
+    _last_turn_tool_names.append(name)
+    return handler(args)
 
 
-def _execute_tool_call(client: "OpenAI", name: str, args: dict) -> str:
+def _execute_tool_call(client, name: str, args: dict) -> str:
     """Dispatch a tool call in pipe mode (no interactive prompts)."""
     if name in _PARALLEL_TOOLS:
         return _call_tool_safe(name, args)
     return _dispatch_interactive(name, args)
-
 
 
 def _auto_presearch(working: list) -> list:
@@ -3764,9 +3856,10 @@ def _compact_tool_loop(working: list, keep_recent_tools: int = 4, head_chars: in
     return new
 
 
-def run_turn(client: OpenAI, messages: list, allow_tools: bool = True) -> str | None:
+def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | None:
     """Full turn with tool-use loop. Returns reply, '' on cancel, None on error."""
     global _last_turn_tokens, _real_ctx_tokens
+    del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
     working = _auto_presearch(list(messages)) if allow_tools else list(messages)
     # Feature 10: Surface unresolved errors from prior turn
     try:
@@ -3964,7 +4057,8 @@ def run_turn(client: OpenAI, messages: list, allow_tools: bool = True) -> str | 
         # Classify tools into sequential batches to avoid conflicts
         batches = _classify_tool_batch(tool_calls, parsed_args)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        try:
+            pool = _get_pool()
             for batch in batches:
                 safe_futures: dict[int, concurrent.futures.Future] = {}
 
@@ -4000,6 +4094,8 @@ def run_turn(client: OpenAI, messages: list, allow_tools: bool = True) -> str | 
                 for i, fut in safe_futures.items():
                     try:
                         result = fut.result(timeout=60)
+                    except KeyboardInterrupt:
+                        raise
                     except Exception as exc:
                         idx = i
                         rname = tool_calls[idx]["function"]["name"]
@@ -4012,12 +4108,18 @@ def run_turn(client: OpenAI, messages: list, allow_tools: bool = True) -> str | 
                         _smart_cap(client, result, tool_calls[i]["function"]["name"], last_user_msg),
                     )
 
-        for i in range(len(tool_calls)):
-            tc_id, result = tool_results[i]
-            working.append({"role": "tool", "tool_call_id": tc_id, "content": result})
+            for i in range(len(tool_calls)):
+                tc_id, result = tool_results[i]
+                working.append({"role": "tool", "tool_call_id": tc_id, "content": result})
 
-        first_call = False
-        depth += 1
+            first_call = False
+            depth += 1
+        except KeyboardInterrupt:
+            console.print("\n[dim][tools cancelled — returning to prompt][/dim]")
+            for i in range(len(tool_calls)):
+                working.append(
+                    {"role": "tool", "tool_call_id": tool_calls[i]["id"], "content": "[user cancelled tool execution]"}
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -4059,21 +4161,21 @@ def truncate_middle(history: list, keep_first: int = 6, keep_last: int = 20) -> 
 # ---------------------------------------------------------------------------
 
 
-def cmd_trim(history: list, client: OpenAI) -> list:
+def cmd_trim(history: list, client: object) -> list:
     """Command: trim."""
     CHUNK = 8
-    KEEP = 4
-    if len(history) < KEEP + CHUNK:
+    keep_count = 4
+    if len(history) < keep_count + CHUNK:
         console.print("[dim][history too short to trim (need ≥12 turns)][/dim]")
         return history
 
     # Separate "work" turns (file writes/patches) from pure chat — keep work turns verbatim
-    _WORK_MARKERS = ("[patched:", "[created:", "[updated:", "[write_file]", "[patch_file]")
+    _work_markers = ("[patched:", "[created:", "[updated:", "[write_file]", "[patch_file]")
     work_pairs: list[tuple[int, dict, dict | None]] = []  # (orig_idx, user_msg, asst_msg)
     chat_only: list[dict] = []
 
-    to_process_full = history[:-KEEP]
-    keep = history[-KEEP:]
+    to_process_full = history[:-keep_count]
+    keep = history[-keep_count:]
 
     i = 0
     while i < len(to_process_full):
@@ -4081,7 +4183,7 @@ def cmd_trim(history: list, client: OpenAI) -> list:
         if msg.get("role") == "user":
             asst = to_process_full[i + 1] if i + 1 < len(to_process_full) else None
             asst_content = (asst.get("content") or "") if asst else ""
-            if any(m in asst_content for m in _WORK_MARKERS):
+            if any(m in asst_content for m in _work_markers):
                 work_pairs.append((i, msg, asst))
                 i += 2
                 continue
@@ -4167,7 +4269,7 @@ def cmd_trim(history: list, client: OpenAI) -> list:
     return history
 
 
-def _maybe_autocompact(history: list, base_system: str, client: "OpenAI") -> list:
+def _maybe_autocompact(history: list, base_system: str, client) -> list:
     """Keep the session going when the context window fills up.
 
     When usage crosses the limit we SUMMARIZE old turns (preserving file-editing
@@ -4237,7 +4339,7 @@ def _maybe_autocompact(history: list, base_system: str, client: "OpenAI") -> lis
 # ---------------------------------------------------------------------------
 
 
-def run_piped(client: OpenAI) -> None:
+def run_piped(client: object) -> None:
     """Run in non-interactive pipe mode with full multi-round tool loop.
 
     stdout → clean final answer only (safe to pipe / redirect to file)
@@ -4361,13 +4463,13 @@ def show_config() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_client() -> "OpenAI":
+def make_client():  # returns OpenAI instance
     """Make Client."""
     global MODEL, ACTIVE_BACKEND
     import httpx
 
-    _timeout = httpx.Timeout(connect=30.0, read=3600.0, write=60.0, pool=10.0)
-    lm_client = OpenAI(base_url=BASE_URL, api_key="no-key", timeout=_timeout)
+    _timeout = httpx.Timeout(connect=30.0, read=120.0, write=60.0, pool=10.0)
+    lm_client = _get_openai()(base_url=BASE_URL, api_key="no-key", timeout=_timeout)
     try:
         lm_client.models.list()
         ACTIVE_BACKEND = "llama.cpp"
@@ -4379,7 +4481,7 @@ def make_client() -> "OpenAI":
         console.print(f"[yellow]  llama.cpp server unreachable — falling back to OpenAI ({FALLBACK_MODEL})[/yellow]")
         MODEL = FALLBACK_MODEL
         ACTIVE_BACKEND = "openai"
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=_timeout)
+        return _get_openai()(api_key=OPENAI_API_KEY, timeout=_timeout)
 
     console.print(f"[yellow]  [warning] llama.cpp server not reachable at {BASE_URL}[/yellow]")
     console.print("[dim]  Set openai_api_key in config.toml or OPENAI_API_KEY env var to enable cloud fallback.[/dim]")
@@ -4387,14 +4489,9 @@ def make_client() -> "OpenAI":
     return lm_client
 
 
-
-
 # ==============================================================================
 # Main Entry Point
 # ==============================================================================
-
-
-
 
 
 def main() -> None:
@@ -4423,6 +4520,7 @@ def main() -> None:
         _logger.debug("LSP server startup pre-warm failed (non-critical)")
 
     from qwen_cli.core.context import clean_old_snapshots as _clean_snaps
+
     _removed = _clean_snaps(keep=5)
     if _removed:
         _logger.debug("Cleaned %d old context snapshots", _removed)
@@ -4450,7 +4548,13 @@ def main() -> None:
         return
 
     base_system, history, ctx = _repl_setup(client)
-    _repl_loop(ctx, history, base_system)
+    try:
+        _repl_loop(ctx, history, base_system)
+    except Exception as _fatal:
+        _logger.exception("Fatal error in REPL loop")
+        _silent_autosave(history, base_system)
+        console.print(f"\n[red][fatal error] {_fatal}[/red]")
+        console.print("[dim]Session autosaved. Check qwen.log for details.[/dim]")
 
 
 def _print_turn_footer(elapsed: float) -> None:

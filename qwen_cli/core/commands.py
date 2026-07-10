@@ -33,6 +33,8 @@ def _cmd_exit(ctx: _ReplContext, arg: str) -> None:
 
     if ctx.history:
         _main.save_session(ctx.history, ctx.base_system)
+    with contextlib.suppress(Exception):
+        _main.record_session_changes_memory(ctx.client)
     _main.console.print("[dim]Bye.[/dim]")
     raise StopIteration
 
@@ -364,7 +366,9 @@ def _cmd_mode(ctx: _ReplContext, arg: str) -> None:
     if not arg:
         modes_list = " / ".join(_main._MODE_PROMPTS.keys())
         if _main._current_mode:
-            _main.console.print(f"[dim][mode: {_main._current_mode} — {_main._MODE_PROMPTS[_main._current_mode]}][/dim]")
+            _main.console.print(
+                f"[dim][mode: {_main._current_mode} — {_main._MODE_PROMPTS[_main._current_mode]}][/dim]"
+            )
         else:
             _main.console.print(f"[dim][mode: default — available: {modes_list} / off][/dim]")
     elif arg in _main._MODE_PROMPTS:
@@ -447,7 +451,7 @@ def _cmd_lsp(ctx: _ReplContext, arg: str) -> None:
 
     _lsp = _main._get_lsp()
 
-    _LSP_DISPATCH = {
+    _lsp_dispatch = {
         "status": lambda _a: _lsp.lsp_status(),
         "diagnose": lambda a: _lsp.lsp_diagnostics(a[0]) if a else "usage: /lsp diagnose <file>",
         "diag": lambda a: _lsp.lsp_diagnostics(a[0]) if a else "usage: /lsp diagnose <file>",
@@ -475,7 +479,7 @@ def _cmd_lsp(ctx: _ReplContext, arg: str) -> None:
         ),
     }
 
-    handler = _LSP_DISPATCH.get(sub)
+    handler = _lsp_dispatch.get(sub)
     if handler:
         result = handler(sub_args)
         if isinstance(result, str) and result.startswith("usage:"):

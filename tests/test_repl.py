@@ -27,17 +27,6 @@ def test_repl_context_construction():
 
 
 # ==============================================================================
-# _close_loitering_event_loop
-# ==============================================================================
-
-
-def test_close_loitering_event_loop_no_running_loop():
-    from qwen_cli.core.repl import _close_loitering_event_loop
-
-    _close_loitering_event_loop()
-
-
-# ==============================================================================
 # read_input
 # ==============================================================================
 
@@ -538,7 +527,7 @@ def test_run_turn_and_handle_reply_autosave(qwen_cli):
     qwen_cli._turn_count = 1
 
     with (
-        patch("qwen_cli.main.AUTO_SAVE_INTERVAL", 2, create=True),
+        patch("qwen_cli.core.config.AUTO_SAVE_INTERVAL", 2),
         patch.object(qwen_cli, "_maybe_autocompact", side_effect=lambda h, bs, c: h),
         patch.object(qwen_cli, "build_system_prompt", return_value="sys"),
         patch.object(qwen_cli, "run_turn", return_value="hello"),

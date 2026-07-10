@@ -11,8 +11,10 @@ This module replaces the blunt truncate-middle approach with a layered system th
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+UTC = timezone.utc  # noqa: UP017 — datetime.UTC exists only on 3.11+; alias keeps 3.10 compat
 
 _logger = logging.getLogger(__name__)
 
@@ -33,7 +35,10 @@ _SNAPSHOT_DIR = Path(__file__).parent / "context_snapshots"
 
 
 def _ensure_snapshot_dir() -> Path:
-    _SNAPSHOT_DIR.mkdir(exist_ok=True)
+    try:
+        _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # non-directory path or permission issue — callers handle absence
     return _SNAPSHOT_DIR
 
 
@@ -236,7 +241,7 @@ class ContextSnapshot:
 
         # Save to disk
         snapshot_path = _ensure_snapshot_dir() / f"snapshot_{timestamp[:16].replace(':', '').replace('-', '')}.json"
-        with open(snapshot_path, "w", encoding="utf-8") as f:
+        with snapshot_path.open("w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2, ensure_ascii=False)
 
         return snapshot
@@ -248,7 +253,7 @@ class ContextSnapshot:
         Returns list of snapshot dicts, most recent first.
         """
         snapshot_dir = _ensure_snapshot_dir()
-        if not snapshot_dir.exists():
+        if not snapshot_dir.is_dir():
             return []
 
         snapshots = sorted(
@@ -260,7 +265,7 @@ class ContextSnapshot:
         results = []
         for snap_path in snapshots[:max_count]:
             try:
-                with open(snap_path, encoding="utf-8") as f:
+                with snap_path.open(encoding="utf-8") as f:
                     snap = json.load(f)
                 if session_id is None or snap.get("session_id") == session_id:
                     results.append(snap)
@@ -499,14 +504,16 @@ class GrowthTracker:
         try:
             from qwen_cli import TOKEN_LIMIT
         except ImportError:
-            TOKEN_LIMIT = 128_000  # Default fallback
+            token_limit = 128_000  # Default fallback
+        else:
+            token_limit = TOKEN_LIMIT
 
         turns_to_80 = -1
         turns_to_90 = -1
 
         if avg_growth > 0:
-            threshold_80 = TOKEN_LIMIT * 0.80
-            threshold_90 = TOKEN_LIMIT * 0.90
+            threshold_80 = token_limit * 0.80
+            threshold_90 = token_limit * 0.90
 
             remaining_80 = max(0, threshold_80 - current_tokens)
             remaining_90 = max(0, threshold_90 - current_tokens)
@@ -647,15 +654,16 @@ def predict_turns_to_threshold(threshold_pct: int = 80) -> int:
     # Calculate for arbitrary threshold
     try:
         from qwen_cli import TOKEN_LIMIT
+        token_limit = TOKEN_LIMIT
     except ImportError:
-        TOKEN_LIMIT = 128_000
+        token_limit = 128_000
 
     current = trend.get("current_tokens", 0)
     avg_growth = trend.get("growth_rate", 0)
     if avg_growth <= 0:
         return -1
 
-    threshold_tokens = TOKEN_LIMIT * threshold_pct // 100
+    threshold_tokens = token_limit * threshold_pct // 100
     remaining = max(0, threshold_tokens - current)
     return max(1, remaining // avg_growth)
 
@@ -684,7 +692,7 @@ def clean_old_snapshots(keep: int = 10) -> int:
     Returns the number of snapshots removed.
     """
     snapshot_dir = _ensure_snapshot_dir()
-    if not snapshot_dir.exists():
+    if not snapshot_dir.is_dir():
         return 0
 
     snapshots = sorted(
@@ -702,3 +710,4 @@ def clean_old_snapshots(keep: int = 10) -> int:
             _logger.debug("Failed to remove old snapshot %s", snap_path)
 
     return removed
+

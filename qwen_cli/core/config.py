@@ -25,8 +25,17 @@ def _load_config() -> dict:
         return {}
 
 
+_VALIDATORS: dict[str, tuple[type | tuple[type, ...], str, bool]] = {
+    "token_limit": (int, "must be a positive integer", True),
+    "max_tool_depth": (int, "must be a positive integer", True),
+    "max_auto_continue": (int, "must be a non-negative integer", False),
+    "auto_search": (str, "use off, smart, or aggressive", False),
+    "preset": (str, "use thinking, code, or instruct", False),
+}
+
+
 def _validate_config(cfg: dict) -> None:
-    KNOWN_KEYS = {
+    known_keys = {
         "base_url",
         "model",
         "token_limit",
@@ -40,30 +49,27 @@ def _validate_config(cfg: dict) -> None:
         "brave_api_key",
         "auto_search",
         "preset",
+        "browser_proxy",
+        "aux_timeout",
     }
     for key in cfg:
-        if key not in KNOWN_KEYS:
-            suggestions = sorted(KNOWN_KEYS, key=lambda k: len(set(k) ^ set(key)))[:3]
+        if key not in known_keys:
+            suggestions = sorted(known_keys, key=lambda k: len(set(k) ^ set(key)))[:3]
             print(
                 f"[config] Warning: unknown key '{key}' in config.toml — did you mean: {', '.join(suggestions)}?",
                 file=sys.stderr,
             )
-    if "token_limit" in cfg and (not isinstance(cfg["token_limit"], int) or cfg["token_limit"] <= 0):
-        print(
-            f"[config] Warning: token_limit={cfg['token_limit']} is invalid — must be a positive integer",
-            file=sys.stderr,
-        )
-    if "max_tool_depth" in cfg and (not isinstance(cfg["max_tool_depth"], int) or cfg["max_tool_depth"] <= 0):
-        print(
-            f"[config] Warning: max_tool_depth={cfg['max_tool_depth']} is invalid — must be a positive integer",
-            file=sys.stderr,
-        )
-    if "max_auto_continue" in cfg and (not isinstance(cfg["max_auto_continue"], int) or cfg["max_auto_continue"] < 0):
-        print(
-            f"[config] Warning: max_auto_continue={cfg['max_auto_continue']} is invalid"
-            " — must be a non-negative integer",
-            file=sys.stderr,
-        )
+    for key, (typ, msg, positive) in _VALIDATORS.items():
+        if key not in cfg:
+            continue
+        val = cfg[key]
+        if not isinstance(val, typ):
+            print(f"[config] Warning: {key}={val!r} is invalid — {msg}", file=sys.stderr)
+            continue
+        if typ is int and positive and val <= 0:
+            print(f"[config] Warning: {key}={val} is invalid — {msg}", file=sys.stderr)
+        if typ is int and not positive and val < 0:
+            print(f"[config] Warning: {key}={val} is invalid — {msg}", file=sys.stderr)
     if "auto_search" in cfg and cfg["auto_search"] not in ("off", "smart", "aggressive"):
         print(
             f"[config] Warning: auto_search='{cfg['auto_search']}' is invalid — use off, smart, or aggressive",
@@ -112,7 +118,7 @@ INTEL_TOPICS = INTEL_DIR / "topics.json"
 PT_HISTORY_FILE = DATA_DIR / "pt_history.txt"
 
 TOOL_RESULT_LIMIT = 16_000
-AUTO_SAVE_INTERVAL = 5
+AUTO_SAVE_INTERVAL = 1  # save after every turn — lose at most one on crash
 AUX_LLM_TIMEOUT = float(_cfg("aux_timeout", "QWEN_AUX_TIMEOUT", "120"))
 
 AUTO_SEARCH_MODE = _cfg("auto_search", "QWEN_AUTO_SEARCH", "smart").lower()

@@ -46,14 +46,15 @@ start "Qwen LLM Server" "%LLAMA_PATH%" ^
   --mmproj "%USERPROFILE%\.qwen-cli\models\mmproj-F32.gguf" ^
   --alias "Qwen3.6-27B" ^
   --port 8080 ^
-  --host 0.0.0.0 ^
+  --host 127.0.0.1 ^
   -ngl 64 ^
   -c 65536 ^
   --cache-type-k q4_0 ^
   --cache-type-v q4_0 ^
   -np 1 ^
   -t 16 ^
-  --flash-attn on
+  --flash-attn on ^
+  --image-min-tokens 1024
 
 echo [start-qwen] Loading model (30-90 seconds)...
 set "_WAIT=0"

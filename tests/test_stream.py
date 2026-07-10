@@ -71,14 +71,15 @@ def test_stream_once_salvages_partial_on_drop(qwen_cli):
 
 
 def test_stream_once_reraises_when_nothing_received(qwen_cli):
-    # Drop before any content arrives -> nothing to salvage, so the error propagates
-    # (the caller's retry/refresh path handles it).
-    with pytest.raises(Exception):
-        qwen_cli.stream_once(
-            _client([], raise_immediately=True),
-            [{"role": "user", "content": "hi"}],
-            use_tools=False,
-        )
+    # Drop before any content arrives -> returns empty result instead of crashing.
+    text, calls, usage = qwen_cli.stream_once(
+        _client([], raise_immediately=True),
+        [{"role": "user", "content": "hi"}],
+        use_tools=False,
+    )
+    assert text == ""
+    assert calls == []
+    assert usage.get("finish_reason") == "error"
 
 
 def test_stream_once_reports_complete(qwen_cli):
