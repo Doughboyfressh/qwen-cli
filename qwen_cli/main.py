@@ -303,8 +303,6 @@ _SERIAL_BY_DOMAIN = frozenset({"fetch_url", "fetch_rendered", "describe_image", 
 
 def _extract_domain(url: str) -> str:
     """Extract domain from a URL for contention detection."""
-    import re
-
     m = re.search(r"https?://([^/:\d]+)", url)
     return m.group(1) if m else ""
 
@@ -380,9 +378,12 @@ _DANGEROUS_CMD_RE = re.compile(
     r"format\s+[a-z]:|"
     r"git\s+reset\s+--hard|git\s+clean\s+-[^-]*f|"
     r"drop\s+table|drop\s+database|truncate\s+table|"
-    r"dd\s+if=|mkfs\.|shred\s+|"
+    r"dd\s+if=|mkfs[.\s]|shred\s+|"
     r"sudo\s+rm|sudo\s+mkfs|sudo\s+dd|sudo\s+chmod\s+777|"
-    r"chmod\s+777)",
+    r"chmod\s+777|"
+    r"no-preserve-root|"
+    r"shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|"
+    r"invoke-expression|\biex\b|downloadstring)",
     re.IGNORECASE,
 )
 
@@ -1842,8 +1843,9 @@ def load_project_context(arg: str, history: list) -> bool:
                     text = text[:12_000] + "\n... [truncated]"
                 lang = LANG_MAP.get(fpath.suffix.lower(), "")
                 key_sections.append(f"### {fpath.name}\n```{lang}\n{text}\n```")
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.warning("Could not read key file %s: %s", fpath, e)
+                console.print(f"[dim yellow]  [project: skipped unreadable {fpath.name} — {e}][/dim yellow]")
     parts = [f"# Project Context — {root}\n\n## Directory Tree\n```\n{tree}\n```"]
     if key_sections:
         parts.append("## Key Files\n\n" + "\n\n".join(key_sections))
@@ -1908,23 +1910,20 @@ def _is_dangerous(command: str) -> bool:
     # Check the raw command
     if _DANGEROUS_CMD_RE.search(command):
         return True
-    # Check for variable expansion patterns
-    import re as _re
-
     # Detect: CMD=rm; $CMD -rf /
-    if _re.search(r"\$[A-Z_]+\s+(-[a-zA-Z]*r|rm|mkfs|dd|chmod)", command):
+    if re.search(r"\$[A-Z_]+\s+(-[a-zA-Z]*r|rm|mkfs|dd|chmod)", command):
         return True
     # Detect: base64 encoded commands
-    if _re.search(r"base64\s+(-d|--decode)", command):
+    if re.search(r"base64\s+(-d|--decode)", command):
         return True
     # Detect: eval/exec with suspicious content
-    if _re.search(r"eval\s+.*\$\(", command):
+    if re.search(r"eval\s+.*\$\(", command):
         return True
     # Detect: command substitution with dangerous commands
-    if _re.search(r"\$\(.*\b(rm|mkfs|dd|chmod)\b", command):
+    if re.search(r"\$\(.*\b(rm|mkfs|dd|chmod)\b", command):
         return True
-    # Detect: pipe to shell (curl/wget ... | bash/sh/python)
-    return bool(_re.search(r"\|\s*(bash|sh|zsh|fish|python\d*|perl|ruby)\b", command))
+    # Detect: pipe to shell/interpreter (curl/wget/echo ... | bash/sh/python/powershell/iex)
+    return bool(re.search(r"\|\s*(bash|sh|zsh|fish|python\d*|perl|ruby|pwsh|powershell|iex|cmd)\b", command))
 
 
 _MAX_CMD_OUTPUT = 25_000
@@ -2087,7 +2086,7 @@ def do_run_script(language: str, code: str, cwd: str = "", timeout: int = 30) ->
                     f"[dim yellow]  Pre-flight: {result['errors']} error(s), {result['warnings']} warning(s) in script[/dim yellow]"
                 )
         except Exception:
-            pass
+            _logger.debug("LSP pre-flight check unavailable", exc_info=True)
 
     with _tmpmod.NamedTemporaryFile(
         suffix=ext,
@@ -2423,14 +2422,22 @@ def do_search_files(path: str, query: str, pattern: str = "**/*", context: int =
         return f"[error: {e}]"
 
 
-def _cleanup_backups(keep: int = 50) -> None:
-    """Keep only the most recent N backup files, deleting the rest."""
+def _cleanup_backups(keep: int = 50, keep_per_file: int = 10) -> None:
+    """Keep the most recent N backups overall, and at most M per original file.
+
+    The per-file cap stops one hot file (e.g. a test fixture edited hundreds of
+    times) from evicting the only backups of everything else.
+    """
     if not BACKUPS_DIR.exists():
         return
     files = sorted(BACKUPS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in files[keep:]:
-        with contextlib.suppress(Exception):
-            old.unlink()
+    per_file: dict[str, int] = {}
+    for i, f in enumerate(files):
+        orig = f.name.rsplit(".", 2)[0]  # "<original>.<stamp>.bak" → "<original>"
+        per_file[orig] = per_file.get(orig, 0) + 1
+        if i >= keep or per_file[orig] > keep_per_file:
+            with contextlib.suppress(Exception):
+                f.unlink()
 
 
 def _backup_file(p: Path) -> None:
@@ -3869,7 +3876,7 @@ def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | 
             for e in trend["unresolved_errors"][:5]:
                 console.print(f"    {e}")
     except Exception:
-        pass
+        _logger.debug("LSP trend report unavailable", exc_info=True)
 
     use_tools = allow_tools
     first_call = True

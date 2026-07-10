@@ -97,6 +97,25 @@ class TestRecordSessionChangesMemory:
         mem = self.mem_file.read_text(encoding="utf-8")
         assert "robust.py" in mem  # deterministic fallback still wrote the entry
 
+    def test_backup_per_file_cap(self, tmp_path, monkeypatch):
+        import time
+
+        monkeypatch.setattr(qmain, "BACKUPS_DIR", tmp_path)
+        # 15 backups of "hot.txt" + 2 of "rare.txt", hot.txt newest
+        for i in range(2):
+            p = tmp_path / f"rare.txt.2026010{i}_000000.bak"
+            p.write_text("r", encoding="utf-8")
+        time.sleep(0.01)
+        for i in range(15):
+            p = tmp_path / f"hot.txt.202607{i:02d}_000000.bak"
+            p.write_text("h", encoding="utf-8")
+
+        qmain._cleanup_backups(keep=50, keep_per_file=10)
+
+        remaining = [f.name for f in tmp_path.iterdir()]
+        assert sum(1 for n in remaining if n.startswith("hot.txt")) == 10  # capped
+        assert sum(1 for n in remaining if n.startswith("rare.txt")) == 2  # untouched
+
     def test_dedup_same_day_same_files(self):
         f = self.tmp_path / "dup.py"
         f.write_text("y\n", encoding="utf-8")
