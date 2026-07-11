@@ -317,6 +317,15 @@ _CAPTCHA_SIGNALS = [
     "cloudflare",
     "bot verification",
     "security check",
+    # PerimeterX/HUMAN's specific press-and-hold widget copy -- confirmed live
+    # against a real PerimeterX-protected site (zillow.com in headless mode),
+    # where the block page's exact text is "Press & Hold to confirm you are
+    # a human (and not a bot)". Neither this nor the generic patterns below
+    # matched it, so this response was silently returned as if it were real
+    # page content instead of being flagged.
+    "press & hold",
+    "press and hold",
+    "confirm you are a human",
 ]
 
 
@@ -341,6 +350,11 @@ _ANTIBOT_RESPONSE_PATTERNS = [
     "shape security",
     "you need to enable javascript",
     "blocked by firewall",
+    # PerimeterX's actual block-page title phrasing doesn't contain the
+    # contiguous substring "access denied" ("Access to this page has been
+    # denied") -- confirmed live against zillow.com, where this exact page
+    # went undetected by every existing pattern.
+    "page has been denied",
 ]
 
 # Anti-bot challenge widgets are commonly served from a cross-origin iframe
