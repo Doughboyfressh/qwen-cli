@@ -57,6 +57,64 @@ class TestTeams:
 
 
 # ---------------------------------------------------------------------------
+# Legacy / externally-written team configs — members as bare strings
+#
+# Team config.json isn't necessarily written by qwen-cli itself (the docs
+# advertise ClawTeam CLI compatibility). A real config found on disk had
+# "members": ["user", "auditor-arch", ...] — plain strings, not qwen-cli's
+# own {"name": ..., "agentId": ..., ...} dicts. Every consumer that did
+# m["name"] or m.get("name") crashed immediately: "string indices must be
+# integers, not 'str'", confirmed live via team_spawn_agent.
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyStringMembers:
+    def _write_legacy_config(self, tmp_path, team="legacy"):
+        team_dir = tmp_path / ".clawteam" / "teams" / team
+        team_dir.mkdir(parents=True, exist_ok=True)
+        (team_dir / "config.json").write_text(
+            json.dumps({"name": team, "members": ["user", "auditor-arch", "auditor-security"]}),
+            encoding="utf-8",
+        )
+
+    def test_load_team_normalizes_string_members_to_dicts(self, ct, tmp_path):
+        self._write_legacy_config(tmp_path)
+        cfg = ct._ct_load_team("legacy")
+        assert cfg["members"][0] == {
+            "name": "user",
+            "user": "",
+            "agentId": "",
+            "agentType": "unknown",
+            "joinedAt": "",
+        }
+        assert [m["name"] for m in cfg["members"]] == ["user", "auditor-arch", "auditor-security"]
+
+    def test_team_join_does_not_crash_on_legacy_config(self, ct, tmp_path):
+        self._write_legacy_config(tmp_path)
+        member = ct._ct_team_join("legacy", "new-agent")
+        assert member["name"] == "new-agent"
+        cfg = ct._ct_load_team("legacy")
+        assert any(m["name"] == "new-agent" for m in cfg["members"])
+
+    def test_board_render_does_not_crash_on_legacy_config(self, ct, tmp_path):
+        self._write_legacy_config(tmp_path)
+        board = ct._ct_board_render("legacy")
+        assert "auditor-arch" in board
+
+    def test_spawn_leader_resolution_does_not_crash_on_legacy_config(self, ct, tmp_path, monkeypatch):
+        self._write_legacy_config(tmp_path)
+        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", lambda *a, **k: None)
+        result = ct._ct_spawn("legacy", "worker1", "do the thing")
+        assert "Spawned agent 'worker1'" in result
+
+    def test_normalize_member_passes_dicts_through_unchanged(self, ct):
+        from qwen_cli.tools import team as team_mod
+
+        d = {"name": "x", "agentId": "abc"}
+        assert team_mod._ct_normalize_member(d) is d
+
+
+# ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
 

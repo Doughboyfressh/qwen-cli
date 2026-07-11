@@ -52,14 +52,33 @@ def _ct_atomic_write(path: Path, data: str) -> None:
         raise
 
 
+def _ct_normalize_member(m: object) -> dict:
+    """Coerce a team-config member entry into the dict shape this module expects.
+
+    Team config.json files aren't necessarily written by qwen-cli — the docs
+    advertise compatibility with the ClawTeam CLI, which (like a hand-edited
+    config) may store members as bare name strings instead of our own
+    {"name": ..., "agentId": ..., ...} dicts. Reading such a file used to
+    crash immediately the moment anyone joined or spawned into that team
+    (e.g. m["name"] on a str raises "string indices must be integers, not
+    'str'" — confirmed live against a real pre-existing team config).
+    """
+    if isinstance(m, dict):
+        return m
+    return {"name": str(m), "user": "", "agentId": "", "agentType": "unknown", "joinedAt": ""}
+
+
 def _ct_load_team(team: str) -> dict | None:
     cfg = _ct_team_dir(team) / "config.json"
     if not cfg.exists():
         return None
     try:
-        return json.loads(cfg.read_text(encoding="utf-8"))
+        config = json.loads(cfg.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if isinstance(config, dict) and isinstance(config.get("members"), list):
+        config["members"] = [_ct_normalize_member(m) for m in config["members"]]
+    return config
 
 
 def _ct_save_team(team: str, config: dict) -> None:
