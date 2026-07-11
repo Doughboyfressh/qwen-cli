@@ -5,6 +5,7 @@ import contextlib
 import json
 import random as _r
 import time
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -405,6 +406,34 @@ def _browser_save_cookies(page) -> None:
         page.context.storage_state(path=str(COOKIE_FILE))
 
 
+def _parse_proxy_config(proxy_url: str) -> dict | None:
+    """Parse a 'http://user:pass@host:port' style URL into the dict shape
+    Playwright's launch(proxy=...) expects. Returns None if empty/unparseable.
+
+    A bare 'host:port' (no scheme) is treated as http:// -- urlsplit()
+    without "://" present would otherwise misparse the host itself as the
+    scheme (urlsplit("host:8080").hostname is None), silently dropping a
+    proxy a user typed without the scheme prefix.
+    """
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return None
+    if "://" not in proxy_url:
+        proxy_url = f"http://{proxy_url}"
+    parsed = urllib.parse.urlsplit(proxy_url)
+    if not parsed.hostname:
+        return None
+    server = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        server += f":{parsed.port}"
+    proxy: dict = {"server": server}
+    if parsed.username:
+        proxy["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password:
+        proxy["password"] = urllib.parse.unquote(parsed.password)
+    return proxy
+
+
 def _get_page() -> Any:
     """Internal helper: get page."""
     if "page" not in _browser_state or _browser_state.get("closed"):
@@ -416,8 +445,15 @@ def _get_page() -> Any:
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
+        _proxy_url = _CFG.get("browser_proxy", "")
+        _proxy_config = _parse_proxy_config(_proxy_url)
+        if _proxy_url and not _proxy_config:
+            console.print(f"[yellow]  [browser] browser_proxy={_proxy_url!r} could not be parsed — ignoring[/yellow]")
+        elif _proxy_config:
+            console.print(f"[dim]  [browser] using proxy: {_proxy_config['server']}[/dim]")
         browser = pw.chromium.launch(
             headless=False,  # headed mode is harder to detect
+            proxy=_proxy_config,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -453,11 +489,6 @@ def _get_page() -> Any:
             color_scheme="light",
             storage_state=_resolve_storage_state(),
         )
-        # Proxy from config (optional)
-        _cfg_data = _CFG
-        _proxy_url = _cfg_data.get("browser_proxy", "")
-        if _proxy_url:
-            console.print(f"[dim]  [browser] using proxy: {_proxy_url}[/dim]")
         ctx.add_init_script(_STEALTH_JS)
         page = ctx.new_page()
         # Links with target="_blank", OAuth popups, and window.open() all spawn a
@@ -892,6 +923,7 @@ def _get_render_page() -> Any:
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
         bro = pw.chromium.launch(
             headless=True,
+            proxy=_parse_proxy_config(_CFG.get("browser_proxy", "")),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",

@@ -131,3 +131,33 @@ class TestResolveStorageState:
         cookie_file.write_text("{not valid json")
         monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
         assert br._resolve_storage_state() is None
+
+
+class TestParseProxyConfig:
+    def test_empty_returns_none(self):
+        assert br._parse_proxy_config("") is None
+
+    def test_plain_host_port(self):
+        assert br._parse_proxy_config("http://proxy.example.com:8080") == {
+            "server": "http://proxy.example.com:8080"
+        }
+
+    def test_with_credentials(self):
+        result = br._parse_proxy_config("http://alice:s3cret@proxy.example.com:8080")
+        assert result == {
+            "server": "http://proxy.example.com:8080",
+            "username": "alice",
+            "password": "s3cret",
+        }
+
+    def test_url_encoded_credentials_are_decoded(self):
+        result = br._parse_proxy_config("http://ali%40ce:p%40ss@proxy.example.com:8080")
+        assert result["username"] == "ali@ce"
+        assert result["password"] == "p@ss"
+
+    def test_defaults_to_http_scheme_if_missing(self):
+        result = br._parse_proxy_config("proxy.example.com:8080")
+        assert result["server"] == "http://proxy.example.com:8080"
+
+    def test_unparseable_returns_none(self):
+        assert br._parse_proxy_config("   ") is None
