@@ -48,6 +48,45 @@ def _resolve(path: str) -> Path:
     return p.resolve(strict=False) if p.is_absolute() else (Path.cwd() / p).resolve(strict=False)
 
 
+def _find_hunk_location(result: list[str], old_part: list[str], hint: int) -> int | None:
+    """Search for old_part's content in result, starting near hint.
+
+    Returns the index of the first matching line, or None if no match exists
+    anywhere in the file. Used as a fallback when a hunk's stated line number
+    no longer lines up with the file on disk — e.g. the model's belief about
+    line numbers drifted after a context-compaction summary, or an earlier
+    edit in the same patch shifted things unexpectedly. Without this, a single
+    stale line number fails the whole hunk with no recovery path, which is
+    what pushed patch_file's exact-line matching to be abandoned in favor of
+    ad-hoc line-number archaeology via run_script.
+
+    Searches an expanding window around hint first (cheap, and right most of
+    the time for small drift), then falls back to a full-file scan.
+    """
+    if not old_part:
+        return None
+    norm_old = [ln.rstrip() for ln in old_part]
+    n = len(old_part)
+    last_start = len(result) - n
+    if last_start < 0:
+        return None
+
+    def matches_at(i: int) -> bool:
+        return [ln.rstrip() for ln in result[i : i + n]] == norm_old
+
+    for radius in (25, 100, 500):
+        lo = max(0, hint - radius)
+        hi = min(last_start, hint + radius)
+        for i in range(lo, hi + 1):
+            if matches_at(i):
+                return i
+
+    for i in range(last_start + 1):
+        if matches_at(i):
+            return i
+    return None
+
+
 def _apply_diff(original: str, diff: str) -> str:
     """Apply a unified diff to original text. Raises ValueError on mismatch."""
     if not diff.strip():
@@ -103,14 +142,19 @@ def _apply_diff(original: str, diff: str) -> str:
             return [ln.rstrip() for ln in ls]
 
         if _norm(actual) != _norm(old_part):
-            msg = (
-                f"Hunk at original line {src_start + 1} does not match.\n"
-                f"Expected:\n{''.join(old_part)}"
-                f"Got:\n{''.join(actual)}"
-            )
-            raise ValueError(
-                msg,
-            )
+            found = _find_hunk_location(result, old_part, target)
+            if found is None:
+                msg = (
+                    f"Hunk at original line {src_start + 1} does not match, and no matching "
+                    f"content was found anywhere else in the file either.\n"
+                    f"Expected:\n{''.join(old_part)}"
+                    f"Got at line {target + 1}:\n{''.join(actual)}"
+                )
+                raise ValueError(
+                    msg,
+                )
+            offset += found - target
+            target = found
 
         result[target : target + len(old_part)] = new_part
         offset += len(new_part) - len(old_part)
