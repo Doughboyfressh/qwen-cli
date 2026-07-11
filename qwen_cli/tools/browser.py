@@ -336,6 +336,30 @@ def _browser_detect_antibot(page) -> str:
     return ""
 
 
+def _browser_wait_out_antibot(page, max_wait_s: float = 8.0) -> str:
+    """If an anti-bot signal is showing, poll for it to clear on its own.
+
+    Simple Cloudflare-style "Checking your browser..." JS challenges
+    typically auto-resolve in a few seconds once real JS actually executes,
+    which this stealth session supports -- giving up after a token ~0.5s
+    delay (the old behavior) reports "blocked" on plenty of sites that would
+    have passed with a bit more patience. Returns the still-present signal
+    string, or "" if it cleared (or was never there).
+    """
+    pat = _browser_detect_antibot(page)
+    if not pat:
+        return ""
+    deadline = time.time() + max_wait_s
+    while time.time() < deadline:
+        with contextlib.suppress(Exception):
+            page.wait_for_load_state("networkidle", timeout=1500)
+        time.sleep(0.5)
+        pat = _browser_detect_antibot(page)
+        if not pat:
+            return ""
+    return pat
+
+
 def _browser_random_viewport() -> dict:
     """Return a randomized viewport to avoid fingerprint matching."""
     widths = [1280, 1366, 1440, 1536, 1600, 1920]
@@ -434,6 +458,44 @@ def _parse_proxy_config(proxy_url: str) -> dict | None:
     return proxy
 
 
+def _launch_chromium(pw, *, headless: bool, proxy_config: dict | None, args: list[str]) -> tuple[Any, bool]:
+    """Launch Chromium, preferring the real installed Chrome channel.
+
+    Anti-bot systems (Cloudflare, PerimeterX, DataDome, etc.) fingerprint
+    Playwright's bundled Chromium build distinctly from a real Google Chrome
+    install -- using the "chrome" channel is one of the most effective single
+    changes for passing heavier bot checks. Falls back to bundled Chromium if
+    Chrome isn't installed (this tool's own install instructions only mention
+    `playwright install chromium`, so plenty of setups won't have it).
+    ignore_default_args drops Playwright's own --enable-automation flag,
+    another default automation signal.
+
+    Returns (browser, used_real_chrome) -- callers should skip their own
+    user_agent/sec-ch-ua overrides when used_real_chrome is True. Those
+    overrides only touch navigator.userAgent and the User-Agent header, not
+    a real Chrome's own Client Hints (navigator.userAgentData, sec-ch-ua),
+    which still reflect the true version -- spoofing on top of a genuine
+    browser creates a mismatch that's a *worse* tell than leaving it alone.
+    """
+    try:
+        browser = pw.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            proxy=proxy_config,
+            args=args,
+            ignore_default_args=["--enable-automation"],
+        )
+        return browser, True
+    except Exception:
+        browser = pw.chromium.launch(
+            headless=headless,
+            proxy=proxy_config,
+            args=args,
+            ignore_default_args=["--enable-automation"],
+        )
+        return browser, False
+
+
 def _get_page() -> Any:
     """Internal helper: get page."""
     if "page" not in _browser_state or _browser_state.get("closed"):
@@ -451,9 +513,10 @@ def _get_page() -> Any:
             console.print(f"[yellow]  [browser] browser_proxy={_proxy_url!r} could not be parsed — ignoring[/yellow]")
         elif _proxy_config:
             console.print(f"[dim]  [browser] using proxy: {_proxy_config['server']}[/dim]")
-        browser = pw.chromium.launch(
+        browser, _is_real_chrome = _launch_chromium(
+            pw,
             headless=False,  # headed mode is harder to detect
-            proxy=_proxy_config,
+            proxy_config=_proxy_config,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -469,14 +532,18 @@ def _get_page() -> Any:
                 "--lang=en-US",
             ],
         )
-        ctx = browser.new_context(
-            user_agent=_ua,
-            viewport=_browser_random_viewport(),
-            locale="en-US",
-            timezone_id="America/New_York",
-            geolocation={"latitude": 40.7128, "longitude": -74.0060},
-            permissions=["geolocation"],
-            extra_http_headers={
+        _ctx_kwargs: dict[str, Any] = {
+            "viewport": _browser_random_viewport(),
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
+            "permissions": ["geolocation"],
+            "color_scheme": "light",
+            "storage_state": _resolve_storage_state(),
+        }
+        if not _is_real_chrome:
+            _ctx_kwargs["user_agent"] = _ua
+            _ctx_kwargs["extra_http_headers"] = {
                 "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
@@ -485,10 +552,8 @@ def _get_page() -> Any:
                 "sec-fetch-site": "none",
                 "sec-fetch-user": "?1",
                 "accept-language": "en-US,en;q=0.9",
-            },
-            color_scheme="light",
-            storage_state=_resolve_storage_state(),
-        )
+            }
+        ctx = browser.new_context(**_ctx_kwargs)
         ctx.add_init_script(_STEALTH_JS)
         page = ctx.new_page()
         # Links with target="_blank", OAuth popups, and window.open() all spawn a
@@ -590,10 +655,9 @@ def _browser_do_navigate(page, url, selector="", value="", screenshot_path=""):
     if last_nav_err:
         return f"[browser navigation failed: {last_nav_err}]"
     _browser_smart_wait(page, timeout=12000)
-    antibot_pat = _browser_detect_antibot(page)
+    antibot_pat = _browser_wait_out_antibot(page)
     if antibot_pat:
         console.print(f"[bold yellow]  [browser] anti-bot signal detected: {antibot_pat}[/bold yellow]")
-        _browser_random_delay()
     captcha_note = _browser_check_captcha_pause(page)
     _browser_save_cookies(page)
     title = page.title()
@@ -921,9 +985,10 @@ def _get_render_page() -> Any:
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
-        bro = pw.chromium.launch(
+        bro, _is_real_chrome = _launch_chromium(
+            pw,
             headless=True,
-            proxy=_parse_proxy_config(_CFG.get("browser_proxy", "")),
+            proxy_config=_parse_proxy_config(_CFG.get("browser_proxy", "")),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -937,12 +1002,15 @@ def _get_render_page() -> Any:
                 "--lang=en-US",
             ],
         )
-        ctx = bro.new_context(
-            user_agent=_ua,
-            viewport=_browser_random_viewport(),
-            locale="en-US",
-            timezone_id="America/New_York",
-            extra_http_headers={
+        _ctx_kwargs: dict[str, Any] = {
+            "viewport": _browser_random_viewport(),
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "color_scheme": "light",
+        }
+        if not _is_real_chrome:
+            _ctx_kwargs["user_agent"] = _ua
+            _ctx_kwargs["extra_http_headers"] = {
                 "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
@@ -951,9 +1019,8 @@ def _get_render_page() -> Any:
                 "sec-fetch-site": "none",
                 "sec-fetch-user": "?1",
                 "accept-language": "en-US,en;q=0.9",
-            },
-            color_scheme="light",
-        )
+            }
+        ctx = bro.new_context(**_ctx_kwargs)
         ctx.add_init_script(_STEALTH_JS)
         page = ctx.new_page()
         ctx.on("page", lambda new_page: _render_state.update(page=new_page))
@@ -993,6 +1060,11 @@ def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
         # Wait for JS content to settle
         _browser_smart_wait(page, timeout=10000)
 
+        # Simple Cloudflare-style JS challenges typically auto-resolve in a
+        # few seconds once real JS executes -- wait it out rather than
+        # reporting the challenge page as if it were the real content.
+        antibot_pat = _browser_wait_out_antibot(page)
+
         # Check for CAPTCHA (headless triggers it less, but still possible).
         # Non-blocking: this page has no visible window, so there's no one who
         # could solve it here even if we paused.
@@ -1014,6 +1086,8 @@ def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
 
         title = page.title()
         result = f"[Rendered: {url}]\nTitle: {title}\n\n{text}"
+        if antibot_pat:
+            result += f"\n[anti-bot signal: {antibot_pat} — this may be a challenge page, not real content]"
         if captcha_note:
             result += f"\n{captcha_note}"
         return result

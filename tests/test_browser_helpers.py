@@ -4,6 +4,7 @@ These run without Playwright installed — fake page objects stand in for real o
 """
 
 import re
+import time
 
 import qwen_cli.tools.browser as br
 
@@ -161,3 +162,87 @@ class TestParseProxyConfig:
 
     def test_unparseable_returns_none(self):
         assert br._parse_proxy_config("   ") is None
+
+
+class TestWaitOutAntibot:
+    def test_clean_page_returns_immediately(self):
+        page = FakePage(title="Example Domain", body="clean content")
+        start = time.time()
+        result = br._browser_wait_out_antibot(page, max_wait_s=5)
+        assert result == ""
+        assert time.time() - start < 1  # no polling loop entered at all
+
+    def test_challenge_that_clears_returns_empty(self):
+        class ClearingPage:
+            def __init__(self):
+                self.calls = 0
+
+            def title(self):
+                self.calls += 1
+                return "Just a moment..." if self.calls < 2 else "Welcome"
+
+            def inner_text(self, selector, timeout=0):
+                return "checking your browser" if self.calls < 2 else "real content"
+
+            def wait_for_load_state(self, state, timeout=None):
+                pass
+
+        result = br._browser_wait_out_antibot(ClearingPage(), max_wait_s=5)
+        assert result == ""
+
+    def test_persistent_challenge_returns_signal_after_timeout(self):
+        page = FakePage(title="Just a moment...", body="checking your browser")
+        start = time.time()
+        result = br._browser_wait_out_antibot(page, max_wait_s=0.6)
+        assert result == "checking your browser"
+        assert time.time() - start >= 0.6
+
+
+class TestLaunchChromium:
+    def test_prefers_real_chrome_channel(self):
+        calls = []
+
+        class FakePW:
+            class chromium:
+                @staticmethod
+                def launch(**kwargs):
+                    calls.append(kwargs)
+                    return "BROWSER"
+
+        browser, is_real = br._launch_chromium(FakePW(), headless=False, proxy_config=None, args=[])
+        assert browser == "BROWSER"
+        assert is_real is True
+        assert calls[0].get("channel") == "chrome"
+        assert len(calls) == 1
+
+    def test_falls_back_when_chrome_channel_unavailable(self):
+        calls = []
+
+        class FakePW:
+            class chromium:
+                @staticmethod
+                def launch(**kwargs):
+                    calls.append(kwargs)
+                    if kwargs.get("channel") == "chrome":
+                        raise RuntimeError("chrome not found")
+                    return "BROWSER"
+
+        browser, is_real = br._launch_chromium(FakePW(), headless=False, proxy_config=None, args=[])
+        assert browser == "BROWSER"
+        assert is_real is False
+        assert len(calls) == 2
+
+    def test_ignore_default_args_disables_automation_flag(self):
+        calls = []
+
+        class FakePW:
+            class chromium:
+                @staticmethod
+                def launch(**kwargs):
+                    calls.append(kwargs)
+                    return "BROWSER"
+
+        br._launch_chromium(FakePW(), headless=True, proxy_config=None, args=["--foo"])
+        assert calls[0]["ignore_default_args"] == ["--enable-automation"]
+        assert calls[0]["args"] == ["--foo"]
+        assert calls[0]["headless"] is True
