@@ -68,6 +68,9 @@ def _cmd_clear(ctx: _ReplContext, arg: str) -> None:
     """Clear the conversation history, optionally dropping only the last N turns."""
     import qwen_cli.main as _main
 
+    # History is about to shrink either way — the cached real prompt-token count
+    # from the last API response no longer describes it (see _maybe_autocompact).
+    _main._real_ctx_tokens = 0
     if arg.isdigit():
         n = int(arg)
         drop = min(n * 2, len(ctx.history))
@@ -337,6 +340,10 @@ def _cmd_load(ctx: _ReplContext, arg: str) -> None:
 
     result = _main.cmd_load_session(arg, ctx.history, ctx.base_system)
     ctx.history, ctx.base_system = result
+    # The cached real prompt-token count described the OLD history; a freshly
+    # loaded session (possibly much larger or smaller) must be recomputed, or
+    # _maybe_autocompact could skip needed trimming on the very next turn.
+    _main._real_ctx_tokens = 0
 
 
 def _cmd_sessions(ctx: _ReplContext, arg: str) -> None:

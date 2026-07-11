@@ -4278,6 +4278,11 @@ def truncate_middle(history: list, keep_first: int = 6, keep_last: int = 20) -> 
 
 def cmd_trim(history: list, client: object) -> list:
     """Command: trim."""
+    # Whatever this function returns, the last real prompt-token count from the
+    # API no longer describes the (possibly shrunk) history — _maybe_autocompact
+    # must recompute rather than reuse a now-stale figure.
+    global _real_ctx_tokens
+    _real_ctx_tokens = 0
     CHUNK = 8
     keep_count = 4
     if len(history) < keep_count + CHUNK:

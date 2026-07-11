@@ -115,6 +115,23 @@ def test_cmd_trim_preserves_current_task_and_work_turns(qwen_cli, monkeypatch):
     assert any("[patched: config.toml" in (m.get("content") or "") for m in out)
 
 
+def test_cmd_trim_resets_stale_real_ctx_tokens(qwen_cli, monkeypatch):
+    # cmd_trim changes `history`, so a cached real prompt-token count from a
+    # previous API response no longer describes it and must be invalidated —
+    # otherwise _maybe_autocompact could act on stale data on the next turn.
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 12345)
+    monkeypatch.setattr(qwen_cli, "stream_once", lambda *a, **k: ("summary", {}, []))
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"chat {i}"} for i in range(16)]
+    qwen_cli.cmd_trim(history, client="C")
+    assert qwen_cli._real_ctx_tokens == 0
+
+
+def test_cmd_trim_resets_real_ctx_tokens_even_when_too_short(qwen_cli, monkeypatch):
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 999)
+    qwen_cli.cmd_trim([{"role": "user", "content": "hi"}], client="C")
+    assert qwen_cli._real_ctx_tokens == 0
+
+
 # --- mid-run (tool-loop) compaction -----------------------------------------
 
 

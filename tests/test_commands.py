@@ -148,6 +148,31 @@ def test_cmd_clear_full_also_clears_plan(qwen_cli):
         qwen_cli._current_plan.clear()
 
 
+def test_cmd_clear_resets_stale_real_ctx_tokens(qwen_cli, monkeypatch):
+    from qwen_cli.core.commands import _cmd_clear
+
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 12345)
+    ctx = _mock_ctx()
+    ctx.history = [{"role": "user", "content": "hi"}]
+    _run_and_capture_print(_cmd_clear, qwen_cli, ctx, "")
+    assert qwen_cli._real_ctx_tokens == 0
+
+
+def test_cmd_clear_partial_also_resets_real_ctx_tokens(qwen_cli, monkeypatch):
+    from qwen_cli.core.commands import _cmd_clear
+
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 12345)
+    ctx = _mock_ctx()
+    ctx.history = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+        {"role": "assistant", "content": "d"},
+    ]
+    _run_and_capture_print(_cmd_clear, qwen_cli, ctx, "1")
+    assert qwen_cli._real_ctx_tokens == 0
+
+
 # --- _cmd_plan ---
 
 
@@ -168,6 +193,21 @@ def test_cmd_plan_shows_active_plan(qwen_cli):
         assert "Read the file" in output
     finally:
         qwen_cli._current_plan.clear()
+
+
+# --- _cmd_load ---
+
+
+def test_cmd_load_resets_stale_real_ctx_tokens(qwen_cli, monkeypatch):
+    from qwen_cli.core.commands import _cmd_load
+
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 12345)
+    loaded_history = [{"role": "user", "content": "loaded"}]
+    monkeypatch.setattr(qwen_cli, "cmd_load_session", lambda arg, h, s: (loaded_history, s))
+    ctx = _mock_ctx()
+    _run_and_capture_print(_cmd_load, qwen_cli, ctx, "some-session")
+    assert ctx.history == loaded_history
+    assert qwen_cli._real_ctx_tokens == 0
 
 
 # --- _cmd_retry ---
