@@ -2056,7 +2056,7 @@ def do_run_command(
     cancelled = threading.Event()
     t0 = time.monotonic()
 
-    _shell_meta = re.compile(r"[|;&$`<>()\[\]{}!\\\n]")
+    _shell_meta = re.compile(r"[|;&$`<>()\[\]{}!\n]")
     try:
         if _shell_meta.search(command):
             _logger.warning("shell=True for command with metacharacters: %.120s", command)
@@ -2073,7 +2073,17 @@ def do_run_command(
                 env=proc_env,
             )
         else:
-            cmd_parts = shlex.split(command)
+            if sys.platform == "win32":
+                # posix=True shlex treats backslashes as escapes and mangles Windows
+                # paths (C:\Users\... -> C:UsersDough...); posix=False preserves them
+                # but leaves surrounding quotes on quoted tokens, so strip those.
+                cmd_parts = []
+                for tok in shlex.split(command, posix=False):
+                    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+                        tok = tok[1:-1]
+                    cmd_parts.append(tok)
+            else:
+                cmd_parts = shlex.split(command)
             proc = subprocess.Popen(
                 cmd_parts,
                 shell=False,

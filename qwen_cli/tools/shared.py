@@ -370,7 +370,10 @@ def _search_ddg(query: str, max_results: int) -> list[dict]:
     except ImportError:
         from duckduckgo_search import DDGS  # type: ignore
     with DDGS(timeout=15) as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+        # backend="auto" fans out to every registered engine, including grokipedia
+        # (~37% 502) and the unofficial brave scrape (~84% 429) -- pin to the
+        # engines that actually succeed to cut wasted round trips.
+        return list(ddgs.text(query, max_results=max_results, backend="duckduckgo,yahoo,yandex,mojeek,wikipedia"))
 
 
 def _search_ddg_news(query: str, max_results: int) -> list[dict]:
@@ -429,19 +432,21 @@ def do_web_search(query: str, max_results: int = 6, type: str = "web") -> str:
         return cached
 
     if type == "news":
-        engines = [
-            ("DDG-news", _search_ddg_news),
-            ("Brave-news", _search_brave_news),
-            ("Google", _search_google),
-            ("Brave", _search_brave),
-        ]
+        engines = [("DDG-news", _search_ddg_news)]
+        if BRAVE_API_KEY:
+            engines.append(("Brave-news", _search_brave_news))
+        if GOOGLE_API_KEY and GOOGLE_CSE_ID:
+            engines.append(("Google", _search_google))
+        if BRAVE_API_KEY:
+            engines.append(("Brave", _search_brave))
     else:
-        engines = [
-            ("Google", _search_google),
-            ("Brave", _search_brave),
-            ("DDG", _search_ddg),
-            ("Bing", _search_bing_scrape),
-        ]
+        engines = []
+        if GOOGLE_API_KEY and GOOGLE_CSE_ID:
+            engines.append(("Google", _search_google))
+        if BRAVE_API_KEY:
+            engines.append(("Brave", _search_brave))
+        engines.append(("DDG", _search_ddg))
+        engines.append(("Bing", _search_bing_scrape))
 
     all_results: list[tuple[str, list[dict]]] = []
 
