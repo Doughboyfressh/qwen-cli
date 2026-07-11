@@ -104,3 +104,30 @@ class TestDetectAntibot:
                 raise RuntimeError("page gone")
 
         assert br._browser_detect_antibot(ExplodingPage()) == ""
+
+
+class TestResolveStorageState:
+    def test_missing_file_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(br, "COOKIE_FILE", tmp_path / "nope.json")
+        assert br._resolve_storage_state() is None
+
+    def test_new_format_dict_with_cookies_returns_path(self, tmp_path, monkeypatch):
+        cookie_file = tmp_path / "cookies.json"
+        cookie_file.write_text('{"cookies": [], "origins": []}')
+        monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
+        assert br._resolve_storage_state() == str(cookie_file)
+
+    def test_legacy_bare_list_format_is_ignored(self, tmp_path, monkeypatch):
+        # Old versions of this file stored context.cookies() directly -- a
+        # bare list, not the {"cookies": ..., "origins": ...} shape
+        # new_context(storage_state=...) requires.
+        cookie_file = tmp_path / "cookies.json"
+        cookie_file.write_text("[]")
+        monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
+        assert br._resolve_storage_state() is None
+
+    def test_corrupt_json_returns_none(self, tmp_path, monkeypatch):
+        cookie_file = tmp_path / "cookies.json"
+        cookie_file.write_text("{not valid json")
+        monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
+        assert br._resolve_storage_state() is None

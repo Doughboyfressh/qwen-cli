@@ -376,17 +376,33 @@ def _browser_has_captcha(page) -> bool:
         return False
 
 
-def _browser_load_cookies(context) -> None:
-    """Internal helper: browser load cookies."""
-    if COOKIE_FILE.exists():
-        with contextlib.suppress(Exception):
-            context.add_cookies(json.loads(COOKIE_FILE.read_text()))
+def _resolve_storage_state() -> str | None:
+    """Return a Playwright storage_state path if COOKIE_FILE holds one, else None.
+
+    Older versions of this file stored a bare list of cookies (via
+    context.cookies()) -- cookies only, no localStorage. Plenty of modern
+    SPAs (JWT-based auth, common in React/Vue dashboards) keep the session
+    token in localStorage instead, so a cookies-only save silently fails to
+    restore those logins. storage_state() captures both. A stale bare-list
+    file from before this change is ignored rather than passed to
+    new_context(), which requires the {"cookies": [...], "origins": [...]}
+    shape and would error on a plain list.
+    """
+    if not COOKIE_FILE.exists():
+        return None
+    try:
+        data = json.loads(COOKIE_FILE.read_text())
+    except Exception:
+        return None
+    if isinstance(data, dict) and "cookies" in data:
+        return str(COOKIE_FILE)
+    return None
 
 
 def _browser_save_cookies(page) -> None:
-    """Internal helper: browser save cookies."""
+    """Save cookies + localStorage for the current context via storage_state()."""
     with contextlib.suppress(Exception):
-        COOKIE_FILE.write_text(json.dumps(page.context.cookies()))
+        page.context.storage_state(path=str(COOKIE_FILE))
 
 
 def _get_page() -> Any:
@@ -435,6 +451,7 @@ def _get_page() -> Any:
                 "accept-language": "en-US,en;q=0.9",
             },
             color_scheme="light",
+            storage_state=_resolve_storage_state(),
         )
         # Proxy from config (optional)
         _cfg_data = _CFG
@@ -442,7 +459,6 @@ def _get_page() -> Any:
         if _proxy_url:
             console.print(f"[dim]  [browser] using proxy: {_proxy_url}[/dim]")
         ctx.add_init_script(_STEALTH_JS)
-        _browser_load_cookies(ctx)
         page = ctx.new_page()
         # Links with target="_blank", OAuth popups, and window.open() all spawn a
         # new Playwright Page in this context. Without this, _browser_state["page"]
