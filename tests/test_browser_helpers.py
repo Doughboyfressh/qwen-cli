@@ -30,6 +30,17 @@ class FakePage:
         return self._body
 
 
+class FakeFrame:
+    def __init__(self, url):
+        self.url = url
+
+
+class FakeFramePage(FakePage):
+    def __init__(self, title="", body="", frame_urls=None):
+        super().__init__(title, body)
+        self.frames = [FakeFrame(u) for u in (frame_urls or [])]
+
+
 class TestRandomUA:
     def test_format_is_realistic_chrome(self):
         ua = br._browser_random_ua()
@@ -54,15 +65,54 @@ class TestRandomViewport:
             assert vp["height"] in (720, 768, 800, 900, 1024, 1080, 1200)
 
 
-class TestJitterMouse:
-    def test_moves_mouse_within_bounds(self):
+class TestHumanMouseMove:
+    def setup_method(self):
+        br._browser_state.clear()
+
+    def test_ends_at_target_and_tracks_position(self):
         page = FakePage()
-        br._browser_jitter_mouse(page)
-        assert 2 <= len(page.mouse.moves) <= 5
-        for dx, dy, steps in page.mouse.moves:
-            assert -30 <= dx <= 30
-            assert -10 <= dy <= 10
-            assert 3 <= steps <= 8
+        br._browser_human_mouse_move(page, 500, 300)
+        assert 4 <= len(page.mouse.moves) <= 7
+        last_x, last_y, _steps = page.mouse.moves[-1]
+        assert (last_x, last_y) == (500, 300)
+        assert br._browser_state["mouse_pos"] == (500, 300)
+
+    def test_second_move_to_same_target_settles_there(self):
+        # Wobble is independent noise, not distance-scaled, so intermediate
+        # points still curve a bit even when start == target -- only the
+        # final settle point (the last move call) is guaranteed exact.
+        page = FakePage()
+        br._browser_human_mouse_move(page, 500, 300)
+        page.mouse.moves.clear()
+        br._browser_human_mouse_move(page, 500, 300)
+        last_x, last_y, _steps = page.mouse.moves[-1]
+        assert (last_x, last_y) == (500, 300)
+
+
+class TestMoveTowardElement:
+    def setup_method(self):
+        br._browser_state.clear()
+
+    def test_moves_into_bounding_box(self):
+        class FakeLoc:
+            def bounding_box(self):
+                return {"x": 100, "y": 200, "width": 40, "height": 20}
+
+        page = FakePage()
+        br._browser_move_toward_element(page, FakeLoc())
+        assert page.mouse.moves
+        last_x, last_y, _steps = page.mouse.moves[-1]
+        assert 100 <= last_x <= 140
+        assert 200 <= last_y <= 220
+
+    def test_missing_bounding_box_is_noop(self):
+        class FakeLoc:
+            def bounding_box(self):
+                return None
+
+        page = FakePage()
+        br._browser_move_toward_element(page, FakeLoc())
+        assert page.mouse.moves == []
 
 
 class TestCaptchaHint:
@@ -78,12 +128,36 @@ class TestCaptchaHint:
         assert "headless" in hint
         assert "browser_action" in hint
 
+    def test_iframe_challenge_with_clean_outer_text_returns_hint(self):
+        # DataDome/hCaptcha/Turnstile widgets load in a cross-origin iframe --
+        # the outer page's title/body can say nothing while it's blocking.
+        page = FakeFramePage(title="Loading...", body="", frame_urls=["https://geo.captcha-delivery.com/captcha/"])
+        hint = br._browser_captcha_hint(page)
+        assert "browser_action" in hint
+
     def test_page_error_returns_empty(self):
         class ExplodingPage:
             def title(self):
                 raise RuntimeError("page gone")
 
         assert br._browser_captcha_hint(ExplodingPage()) == ""
+
+
+class TestDetectChallengeIframe:
+    def test_no_matching_frames_returns_empty(self):
+        page = FakeFramePage(frame_urls=["https://example.com/widget"])
+        assert br._browser_detect_challenge_iframe(page) == ""
+
+    def test_datadome_iframe_detected(self):
+        page = FakeFramePage(frame_urls=["https://geo.captcha-delivery.com/captcha/"])
+        assert br._browser_detect_challenge_iframe(page) == "captcha-delivery.com"
+
+    def test_hcaptcha_iframe_detected(self):
+        page = FakeFramePage(frame_urls=["https://newassets.hcaptcha.com/captcha/v1/frame"])
+        assert br._browser_detect_challenge_iframe(page) == "hcaptcha.com"
+
+    def test_page_without_frames_attr_returns_empty(self):
+        assert br._browser_detect_challenge_iframe(FakePage()) == ""
 
 
 class TestDetectAntibot:
@@ -105,6 +179,10 @@ class TestDetectAntibot:
                 raise RuntimeError("page gone")
 
         assert br._browser_detect_antibot(ExplodingPage()) == ""
+
+    def test_challenge_iframe_detected_despite_clean_text(self):
+        page = FakeFramePage(title="Loading...", body="", frame_urls=["https://geo.captcha-delivery.com/x"])
+        assert br._browser_detect_antibot(page) == "captcha-delivery.com"
 
 
 class TestResolveStorageState:

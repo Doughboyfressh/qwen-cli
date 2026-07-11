@@ -319,9 +319,43 @@ _ANTIBOT_RESPONSE_PATTERNS = [
     "blocked by firewall",
 ]
 
+# Anti-bot challenge widgets are commonly served from a cross-origin iframe
+# (DataDome's slider, hCaptcha, Cloudflare Turnstile, Arkose/FunCaptcha,
+# PerimeterX). Cross-origin iframes are a separate document tree, so
+# page.title() / page.inner_text("body") can't see into them at all -- the
+# outer page can be fully blocked by a loaded DataDome widget while its own
+# visible text says nothing about it. Frame URLs are visible regardless of
+# origin, so checking them catches challenges the text-based checks miss.
+_ANTIBOT_IFRAME_DOMAINS = [
+    "captcha-delivery.com",  # DataDome (covers geo.captcha-delivery.com too)
+    "hcaptcha.com",
+    "recaptcha.net",
+    "google.com/recaptcha",
+    "challenges.cloudflare.com",  # Cloudflare Turnstile
+    "arkoselabs.com",  # Arkose Labs / FunCaptcha
+    "perimeterx.net",
+    "px-cdn.net",
+]
+
+
+def _browser_detect_challenge_iframe(page) -> str:
+    """Return the matched domain if a known anti-bot challenge iframe is present."""
+    try:
+        for frame in page.frames:
+            furl = frame.url or ""
+            for dom in _ANTIBOT_IFRAME_DOMAINS:
+                if dom in furl:
+                    return dom
+    except Exception:
+        pass
+    return ""
+
 
 def _browser_detect_antibot(page) -> str:
     """Check if the page is showing an anti-bot block page. Returns hint string or empty."""
+    iframe_hit = _browser_detect_challenge_iframe(page)
+    if iframe_hit:
+        return iframe_hit
     try:
         title = page.title().lower()
         body = ""
@@ -383,17 +417,56 @@ def _browser_random_delay(min_ms: float = 100, max_ms: float = 600) -> None:
     time.sleep(_r.uniform(min_ms / 1000, max_ms / 1000))
 
 
-def _browser_jitter_mouse(page) -> None:
-    """Move mouse slightly in a natural-looking pattern before interactions."""
-    _steps = _r.randint(2, 5)
-    for _ in range(_steps):
-        _dx = _r.randint(-30, 30)
-        _dy = _r.randint(-10, 10)
-        page.mouse.move(_dx, _dy, steps=_r.randint(3, 8))
+def _browser_human_mouse_move(page, target_x: float, target_y: float) -> None:
+    """Walk the mouse toward (target_x, target_y) via a short, slightly wobbly path.
+
+    page.mouse.move(x, y, ...) takes *absolute* viewport coordinates, not
+    relative deltas. The previous implementation called it with small
+    (-30..30, -10..10) values on every fill/click, which meant the cursor
+    teleported to near the top-left corner before every single interaction --
+    a far stronger bot tell to behavioral anti-bot checks (DataDome, etc.)
+    than not moving the mouse at all. This tracks the last known position in
+    _browser_state and interpolates toward the real target instead.
+    """
+    sx, sy = _browser_state.get("mouse_pos", (_r.uniform(200, 800), _r.uniform(150, 500)))
+    steps = _r.randint(3, 6)
+    for i in range(1, steps + 1):
+        t = i / steps
+        wobble = (1 - t) * _r.uniform(-15, 15)
+        ix = sx + (target_x - sx) * t + wobble
+        iy = sy + (target_y - sy) * t + wobble
+        page.mouse.move(ix, iy, steps=_r.randint(2, 5))
+    page.mouse.move(target_x, target_y, steps=_r.randint(2, 4))
+    _browser_state["mouse_pos"] = (target_x, target_y)
+
+
+def _browser_move_toward_element(page, loc) -> None:
+    """Move the mouse to a random point inside loc's bounding box before acting on it.
+
+    Playwright's own click()/hover() warp the cursor to the target instantly;
+    walking there first leaves a mouse trail that looks like a real user's,
+    which matters to behavioral checks that track movement, not just clicks.
+    """
+    try:
+        box = loc.bounding_box()
+    except Exception:
+        box = None
+    if not box:
+        return
+    tx = box["x"] + box["width"] * _r.uniform(0.3, 0.7)
+    ty = box["y"] + box["height"] * _r.uniform(0.3, 0.7)
+    _browser_human_mouse_move(page, tx, ty)
 
 
 def _browser_has_captcha(page) -> bool:
-    """Internal helper: browser has captcha."""
+    """Internal helper: browser has captcha.
+
+    Checks known challenge-iframe domains first (see _browser_detect_challenge_iframe)
+    since a DataDome/hCaptcha/Turnstile widget can be fully loaded in a
+    cross-origin iframe with the outer page's visible text still saying nothing.
+    """
+    if _browser_detect_challenge_iframe(page):
+        return True
     try:
         content = (page.title() + " " + page.inner_text("body", timeout=3000)).lower()
         return any(kw in content for kw in _CAPTCHA_SIGNALS)
@@ -592,7 +665,9 @@ def _browser_check_captcha_pause(page) -> str:
 
     Only for the headed (visible) browser_action session — the user needs an
     actual window to solve a CAPTCHA in. For headless contexts, use
-    _browser_captcha_hint instead.
+    _browser_captcha_hint instead. Covers iframe-embedded widgets (DataDome
+    slider, hCaptcha, Turnstile) via _browser_has_captcha's iframe check, not
+    just text-visible CAPTCHAs on the outer page.
     """
     if not _browser_has_captcha(page):
         return ""
@@ -676,7 +751,7 @@ def _browser_do_fill(page, url="", selector="", value="", screenshot_path=""):
     loc = _browser_resolve_selector(page, selector)
     loc.first.wait_for(state="visible", timeout=8000)
     _browser_random_delay(200, 500)
-    _browser_jitter_mouse(page)
+    _browser_move_toward_element(page, loc.first)
     loc.first.fill(value)
     return f"[filled {selector!r} with {value!r}]"
 
@@ -699,7 +774,7 @@ def _browser_do_click(page, url="", selector="", value="", screenshot_path=""):
     loc = _browser_resolve_selector(page, selector)
     loc.first.wait_for(state="visible", timeout=8000)
     _browser_random_delay(150, 400)
-    _browser_jitter_mouse(page)
+    _browser_move_toward_element(page, loc.first)
     loc.first.click()
     _browser_smart_wait(page)
     captcha_note = _browser_check_captcha_pause(page)
@@ -766,6 +841,7 @@ def _browser_do_hover(page, url="", selector="", value="", screenshot_path=""):
     loc = _browser_resolve_selector(page, selector)
     loc.first.wait_for(state="visible", timeout=8000)
     _browser_random_delay()
+    _browser_move_toward_element(page, loc.first)
     loc.first.hover()
     return f"[hovered over {selector!r}]"
 
