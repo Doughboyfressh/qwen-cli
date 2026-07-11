@@ -545,6 +545,41 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": (
+                "Create or update your visible step-by-step plan for the current task. "
+                "Call this FIRST for any non-trivial multi-step task, listing every step with "
+                "status 'pending'. Call it again whenever a step's status changes — mark a step "
+                "'in_progress' right before you start it, and 'completed' only after you've verified "
+                "it actually worked. Always pass the FULL list of steps (not just the one that "
+                "changed) — each call replaces the whole plan. Keep steps short (one line each)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "The complete ordered list of steps for the current task.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "Short description of the step"},
+                                "status": {
+                                    "type": "string",
+                                    "description": "One of: pending, in_progress, completed",
+                                },
+                            },
+                            "required": ["text", "status"],
+                        },
+                    },
+                },
+                "required": ["steps"],
+            },
+        },
+    },
 ]
 
 _HEARTBEAT_SEC = 30  # print "still waiting" after this many seconds with no token

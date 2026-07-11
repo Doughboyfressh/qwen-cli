@@ -75,6 +75,7 @@ def _cmd_clear(ctx: _ReplContext, arg: str) -> None:
         _main.console.print(f"[dim][dropped {drop // 2} turn(s)][/dim]")
     else:
         ctx.history.clear()
+        _main._current_plan.clear()
         _main.console.print("[dim][history cleared][/dim]")
 
 
@@ -424,6 +425,16 @@ def _cmd_agent(ctx: _ReplContext, arg: str) -> None:
         _main.console.print("[yellow][usage: /agent <goal>][/yellow]")
     else:
         _main.cmd_agent(arg, ctx.history, ctx.base_system, ctx.client)
+
+
+def _cmd_plan(ctx: _ReplContext, arg: str) -> None:
+    """Show the current /agent or /task progress plan, if one is active."""
+    import qwen_cli.main as _main
+
+    if not _main._current_plan:
+        _main.console.print("[dim][no active plan — run /agent or /task to start one][/dim]")
+    else:
+        _main._render_plan_panel()
 
 
 def _cmd_git(ctx: _ReplContext, arg: str) -> None:
@@ -955,6 +966,7 @@ _REPL_COMMANDS: dict[str, callable] = {
     "/index": _cmd_index,
     "/task": _cmd_task,
     "/agent": _cmd_agent,
+    "/plan": _cmd_plan,
     "/git": _cmd_git,
     "/lsp": _cmd_lsp,
     "/watch": _cmd_watch,

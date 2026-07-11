@@ -135,6 +135,41 @@ def test_cmd_clear_drop_last_n(qwen_cli):
     assert "dropped 1 turn" in output
 
 
+def test_cmd_clear_full_also_clears_plan(qwen_cli):
+    from qwen_cli.core.commands import _cmd_clear
+
+    ctx = _mock_ctx()
+    ctx.history = [{"role": "user", "content": "hi"}]
+    qwen_cli._current_plan[:] = [{"text": "Old step", "status": "pending"}]
+    try:
+        _run_and_capture_print(_cmd_clear, qwen_cli, ctx, "")
+        assert qwen_cli._current_plan == []
+    finally:
+        qwen_cli._current_plan.clear()
+
+
+# --- _cmd_plan ---
+
+
+def test_cmd_plan_no_active_plan(qwen_cli):
+    from qwen_cli.core.commands import _cmd_plan
+
+    qwen_cli._current_plan.clear()
+    output = _run_and_capture_print(_cmd_plan, qwen_cli, _mock_ctx(), "")
+    assert "no active plan" in output
+
+
+def test_cmd_plan_shows_active_plan(qwen_cli):
+    from qwen_cli.core.commands import _cmd_plan
+
+    qwen_cli._current_plan[:] = [{"text": "Read the file", "status": "completed"}]
+    try:
+        output = _run_and_render(_cmd_plan, qwen_cli, _mock_ctx(), "")
+        assert "Read the file" in output
+    finally:
+        qwen_cli._current_plan.clear()
+
+
 # --- _cmd_retry ---
 
 

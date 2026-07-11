@@ -207,6 +207,10 @@ _focus_set: list[str] = []  # files loaded via /focus this session
 _session_changes: dict[str, str] = {}  # path → original content before first edit
 _tool_call_retry_log: dict[int, list] = {}  # depth → list of (tool, error) for retry context
 
+# --- Visible plan / progress tracking (/agent, /task, update_plan tool) -----
+_current_plan: list[dict] = []  # [{"text": str, "status": "pending"|"in_progress"|"completed"}, ...]
+_PLAN_STATUS_ICON = {"completed": "[green]x[/green]", "in_progress": "[cyan]~[/cyan]", "pending": " "}
+
 # --- Enforced verification (agent mode) -------------------------------------
 # Tools that mutate files; after any of these, /agent will not accept AGENT_DONE
 # until at least one verifying tool has run.
@@ -269,6 +273,7 @@ MEMORY_CURATE_INTERVAL = 10  # consolidate memory.md every N auto-extractions
 
 _PARALLEL_TOOLS = frozenset(
     {
+        "update_plan",
         "web_search",
         "search_news",
         "fetch_url",
@@ -478,7 +483,9 @@ BASE_SYSTEM = (
     "If you search and still cannot find a reliable source, say explicitly 'I couldn't verify this' "
     "rather than guessing. It is always better to say 'let me check' than to state something wrong confidently.\n\n"
     "WORKING DISCIPLINE — how to execute any non-trivial task:\n"
-    "1. PLAN: state a short plan (2-5 steps) before acting. Revise it if you learn something that changes it.\n"
+    "1. PLAN: for anything more than a one-shot answer, call update_plan with a short plan (2-5 steps) "
+    "before acting — this shows the user a visible progress checklist. Mark each step in_progress before "
+    "starting it and completed once verified; revise the plan if you learn something that changes it.\n"
     "2. GROUND: read a file before editing it; check real state with run_command instead of assuming. "
     "Never edit code you have not read this session.\n"
     "3. ACT: make the smallest change that solves the problem. One logical change at a time.\n"
@@ -548,6 +555,7 @@ HELP_TEXT = """
 | `/error` | Paste clipboard error and immediately diagnose it |
 | `/task <goal>` | Plan-approve-execute-test agentic workflow with retry on failure |
 | `/agent <goal>` | Autonomous loop — model iterates with tools until done or Ctrl+C |
+| `/plan` | Show the current /agent or /task progress checklist |
 | `/git commit [msg]` | AI-generated commit message from staged diff, then commit |
 | `/git pr` | AI-generated PR description from commits ahead of main |
 | `/watch <file>` | Re-inject file into context whenever it changes on disk |
@@ -593,7 +601,7 @@ HELP_TEXT = """
 
 ## Autonomous tools (Qwen calls these itself)
 
-`web_search` · `fetch_url` · `browser_action` · `run_command` · `run_script` · `read_file` · **`patch_file`** · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user`
+`web_search` · `fetch_url` · `browser_action` · `run_command` · `run_script` · `read_file` · **`patch_file`** · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan`
 
 **Team tools:** `team_list` · `team_board` · `team_task_add` · `team_task_list` · `team_task_update` · `team_inbox_send` · `team_inbox_receive` · `team_spawn_agent`
 
@@ -896,6 +904,7 @@ _COMMANDS = [
     "/autosearch",
     "/agent",
     "/task",
+    "/plan",
     "/index",
     "/git",
     "/watch",
@@ -3098,6 +3107,9 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
     """
     agent_suffix = (
         "\n\nYou are running in autonomous agent mode. Work toward the goal using tools. "
+        "PLAN: call update_plan FIRST with your full step breakdown (status 'pending' for all). "
+        "Before starting each step call update_plan again marking it 'in_progress'; after you've "
+        "verified it, call update_plan marking it 'completed'. Always pass the complete step list. "
         "After each action, briefly verify the result is correct before moving on — "
         "do not assume success; check the output or re-read the file. "
         "ENFORCEMENT: if you modify any file, AGENT_DONE will be REJECTED until you verify "
@@ -3107,6 +3119,8 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
         "Subagents have full access to all the same tools. You coordinate, they execute in parallel. "
         "When the goal is fully achieved and you have confirmed the result, end your response with exactly: AGENT_DONE"
     )
+    global _current_plan
+    _current_plan = []
     console.print(f"[bold cyan]  Agent goal:[/bold cyan] {goal}")
     console.print(f"[dim]  (max {max_iter} iterations — Ctrl+C to stop)[/dim]")
 
@@ -3349,9 +3363,17 @@ def cmd_task(goal: str, history: list, base_system: str, client: object) -> None
     working.append({"role": "user", "content": f"[Task] {goal}\n\nPlan:\n{plan_text}"})
     working.append({"role": "assistant", "content": "Understood. I will execute each step now."})
 
+    # /task already has a deterministic, parsed step list — seed the visible
+    # plan from it directly rather than asking the model to call update_plan,
+    # so the checklist always exactly matches what will actually execute.
+    global _current_plan
+    _current_plan = [{"text": s, "status": "pending"} for s in step_lines]
+
     for i, step in enumerate(step_lines, 1):
         label = step[:70] + ("..." if len(step) > 70 else "")
         console.print(Rule(f"[dim]Step {i}/{total}: {label}[/dim]", style="dim"))
+        _current_plan[i - 1]["status"] = "in_progress"
+        _render_plan_panel()
 
         # Keep multi-step tasks within the context window — summarize+preserve the
         # task so far if the accumulated working set is nearing the limit.
@@ -3376,8 +3398,11 @@ def cmd_task(goal: str, history: list, base_system: str, client: object) -> None
             history.append({"role": "user", "content": f"[Task {i}/{total}] {step}"})
             history.append({"role": "assistant", "content": reply})
 
-            # Run tests if code was written/patched
-            modified = any(kw in reply for kw in ("[patched:", "[created:", "[updated:"))
+            # Run tests if code was written/patched. Checks which tools actually ran
+            # this step (same mechanism /agent's verification enforcement uses) rather
+            # than string-matching the model's free-text reply for bracket tags it
+            # isn't guaranteed to echo back verbatim.
+            modified = any(name in _MUTATING_FILE_TOOLS for name in _last_turn_tool_names)
             if test_cmd and modified:
                 console.print(f"[dim]  Running: {test_cmd}[/dim]")
                 test_out = do_run_command(test_cmd, timeout=60)
@@ -3397,6 +3422,9 @@ def cmd_task(goal: str, history: list, base_system: str, client: object) -> None
                 if not passed:
                     console.print("[yellow]  Tests still failing — moving on[/yellow]")
             break
+
+        _current_plan[i - 1]["status"] = "completed"
+        _render_plan_panel()
 
         if i < total:
             try:
@@ -3677,7 +3705,52 @@ def _call_with_timeout(name: str, fn, *args, timeout: int, **kwargs) -> str:
         raise
 
 
+def _render_plan_panel() -> None:
+    """Print the current plan as a checklist panel. No-op if there is no active plan."""
+    if not _current_plan:
+        return
+    lines = []
+    for step in _current_plan:
+        icon = _PLAN_STATUS_ICON.get(step.get("status", "pending"), " ")
+        text = step.get("text", "")
+        style = "dim" if step.get("status") == "completed" else ""
+        line = f"[{icon}] {text}"
+        lines.append(f"[{style}]{line}[/{style}]" if style else line)
+    done = sum(1 for s in _current_plan if s.get("status") == "completed")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold]Plan[/bold] ({done}/{len(_current_plan)})",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+
+def do_update_plan(steps: list) -> str:
+    """Replace the visible plan with `steps` and render it. Tool-callable by the model."""
+    global _current_plan
+    if not isinstance(steps, list) or not steps:
+        return "[update_plan error: 'steps' must be a non-empty list of {text, status}]"
+    valid_statuses = {"pending", "in_progress", "completed"}
+    normalized = []
+    for raw in steps:
+        if not isinstance(raw, dict) or not (raw.get("text") or "").strip():
+            continue
+        status = raw.get("status", "pending")
+        if status not in valid_statuses:
+            status = "pending"
+        normalized.append({"text": raw["text"].strip(), "status": status})
+    if not normalized:
+        return "[update_plan error: no valid steps provided]"
+    _current_plan = normalized
+    _render_plan_panel()
+    done = sum(1 for s in _current_plan if s["status"] == "completed")
+    return f"[plan updated: {done}/{len(_current_plan)} steps completed]"
+
+
 _TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
+    "update_plan": lambda a: do_update_plan(a.get("steps", [])),
     "web_search": lambda a: _call_with_timeout(
         "web_search", do_web_search, a.get("query", ""), timeout=_TOOL_TIMEOUT_SLOW
     ),
