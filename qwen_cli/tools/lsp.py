@@ -69,6 +69,17 @@ _LSP_IDLE_TIMEOUT: int = 300  # 5 minutes
 _LSP_ROOT: str | None = None
 _LSP_LANGUAGE: str | None = None
 
+# multilspy's SyncLanguageServer.start_server() blocks on
+# asyncio.run_coroutine_threadsafe(ctx.__aenter__(), ...).result() with NO timeout
+# of its own. If the language server subprocess never completes its LSP
+# 'initialize' handshake (observed hanging indefinitely on this setup), that
+# call — and therefore _create_server() — never returns. Bound it ourselves so
+# a broken handshake degrades to "LSP disabled" instead of freezing the CLI.
+_LSP_STARTUP_TIMEOUT: int = 20  # seconds
+_LSP_REQUEST_TIMEOUT: int = 15  # seconds — bounds every definition/references/hover/etc. call
+_LSP_LAST_START_FAILURE: float = 0.0
+_LSP_FAILURE_COOLDOWN: int = 60  # seconds — don't retry a just-failed/hung server on every call
+
 
 # ---------------------------------------------------------------------------
 # Language detection
@@ -181,13 +192,17 @@ def _create_server(file_path: str = "") -> Any:
     enter it (via ``with`` or manual ``__enter__``) so that the internal event
     loop is created and the server process is actually launched.
     """
-    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
+    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE, _LSP_LAST_START_FAILURE
 
     if not _multilspy_available:
         msg = "multilspy is not installed. Install with: pip install multilspy"
         raise RuntimeError(
             msg,
         )
+
+    if _LSP_LAST_START_FAILURE and time.time() - _LSP_LAST_START_FAILURE < _LSP_FAILURE_COOLDOWN:
+        msg = "LSP server failed to start recently; skipping retry for a bit (see qwen.log)"
+        raise RuntimeError(msg)
 
     language = _detect_language(file_path)
     root = _get_project_root(file_path)
@@ -196,12 +211,40 @@ def _create_server(file_path: str = "") -> Any:
     config = _MultilspyConfig(lang_enum)
     logger = _MultilspyLogger()
 
-    lsp = _SyncLanguageServer.create(config, logger, root)
+    # timeout also bounds every subsequent request_*() call (definition,
+    # references, hover, symbols, rename, completion) — multilspy's own
+    # SyncLanguageServer methods do `.result(timeout=self.timeout)`, but
+    # self.timeout is None (blocks forever) unless passed here.
+    lsp = _SyncLanguageServer.create(config, logger, root, timeout=_LSP_REQUEST_TIMEOUT)
 
     # Enter the context manager so the event loop is created and the
-    # underlying language-server process is actually started.
+    # underlying language-server process is actually started. This is
+    # bounded with a timeout: multilspy's own __enter__() has no timeout,
+    # so an initialize handshake that never completes would otherwise hang
+    # forever (see _LSP_STARTUP_TIMEOUT comment above). Uses a plain daemon
+    # thread rather than ThreadPoolExecutor: a genuinely stuck handshake
+    # thread would otherwise never finish, and non-daemon executor workers
+    # block clean interpreter shutdown even after we've moved on.
     ctx = lsp.start_server()
-    ctx.__enter__()
+    _result: dict[str, Any] = {}
+
+    def _enter() -> None:
+        try:
+            _result["value"] = ctx.__enter__()
+        except Exception as e:  # noqa: BLE001 — surfaced via _result, not raised in this thread
+            _result["error"] = e
+
+    _thread = threading.Thread(target=_enter, daemon=True, name="lsp-startup")
+    _thread.start()
+    _thread.join(timeout=_LSP_STARTUP_TIMEOUT)
+    if _thread.is_alive():
+        _LSP_LAST_START_FAILURE = time.time()
+        msg = f"LSP server for '{language}' did not initialize within {_LSP_STARTUP_TIMEOUT}s (handshake hung)"
+        _logger.warning(msg)
+        raise RuntimeError(msg)
+    if "error" in _result:
+        _LSP_LAST_START_FAILURE = time.time()
+        raise _result["error"]
     lsp._start_ctx = ctx  # keep alive for shutdown
 
     _LSP_SERVER = lsp

@@ -2847,21 +2847,28 @@ def _intel_crawl_once() -> None:
     """Pick the least-recently-crawled topic, do a web search, enqueue the raw result."""
     if not _intel_enabled.is_set():
         return
+    topic: dict | None = None
     try:
-        topics = _intel_load_topics()
-        if not topics:
-            return
-        topic = min(topics, key=lambda t: t.get("last_checked", 0))
+        # _INTEL_CRAWLERS runs multiple copies of this function concurrently.
+        # Claim the topic (mark last_checked, save) under the lock *before*
+        # doing the slow web search, so two threads never pick the same
+        # least-recently-crawled topic and _intel_extract_topics()'s topic
+        # additions can't be lost to an overlapping read-modify-write.
+        with _intel_lock:
+            topics = _intel_load_topics()
+            if not topics:
+                return
+            topic = min(topics, key=lambda t: t.get("last_checked", 0))
+            for t in topics:
+                if t["name"] == topic["name"]:
+                    t["last_checked"] = time.time()
+                    break
+            _intel_save_topics(topics)
         raw = do_web_search(topic["query"], max_results=5)
         if raw and "error" not in raw.lower()[:40]:
             _intel_enqueue(topic["name"], topic["query"], raw)
-        for t in topics:
-            if t["name"] == topic["name"]:
-                t["last_checked"] = time.time()
-                break
-        _intel_save_topics(topics)
     except Exception:
-        _logger.debug("Intel background crawl failed for topic '%s'", topic.get("name", "?"))
+        _logger.debug("Intel background crawl failed for topic '%s'", topic.get("name", "?") if topic else "?")
 
 
 def _intel_process_queue(client) -> None:
@@ -2966,19 +2973,23 @@ def _intel_extract_topics(client, user_msg: str, reply: str) -> None:
         text = (resp.choices[0].message.content or "").strip()
         if not text or text.upper() == "NONE":
             return
-        topics = _intel_load_topics()
-        existing = {t["name"].lower() for t in topics}
-        for line in text.splitlines():
-            if "|" not in line:
-                continue
-            name, query = line.split("|", 1)
-            name, query = name.strip(), query.strip()
-            if name and query and name.lower() not in existing:
-                topics.append({"name": name, "query": query, "last_checked": 0})
-                existing.add(name.lower())
-        if len(topics) > 25:
-            topics = sorted(topics, key=lambda t: t.get("last_checked", 0), reverse=True)[:25]
-        _intel_save_topics(topics)
+        # See _intel_crawl_once(): topics.json is shared with the background
+        # crawler threads, so the read-modify-write must hold _intel_lock too
+        # or a concurrent crawl can silently overwrite these additions.
+        with _intel_lock:
+            topics = _intel_load_topics()
+            existing = {t["name"].lower() for t in topics}
+            for line in text.splitlines():
+                if "|" not in line:
+                    continue
+                name, query = line.split("|", 1)
+                name, query = name.strip(), query.strip()
+                if name and query and name.lower() not in existing:
+                    topics.append({"name": name, "query": query, "last_checked": 0})
+                    existing.add(name.lower())
+            if len(topics) > 25:
+                topics = sorted(topics, key=lambda t: t.get("last_checked", 0), reverse=True)[:25]
+            _intel_save_topics(topics)
     except Exception:
         _logger.debug("Intel topic extraction failed")
 
@@ -2988,7 +2999,14 @@ def _intel_crawler_thread(delay_s: int) -> None:
     INTEL_DIR.mkdir(exist_ok=True)
     _intel_stop.wait(timeout=delay_s)  # stagger startup
     while not _intel_stop.is_set():
-        _intel_crawl_once()
+        try:
+            _intel_crawl_once()
+        except Exception:
+            # _intel_crawl_once() already wraps its own body in try/except;
+            # this outer guard exists so a bug there can never silently kill
+            # this thread forever (as `_intel_enabled = False` used to, by
+            # replacing the Event with a plain bool — see _cmd_intel).
+            _logger.exception("Intel crawler thread tick failed")
         _intel_stop.wait(timeout=_INTEL_INTERVAL)
 
 
@@ -2996,6 +3014,10 @@ def start_intel_crawlers() -> None:
     """Start _INTEL_CRAWLERS background crawler threads, staggered."""
     if not INTEL_TOPICS.exists():
         _intel_save_topics([dict(t) for t in _INTEL_DEFAULT_TOPICS])
+    # threading.Event() starts unset; without this, _intel_crawl_once()'s
+    # `if not _intel_enabled.is_set(): return` guard is true forever and no
+    # crawler thread ever does real work.
+    _intel_enabled.set()
     stagger = max(15, _INTEL_INTERVAL // _INTEL_CRAWLERS)
     for i in range(_INTEL_CRAWLERS):
         t = threading.Thread(
@@ -3148,13 +3170,18 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
 
 def cmd_git_commit(client: object, msg: str = "") -> None:
     """Generate a commit message from staged diff and commit."""
-    diff = subprocess.run(
-        ["git", "diff", "--staged"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    ).stdout.strip()
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--staged"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        ).stdout.strip()
+    except subprocess.TimeoutExpired:
+        console.print("[red][git diff timed out][/red]")
+        return
     if not diff:
         console.print("[yellow][no staged changes — git add first][/yellow]")
         return
@@ -3197,19 +3224,27 @@ def cmd_git_commit(client: object, msg: str = "") -> None:
 def cmd_git_pr(client: object) -> None:
     """Generate a PR description from commits ahead of main/origin/main."""
     for base in ("main", "origin/main", "master", "origin/master"):
-        log = subprocess.run(
-            ["git", "log", f"{base}..HEAD", "--oneline"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        ).stdout.strip()
-        if log:
-            stat = subprocess.run(
-                ["git", "diff", f"{base}...HEAD", "--stat"],
+        try:
+            log = subprocess.run(
+                ["git", "log", f"{base}..HEAD", "--oneline"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                timeout=10,
             ).stdout.strip()
+        except subprocess.TimeoutExpired:
+            continue
+        if log:
+            try:
+                stat = subprocess.run(
+                    ["git", "diff", f"{base}...HEAD", "--stat"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=10,
+                ).stdout.strip()
+            except subprocess.TimeoutExpired:
+                stat = ""
             break
     else:
         console.print("[yellow][no commits ahead of main/master][/yellow]")
@@ -4518,13 +4553,18 @@ def main() -> None:
 
     _session_start = time.monotonic()
 
-    try:
-        from qwen_cli.tools import lsp as _lsp_mod
+    def _lsp_prewarm() -> None:
+        try:
+            from qwen_cli.tools import lsp as _lsp_mod
 
-        _lsp_mod._ensure_server("")
-        _lsp_mod.lsp_query("diagnostics", "")
-    except Exception:
-        _logger.debug("LSP server startup pre-warm failed (non-critical)")
+            _lsp_mod._ensure_server("")
+            _lsp_mod.lsp_query("diagnostics", "")
+        except Exception:
+            _logger.debug("LSP server startup pre-warm failed (non-critical)")
+
+    # Run off the main thread: even with _create_server()'s internal timeout,
+    # nothing should ever block the user from reaching the prompt at startup.
+    threading.Thread(target=_lsp_prewarm, daemon=True, name="lsp-prewarm").start()
 
     from qwen_cli.core.context import clean_old_snapshots as _clean_snaps
 

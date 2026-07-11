@@ -820,10 +820,14 @@ def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
 
     sub = arg.strip().lower() if arg else ""
     if sub == "off":
-        _main._intel_enabled = False
+        # .clear()/.set(), never rebind — _intel_enabled is a threading.Event
+        # shared with the crawler threads; assigning a bool here used to
+        # replace the Event object itself, crashing every crawler thread with
+        # AttributeError on its next `.is_set()` call.
+        _main._intel_enabled.clear()
         _main.console.print("[dim][intel crawlers paused — /intel on to resume][/dim]")
     elif sub == "on":
-        _main._intel_enabled = True
+        _main._intel_enabled.set()
         _main.console.print("[dim][intel crawlers resumed][/dim]")
     elif sub.startswith("topics"):
         topics = _main._intel_load_topics()
@@ -848,20 +852,28 @@ def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
             tname, tquery = tname.strip(), tquery.strip()
         else:
             tname, tquery = rest, rest + " news today"
-        topics = _main._intel_load_topics()
-        if any(t["name"].lower() == tname.lower() for t in topics):
-            _main.console.print(f"[yellow][topic '{tname}' already tracked][/yellow]")
-        else:
-            topics.append({"name": tname, "query": tquery, "last_checked": 0})
-            _main._intel_save_topics(topics)
+        with _main._intel_lock:
+            topics = _main._intel_load_topics()
+            if any(t["name"].lower() == tname.lower() for t in topics):
+                added = False
+            else:
+                topics.append({"name": tname, "query": tquery, "last_checked": 0})
+                _main._intel_save_topics(topics)
+                added = True
+        if added:
             _main.console.print(f"[green][added topic '{tname}'][/green]")
+        else:
+            _main.console.print(f"[yellow][topic '{tname}' already tracked][/yellow]")
     elif sub.startswith("remove "):
         tname = arg[7:].strip()
-        topics = _main._intel_load_topics()
-        before = len(topics)
-        topics = [t for t in topics if t["name"].lower() != tname.lower()]
-        if len(topics) < before:
-            _main._intel_save_topics(topics)
+        with _main._intel_lock:
+            topics = _main._intel_load_topics()
+            before = len(topics)
+            topics = [t for t in topics if t["name"].lower() != tname.lower()]
+            removed = len(topics) < before
+            if removed:
+                _main._intel_save_topics(topics)
+        if removed:
             _main.console.print(f"[green][removed topic '{tname}'][/green]")
         else:
             _main.console.print(f"[yellow][topic '{tname}' not found][/yellow]")
@@ -871,7 +883,7 @@ def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
             _main.console.print(Markdown(feed))
         else:
             _main.console.print("[dim][no intel yet — crawlers are warming up][/dim]")
-        status = "[green]running[/green]" if _main._intel_enabled else "[yellow]paused[/yellow]"
+        status = "[green]running[/green]" if _main._intel_enabled.is_set() else "[yellow]paused[/yellow]"
         _main.console.print(
             f"[dim]Crawlers: {status} · {_main._INTEL_CRAWLERS} threads · {_main._INTEL_INTERVAL}s interval · /intel topics · /intel add <name>|<query> · /intel on/off[/dim]"
         )

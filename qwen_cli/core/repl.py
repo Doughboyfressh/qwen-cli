@@ -253,6 +253,13 @@ def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
             handler(ctx, arg)
         except StopIteration:
             return True
+        except KeyboardInterrupt:
+            console.print("\n[dim][cancelled][/dim]")
+        except Exception as e:
+            # A bug in any single command must not end the whole session —
+            # mirror the recovery the plain-chat turn path already gets.
+            _logger.exception("Unhandled error in command %s", directive)
+            console.print(f"\n[red]  [error running {directive}] {e}[/red]")
     else:
         _cmd_unknown(ctx, directive)
     return False
