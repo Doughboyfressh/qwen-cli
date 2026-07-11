@@ -133,11 +133,27 @@ try {
 } catch(e) {}
 
 // 5. Screen properties and outer dimensions (headless browsers leak outerWidth=0)
-const _screenProps = { colorDepth: 24, pixelDepth: 24 };
+// Snapshot the real values BEFORE redefining window.screen -- a getter that
+// reads the bare identifier `screen` (as the old code did via
+// Object.assign({}, screen, ...)) resolves to window.screen, i.e. the very
+// property being redefined, recursing into itself on every access until the
+// stack overflows. Any real page reading screen.width/height (extremely
+// common) would hit an uncaught RangeError -- a far worse tell than not
+// spoofing screen at all. A static snapshot avoids re-deriving anything live.
+const _realScreen = window.screen;
+const _screenSnapshot = {
+  width: _realScreen.width,
+  height: _realScreen.height,
+  availWidth: _realScreen.availWidth,
+  availHeight: _realScreen.availHeight,
+  availLeft: _realScreen.availLeft,
+  availTop: _realScreen.availTop,
+  colorDepth: 24,
+  pixelDepth: 24,
+  orientation: { type: 'landscape-primary', angle: 0, onchange: null },
+};
 Object.defineProperty(window, 'screen', {
-  get: () => Object.assign({}, screen, _screenProps, {
-    orientation: { type: 'landscape-primary', angle: 0, onchange: null },
-  }),
+  get: () => _screenSnapshot,
   configurable: true,
   enumerable: true,
 });
