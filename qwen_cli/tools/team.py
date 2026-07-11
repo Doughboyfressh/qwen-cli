@@ -271,8 +271,33 @@ def do_team_list() -> str:
     return "\n".join(lines)
 
 
+def _spawn_command(task_file: Path) -> list[str]:
+    """Build the command to launch a new qwen-cli process for a spawned agent.
+
+    Runs the current interpreter directly against the entry script resolved
+    relative to this file, rather than relying on a "qwen"/"qwen.bat" shim on
+    PATH: shutil.which() has been observed to return None for both from
+    inside the running process even when the interactive shell resolves the
+    same name fine (the spawned process's PATH doesn't necessarily match the
+    shell's). The old fallback, Path(sys.executable).parent / "qwen.bat",
+    was simply wrong — sys.executable is the venv's python.exe, and qwen.bat
+    lives at the project root, not next to the interpreter — so it silently
+    pointed at a file that never exists. Every previously-spawned agent's
+    terminal opened and failed immediately with "not recognized as a
+    command" before running a single line of Python; confirmed live via a
+    real self-audit run where every spawned task's started_at stayed empty.
+    """
+    entry_script = Path(__file__).resolve().parent.parent.parent / "qwen-cli.py"
+    if entry_script.exists():
+        return [sys.executable, str(entry_script), "--task", f"@{task_file}"]
+    qwen_bin = shutil.which("qwen") or shutil.which("qwen.bat")
+    if qwen_bin:
+        return [qwen_bin, "--task", f"@{task_file}"]
+    msg = f"could not locate qwen-cli.py (expected at {entry_script}) or a 'qwen'/'qwen.bat' on PATH"
+    raise FileNotFoundError(msg)
+
+
 def _ct_spawn(team: str, agent_name: str, task: str, cwd: str = "") -> str:
-    qwen_bin = shutil.which("qwen") or shutil.which("qwen.bat") or str(Path(sys.executable).parent / "qwen.bat")
     if not _ct_load_team(team):
         _ct_team_create(team)
     _ct_team_join(team, agent_name)
@@ -329,8 +354,9 @@ def _ct_spawn(team: str, agent_name: str, task: str, cwd: str = "") -> str:
     work_dir = cwd or str(Path.cwd())
     safe_name = re.sub(r"[^\w-]", "", agent_name)[:32]
     try:
+        cmd = _spawn_command(task_file)
         subprocess.Popen(
-            ["cmd.exe", "/c", "start", f"qwen-{safe_name}", "cmd", "/k", str(qwen_bin), "--task", f"@{task_file}"],
+            ["cmd.exe", "/c", "start", f"qwen-{safe_name}", "cmd", "/k", *cmd],
             shell=False,
             cwd=work_dir,
         )

@@ -220,3 +220,80 @@ class TestBoard:
     def test_board_unknown_team(self, ct):
         board = ct._ct_board_render("nosuchteam")
         assert "not found" in board
+
+
+# ---------------------------------------------------------------------------
+# Spawn — team_spawn_agent's process launch
+#
+# _ct_spawn used to resolve the launcher via shutil.which("qwen") or
+# shutil.which("qwen.bat"), falling back to Path(sys.executable).parent /
+# "qwen.bat" if neither was found on PATH. Confirmed live (a real self-audit
+# run): shutil.which() returned None for both from inside the running
+# process even though the interactive shell resolved "qwen" fine, so every
+# spawn hit the fallback — which pointed at .venv/Scripts/qwen.bat, a path
+# that never exists (qwen.bat lives at the project root, not next to the
+# interpreter). Every spawned terminal failed immediately with "not
+# recognized as a command" before running any Python; all 4 real tasks
+# spawned that way sat at started_at: "" forever.
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnCommand:
+    def test_resolves_entry_script_relative_to_this_file(self):
+        import sys
+
+        from qwen_cli.tools import team as team_mod
+
+        cmd = team_mod._spawn_command(Path("C:/fake/task.md"))
+        assert cmd[0] == sys.executable
+        assert cmd[1].endswith("qwen-cli.py")
+        assert Path(cmd[1]).exists()
+        assert cmd[2:] == ["--task", "@C:\\fake\\task.md"]
+
+    def test_never_falls_back_to_broken_sys_executable_relative_path(self):
+        from qwen_cli.tools import team as team_mod
+
+        cmd = team_mod._spawn_command(Path("C:/fake/task.md"))
+        # The bug: sys.executable's parent (the venv's Scripts/ dir) was
+        # assumed to contain qwen.bat. It never does.
+        assert "Scripts" not in cmd[1]
+
+    def test_falls_back_to_path_lookup_when_entry_script_missing(self, monkeypatch):
+        from qwen_cli.tools import team as team_mod
+
+        monkeypatch.setattr(team_mod.Path, "exists", lambda self: False)
+        monkeypatch.setattr(team_mod.shutil, "which", lambda name: "C:\\found\\qwen.bat" if name == "qwen" else None)
+        cmd = team_mod._spawn_command(Path("C:/fake/task.md"))
+        assert cmd == ["C:\\found\\qwen.bat", "--task", "@C:\\fake\\task.md"]
+
+    def test_raises_clearly_when_nothing_resolves(self, monkeypatch):
+        from qwen_cli.tools import team as team_mod
+
+        monkeypatch.setattr(team_mod.Path, "exists", lambda self: False)
+        monkeypatch.setattr(team_mod.shutil, "which", lambda name: None)
+        with pytest.raises(FileNotFoundError, match="could not locate qwen-cli.py"):
+            team_mod._spawn_command(Path("C:/fake/task.md"))
+
+
+class TestSpawn:
+    def test_ct_spawn_uses_resolved_command(self, ct, monkeypatch):
+        captured = {}
+
+        def fake_popen(args, **kwargs):
+            captured["args"] = args
+
+            class _P:
+                pid = 1234
+
+            return _P()
+
+        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", fake_popen)
+        result = ct._ct_spawn("myteam", "worker1", "do the thing")
+
+        assert "Spawned agent 'worker1'" in result
+        args = captured["args"]
+        assert args[:5] == ["cmd.exe", "/c", "start", "qwen-worker1", "cmd"]
+        assert args[5] == "/k"
+        assert args[6].endswith("python.exe")
+        assert args[7].endswith("qwen-cli.py")
+        assert args[8] == "--task"
