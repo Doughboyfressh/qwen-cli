@@ -185,31 +185,46 @@ class TestDetectAntibot:
         assert br._browser_detect_antibot(page) == "captcha-delivery.com"
 
 
-class TestResolveStorageState:
-    def test_missing_file_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(br, "COOKIE_FILE", tmp_path / "nope.json")
-        assert br._resolve_storage_state() is None
+class FakeCtx:
+    def __init__(self):
+        self.added_cookies = None
 
-    def test_new_format_dict_with_cookies_returns_path(self, tmp_path, monkeypatch):
+    def add_cookies(self, cookies):
+        self.added_cookies = cookies
+
+
+class TestMigrateLegacyCookieFile:
+    def test_missing_file_is_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(br, "COOKIE_FILE", tmp_path / "nope.json")
+        ctx = FakeCtx()
+        br._migrate_legacy_cookie_file(ctx)
+        assert ctx.added_cookies is None
+
+    def test_cookies_are_imported(self, tmp_path, monkeypatch):
         cookie_file = tmp_path / "cookies.json"
-        cookie_file.write_text('{"cookies": [], "origins": []}')
+        cookie_file.write_text('{"cookies": [{"name": "sid", "value": "1"}], "origins": []}')
         monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
-        assert br._resolve_storage_state() == str(cookie_file)
+        ctx = FakeCtx()
+        br._migrate_legacy_cookie_file(ctx)
+        assert ctx.added_cookies == [{"name": "sid", "value": "1"}]
 
     def test_legacy_bare_list_format_is_ignored(self, tmp_path, monkeypatch):
         # Old versions of this file stored context.cookies() directly -- a
-        # bare list, not the {"cookies": ..., "origins": ...} shape
-        # new_context(storage_state=...) requires.
+        # bare list, not the {"cookies": ..., "origins": ...} shape.
         cookie_file = tmp_path / "cookies.json"
         cookie_file.write_text("[]")
         monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
-        assert br._resolve_storage_state() is None
+        ctx = FakeCtx()
+        br._migrate_legacy_cookie_file(ctx)
+        assert ctx.added_cookies is None
 
-    def test_corrupt_json_returns_none(self, tmp_path, monkeypatch):
+    def test_corrupt_json_is_noop(self, tmp_path, monkeypatch):
         cookie_file = tmp_path / "cookies.json"
         cookie_file.write_text("{not valid json")
         monkeypatch.setattr(br, "COOKIE_FILE", cookie_file)
-        assert br._resolve_storage_state() is None
+        ctx = FakeCtx()
+        br._migrate_legacy_cookie_file(ctx)
+        assert ctx.added_cookies is None
 
 
 class TestParseProxyConfig:
@@ -276,39 +291,59 @@ class TestWaitOutAntibot:
         assert time.time() - start >= 0.6
 
 
-class TestLaunchChromium:
+class TestLaunchPersistentChromium:
     def test_prefers_real_chrome_channel(self):
         calls = []
 
         class FakePW:
             class chromium:
                 @staticmethod
-                def launch(**kwargs):
-                    calls.append(kwargs)
-                    return "BROWSER"
+                def launch_persistent_context(user_data_dir, **kwargs):
+                    calls.append((user_data_dir, kwargs))
+                    return "CONTEXT"
 
-        browser, is_real = br._launch_chromium(FakePW(), headless=False, proxy_config=None, args=[])
-        assert browser == "BROWSER"
+        ctx, is_real = br._launch_persistent_chromium(
+            FakePW(),
+            user_data_dir="profile-dir",
+            headless=False,
+            proxy_config=None,
+            args=[],
+            base_context_kwargs={"locale": "en-US"},
+            fallback_extra_kwargs={"user_agent": "should-not-be-used"},
+        )
+        assert ctx == "CONTEXT"
         assert is_real is True
-        assert calls[0].get("channel") == "chrome"
+        assert calls[0][0] == "profile-dir"
+        assert calls[0][1].get("channel") == "chrome"
+        assert "user_agent" not in calls[0][1]
         assert len(calls) == 1
 
-    def test_falls_back_when_chrome_channel_unavailable(self):
+    def test_falls_back_and_applies_extra_kwargs_when_chrome_unavailable(self):
         calls = []
 
         class FakePW:
             class chromium:
                 @staticmethod
-                def launch(**kwargs):
+                def launch_persistent_context(user_data_dir, **kwargs):
                     calls.append(kwargs)
                     if kwargs.get("channel") == "chrome":
                         raise RuntimeError("chrome not found")
-                    return "BROWSER"
+                    return "CONTEXT"
 
-        browser, is_real = br._launch_chromium(FakePW(), headless=False, proxy_config=None, args=[])
-        assert browser == "BROWSER"
+        ctx, is_real = br._launch_persistent_chromium(
+            FakePW(),
+            user_data_dir="profile-dir",
+            headless=False,
+            proxy_config=None,
+            args=[],
+            base_context_kwargs={"locale": "en-US"},
+            fallback_extra_kwargs={"user_agent": "fallback-ua"},
+        )
+        assert ctx == "CONTEXT"
         assert is_real is False
         assert len(calls) == 2
+        assert calls[1]["user_agent"] == "fallback-ua"
+        assert calls[1]["locale"] == "en-US"
 
     def test_ignore_default_args_disables_automation_flag(self):
         calls = []
@@ -316,11 +351,87 @@ class TestLaunchChromium:
         class FakePW:
             class chromium:
                 @staticmethod
-                def launch(**kwargs):
+                def launch_persistent_context(user_data_dir, **kwargs):
                     calls.append(kwargs)
-                    return "BROWSER"
+                    return "CONTEXT"
 
-        br._launch_chromium(FakePW(), headless=True, proxy_config=None, args=["--foo"])
+        br._launch_persistent_chromium(
+            FakePW(),
+            user_data_dir="profile-dir",
+            headless=True,
+            proxy_config=None,
+            args=["--foo"],
+            base_context_kwargs={},
+            fallback_extra_kwargs={},
+        )
         assert calls[0]["ignore_default_args"] == ["--enable-automation"]
         assert calls[0]["args"] == ["--foo"]
         assert calls[0]["headless"] is True
+
+
+class TestResolveSyncPlaywright:
+    def test_falls_back_to_playwright_when_patchright_absent(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "patchright.sync_api" or name.startswith("patchright"):
+                raise ImportError("no patchright")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        # playwright itself is a real dependency in this project's venv, so this
+        # should resolve to playwright.sync_api.sync_playwright without raising.
+        factory = br._resolve_sync_playwright()
+        assert callable(factory)
+
+    def test_raises_helpful_error_when_neither_installed(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name in ("patchright.sync_api", "playwright.sync_api") or name.startswith(
+                ("patchright", "playwright")
+            ):
+                raise ImportError(f"no {name}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        try:
+            br._resolve_sync_playwright()
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError as e:
+            assert "pip install" in str(e)
+
+
+class TestSettleAfterNav:
+    def test_scrolls_and_skips_mouse_without_state(self):
+        class FakePageWithEval(FakePage):
+            def __init__(self):
+                super().__init__()
+                self.evaluated = []
+
+            def evaluate(self, expr, arg=None):
+                self.evaluated.append((expr, arg))
+
+        page = FakePageWithEval()
+        br._browser_settle_after_nav(page, mouse_state=None)
+        assert len(page.evaluated) == 1
+        assert page.mouse.moves == []
+
+    def test_moves_mouse_and_tracks_position_when_state_given(self):
+        class FakePageWithEval(FakePage):
+            def evaluate(self, expr, arg=None):
+                pass
+
+        page = FakePageWithEval()
+        state: dict = {}
+        br._browser_settle_after_nav(page, mouse_state=state)
+        assert len(page.mouse.moves) == 1
+        assert state["mouse_pos"] == page.mouse.moves[0][:2]
+
+    def test_page_without_evaluate_is_noop_not_error(self):
+        # FakePage has no .evaluate -- must not raise.
+        br._browser_settle_after_nav(FakePage(), mouse_state=None)

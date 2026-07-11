@@ -25,6 +25,14 @@ _CFG = _load_config()
 _browser_state: dict = {}
 _render_state: dict = {}  # dedicated headless page for fetch_rendered (separate from browser_action)
 COOKIE_FILE = DATA_DIR / "browser_cookies.json"
+# Persistent on-disk Chrome profiles (real cookies/localStorage/IndexedDB/cache,
+# not a fresh throwaway context every run). Session/device history is itself a
+# signal heavier anti-bot systems (DataDome, Akamai, PerimeterX) weight -- a
+# browser with zero history on every request looks bot-like no matter how good
+# the JS stealth patches are. Separate dirs because two Chrome processes can't
+# share one user-data-dir, and browser_action/fetch_rendered can run concurrently.
+BROWSER_PROFILE_DIR = DATA_DIR / "browser_profile"
+RENDER_PROFILE_DIR = DATA_DIR / "browser_profile_render"
 
 _STEALTH_JS = """// === Comprehensive Anti-Detection ===
 
@@ -394,6 +402,28 @@ def _browser_wait_out_antibot(page, max_wait_s: float = 8.0) -> str:
     return pat
 
 
+def _browser_settle_after_nav(page, mouse_state: dict | None = None) -> None:
+    """Perform a small ambient scroll (+ mouse nudge, if tracking state is given)
+    right after a page loads.
+
+    A session that goes straight from "loaded" to "acting on a specific
+    selector" with zero ambient activity is itself a signal -- and some
+    behavioral anti-bot checks gate real content behind seeing at least one
+    scroll/mousemove event first. mouse_state is _browser_state for the headed
+    browser_action page (so later clicks continue the tracked path from here);
+    fetch_rendered's headless page has nothing to click afterward, so it's
+    passed None and only gets the scroll.
+    """
+    with contextlib.suppress(Exception):
+        page.evaluate("(y) => window.scrollBy(0, y)", _r.randint(80, 260))
+    if mouse_state is None:
+        return
+    with contextlib.suppress(Exception):
+        tx, ty = _r.uniform(200, 900), _r.uniform(150, 500)
+        page.mouse.move(tx, ty, steps=_r.randint(3, 6))
+        mouse_state["mouse_pos"] = (tx, ty)
+
+
 def _browser_random_viewport() -> dict:
     """Return a randomized viewport to avoid fingerprint matching."""
     widths = [1280, 1366, 1440, 1536, 1600, 1920]
@@ -474,29 +504,6 @@ def _browser_has_captcha(page) -> bool:
         return False
 
 
-def _resolve_storage_state() -> str | None:
-    """Return a Playwright storage_state path if COOKIE_FILE holds one, else None.
-
-    Older versions of this file stored a bare list of cookies (via
-    context.cookies()) -- cookies only, no localStorage. Plenty of modern
-    SPAs (JWT-based auth, common in React/Vue dashboards) keep the session
-    token in localStorage instead, so a cookies-only save silently fails to
-    restore those logins. storage_state() captures both. A stale bare-list
-    file from before this change is ignored rather than passed to
-    new_context(), which requires the {"cookies": [...], "origins": [...]}
-    shape and would error on a plain list.
-    """
-    if not COOKIE_FILE.exists():
-        return None
-    try:
-        data = json.loads(COOKIE_FILE.read_text())
-    except Exception:
-        return None
-    if isinstance(data, dict) and "cookies" in data:
-        return str(COOKIE_FILE)
-    return None
-
-
 def _browser_save_cookies(page) -> None:
     """Save cookies + localStorage for the current context via storage_state()."""
     with contextlib.suppress(Exception):
@@ -531,52 +538,107 @@ def _parse_proxy_config(proxy_url: str) -> dict | None:
     return proxy
 
 
-def _launch_chromium(pw, *, headless: bool, proxy_config: dict | None, args: list[str]) -> tuple[Any, bool]:
-    """Launch Chromium, preferring the real installed Chrome channel.
+def _resolve_sync_playwright():
+    """Return a sync_playwright() factory, preferring patchright over playwright.
 
-    Anti-bot systems (Cloudflare, PerimeterX, DataDome, etc.) fingerprint
-    Playwright's bundled Chromium build distinctly from a real Google Chrome
-    install -- using the "chrome" channel is one of the most effective single
-    changes for passing heavier bot checks. Falls back to bundled Chromium if
-    Chrome isn't installed (this tool's own install instructions only mention
-    `playwright install chromium`, so plenty of setups won't have it).
-    ignore_default_args drops Playwright's own --enable-automation flag,
-    another default automation signal.
-
-    Returns (browser, used_real_chrome) -- callers should skip their own
-    user_agent/sec-ch-ua overrides when used_real_chrome is True. Those
-    overrides only touch navigator.userAgent and the User-Agent header, not
-    a real Chrome's own Client Hints (navigator.userAgentData, sec-ch-ua),
-    which still reflect the true version -- spoofing on top of a genuine
-    browser creates a mismatch that's a *worse* tell than leaving it alone.
+    patchright (https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) is a
+    patched Playwright build that closes CDP-protocol-level detection vectors
+    (e.g. the Runtime.enable leak) which no amount of JS-level stealth (the
+    _STEALTH_JS init script, real Chrome channel, etc.) can hide, because
+    they're visible below the page's own JS. It's API-compatible with
+    playwright.sync_api, so this is a drop-in swap when installed. Not a hard
+    dependency -- falls back to plain playwright if patchright isn't present.
     """
     try:
-        browser = pw.chromium.launch(
+        from patchright.sync_api import sync_playwright
+
+        return sync_playwright
+    except ImportError:
+        pass
+    try:
+        from playwright.sync_api import sync_playwright
+
+        return sync_playwright
+    except ImportError as e:
+        msg = (
+            "no browser automation backend installed — run: pip install playwright && "
+            "playwright install chrome (or, for stronger anti-bot resistance: "
+            "pip install patchright && patchright install chrome)"
+        )
+        raise RuntimeError(msg) from e
+
+
+def _migrate_legacy_cookie_file(ctx) -> None:
+    """One-time import of pre-persistent-profile cookies into a fresh profile.
+
+    Before persistent profiles, cookies/localStorage lived only in COOKIE_FILE
+    (a Playwright storage_state JSON) because every session started from a
+    throwaway context. A brand-new profile directory has none of that, so
+    without this a user upgrading to this version would silently lose whatever
+    session they'd already saved. Cookies only (not localStorage) -- there's no
+    context-level API to inject localStorage across arbitrary origins.
+    """
+    if not COOKIE_FILE.exists():
+        return
+    try:
+        data = json.loads(COOKIE_FILE.read_text())
+        cookies = data.get("cookies") if isinstance(data, dict) else None
+        if cookies:
+            ctx.add_cookies(cookies)
+    except Exception:
+        pass
+
+
+def _launch_persistent_chromium(
+    pw,
+    *,
+    user_data_dir: str,
+    headless: bool,
+    proxy_config: dict | None,
+    args: list[str],
+    base_context_kwargs: dict,
+    fallback_extra_kwargs: dict,
+) -> tuple[Any, bool]:
+    """Launch a persistent Chromium context, preferring the real installed Chrome channel.
+
+    launch_persistent_context() merges browser launch and context creation into
+    one call (unlike launch() + new_context()), so which kwargs apply isn't
+    known until we find out whether the "chrome" channel actually succeeded --
+    hence base_context_kwargs (always applied) vs. fallback_extra_kwargs
+    (user_agent/sec-ch-ua overrides, only applied when real Chrome isn't
+    available and bundled Chromium's own UA needs masking). Spoofing UA/Client
+    Hints on top of a genuine Chrome install would mismatch navigator.userAgentData
+    against the real installed version -- a worse tell than leaving it alone.
+
+    Returns (context, used_real_chrome).
+    """
+    try:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir,
             headless=headless,
             channel="chrome",
             proxy=proxy_config,
             args=args,
             ignore_default_args=["--enable-automation"],
+            **base_context_kwargs,
         )
-        return browser, True
+        return ctx, True
     except Exception:
-        browser = pw.chromium.launch(
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir,
             headless=headless,
             proxy=proxy_config,
             args=args,
             ignore_default_args=["--enable-automation"],
+            **{**base_context_kwargs, **fallback_extra_kwargs},
         )
-        return browser, False
+        return ctx, False
 
 
 def _get_page() -> Any:
     """Internal helper: get page."""
     if "page" not in _browser_state or _browser_state.get("closed"):
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as e:
-            msg = "playwright not installed — run: pip install playwright && playwright install chromium"
-            raise RuntimeError(msg) from e
+        sync_playwright = _resolve_sync_playwright()
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
@@ -586,8 +648,32 @@ def _get_page() -> Any:
             console.print(f"[yellow]  [browser] browser_proxy={_proxy_url!r} could not be parsed — ignoring[/yellow]")
         elif _proxy_config:
             console.print(f"[dim]  [browser] using proxy: {_proxy_config['server']}[/dim]")
-        browser, _is_real_chrome = _launch_chromium(
+        BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
+        _is_fresh_profile = not any(BROWSER_PROFILE_DIR.iterdir())
+        _base_kwargs: dict[str, Any] = {
+            "viewport": _browser_random_viewport(),
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
+            "permissions": ["geolocation"],
+            "color_scheme": "light",
+        }
+        _fallback_extra = {
+            "user_agent": _ua,
+            "extra_http_headers": {
+                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "accept-language": "en-US,en;q=0.9",
+            },
+        }
+        ctx, _is_real_chrome = _launch_persistent_chromium(
             pw,
+            user_data_dir=str(BROWSER_PROFILE_DIR),
             headless=False,  # headed mode is harder to detect
             proxy_config=_proxy_config,
             args=[
@@ -604,37 +690,19 @@ def _get_page() -> Any:
                 "--disable-dev-shm-usage",
                 "--lang=en-US",
             ],
+            base_context_kwargs=_base_kwargs,
+            fallback_extra_kwargs=_fallback_extra,
         )
-        _ctx_kwargs: dict[str, Any] = {
-            "viewport": _browser_random_viewport(),
-            "locale": "en-US",
-            "timezone_id": "America/New_York",
-            "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
-            "permissions": ["geolocation"],
-            "color_scheme": "light",
-            "storage_state": _resolve_storage_state(),
-        }
-        if not _is_real_chrome:
-            _ctx_kwargs["user_agent"] = _ua
-            _ctx_kwargs["extra_http_headers"] = {
-                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "accept-language": "en-US,en;q=0.9",
-            }
-        ctx = browser.new_context(**_ctx_kwargs)
         ctx.add_init_script(_STEALTH_JS)
-        page = ctx.new_page()
+        if _is_fresh_profile:
+            _migrate_legacy_cookie_file(ctx)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         # Links with target="_blank", OAuth popups, and window.open() all spawn a
         # new Playwright Page in this context. Without this, _browser_state["page"]
         # would keep pointing at the now-background original tab, and every
         # subsequent action would silently act on stale content.
         ctx.on("page", lambda new_page: _browser_state.update(page=new_page))
-        _browser_state.update(playwright=pw, browser=browser, context=ctx, page=page, closed=False)
+        _browser_state.update(playwright=pw, context=ctx, page=page, closed=False)
     return _browser_state["page"]
 
 
@@ -697,9 +765,13 @@ def _browser_captcha_hint(page) -> str:
 
 
 def _browser_do_close(url="", selector="", value="", screenshot_path=""):
-    if "browser" in _browser_state:
+    # launch_persistent_context() has no separate Browser object -- closing
+    # the context closes the underlying browser process too. Session state
+    # itself now lives in the on-disk profile (BROWSER_PROFILE_DIR); the
+    # storage_state export below is just a portable backup/inspection copy.
+    if "context" in _browser_state:
         _browser_save_cookies(_browser_state["page"])
-        _browser_state["browser"].close()
+        _browser_state["context"].close()
     if "playwright" in _browser_state:
         _browser_state["playwright"].stop()
     _browser_state.clear()
@@ -733,6 +805,7 @@ def _browser_do_navigate(page, url, selector="", value="", screenshot_path=""):
     antibot_pat = _browser_wait_out_antibot(page)
     if antibot_pat:
         console.print(f"[bold yellow]  [browser] anti-bot signal detected: {antibot_pat}[/bold yellow]")
+    _browser_settle_after_nav(page, _browser_state)
     captcha_note = _browser_check_captcha_pause(page)
     _browser_save_cookies(page)
     title = page.title()
@@ -762,8 +835,13 @@ def _browser_do_type(page, url="", selector="", value="", screenshot_path=""):
     console.print(f"[bold cyan]  [browser][/bold cyan] type {selector!r} = {value!r}")
     loc = _browser_resolve_selector(page, selector)
     loc.first.wait_for(state="visible", timeout=8000)
+    _browser_move_toward_element(page, loc.first)
     loc.first.click()
-    loc.first.type(value, delay=60)
+    # A constant per-keystroke delay is itself a rhythm no real typist has --
+    # type one character at a time with a randomized delay instead of a single
+    # fixed-delay call across the whole string.
+    for ch in value:
+        loc.first.type(ch, delay=_r.uniform(40, 180))
     return f"[typed into {selector!r}]"
 
 
@@ -1053,16 +1131,33 @@ def do_browser_action(
 def _get_render_page() -> Any:
     """Get (or create) the dedicated headless Playwright page used by fetch_rendered."""
     if "page" not in _render_state or _render_state.get("closed"):
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as e:
-            msg = "playwright not installed — run: pip install playwright && playwright install chromium"
-            raise RuntimeError(msg) from e
+        sync_playwright = _resolve_sync_playwright()
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
         _major = _ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in _ua else "131"
-        bro, _is_real_chrome = _launch_chromium(
+        RENDER_PROFILE_DIR.mkdir(exist_ok=True)
+        _base_kwargs: dict[str, Any] = {
+            "viewport": _browser_random_viewport(),
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "color_scheme": "light",
+        }
+        _fallback_extra = {
+            "user_agent": _ua,
+            "extra_http_headers": {
+                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "accept-language": "en-US,en;q=0.9",
+            },
+        }
+        ctx, _is_real_chrome = _launch_persistent_chromium(
             pw,
+            user_data_dir=str(RENDER_PROFILE_DIR),
             headless=True,
             proxy_config=_parse_proxy_config(_CFG.get("browser_proxy", "")),
             args=[
@@ -1077,30 +1172,13 @@ def _get_render_page() -> Any:
                 "--disable-dev-shm-usage",
                 "--lang=en-US",
             ],
+            base_context_kwargs=_base_kwargs,
+            fallback_extra_kwargs=_fallback_extra,
         )
-        _ctx_kwargs: dict[str, Any] = {
-            "viewport": _browser_random_viewport(),
-            "locale": "en-US",
-            "timezone_id": "America/New_York",
-            "color_scheme": "light",
-        }
-        if not _is_real_chrome:
-            _ctx_kwargs["user_agent"] = _ua
-            _ctx_kwargs["extra_http_headers"] = {
-                "sec-ch-ua": f'"Chromium";v="{_major}", "Google Chrome";v="{_major}"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "accept-language": "en-US,en;q=0.9",
-            }
-        ctx = bro.new_context(**_ctx_kwargs)
         ctx.add_init_script(_STEALTH_JS)
-        page = ctx.new_page()
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         ctx.on("page", lambda new_page: _render_state.update(page=new_page))
-        _render_state.update(playwright=pw, browser=bro, context=ctx, page=page, closed=False)
+        _render_state.update(playwright=pw, context=ctx, page=page, closed=False)
     return _render_state["page"]
 
 
@@ -1140,6 +1218,7 @@ def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
         # few seconds once real JS executes -- wait it out rather than
         # reporting the challenge page as if it were the real content.
         antibot_pat = _browser_wait_out_antibot(page)
+        _browser_settle_after_nav(page)
 
         # Check for CAPTCHA (headless triggers it less, but still possible).
         # Non-blocking: this page has no visible window, so there's no one who

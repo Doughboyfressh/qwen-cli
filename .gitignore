@@ -9,6 +9,8 @@ context_snapshots/
 
 # Sensitive files
 browser_cookies.json
+browser_profile/
+browser_profile_render/
 memory.md
 input_history.txt
 pt_history.txt
