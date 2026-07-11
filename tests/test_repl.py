@@ -3,6 +3,7 @@
 import io
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -202,6 +203,155 @@ def test_run_turn_and_handle_reply_with_plan(qwen_cli):
 
     assert len(ctx.history) == 3
     assert ctx.history[-1]["role"] == "assistant"
+
+
+# ==============================================================================
+# _run_turn_and_handle_reply — low-confidence self-correction
+#
+# _confidence_warning() only *tells* the user a reply hedged heavily; it
+# doesn't do anything about it. If the model hedged and never searched to
+# verify, one grounding pass should be forced automatically instead of
+# handing back an unverified answer.
+# ==============================================================================
+
+_HEDGED_REPLY = "It might be v3. It's probably outdated. Perhaps check again. I think that's right."
+
+
+def _patch_common(qwen_cli, run_turn_side_effect):
+    """Returns an already-populated ExitStack so callers can do `with _patch_common(...):`."""
+    stack = ExitStack()
+    for cm in (
+        patch("qwen_cli.main.AUTO_SAVE_INTERVAL", 5, create=True),
+        patch.object(qwen_cli, "_maybe_autocompact", side_effect=lambda h, bs, c: h),
+        patch.object(qwen_cli, "build_system_prompt", return_value="sys"),
+        patch.object(qwen_cli, "run_turn", side_effect=run_turn_side_effect),
+        patch.object(qwen_cli, "_print_turn_footer"),
+        patch.object(qwen_cli, "_confidence_warning"),
+        patch.object(qwen_cli, "_silent_autosave"),
+        patch.object(qwen_cli, "_auto_extract_memory"),
+        patch.object(qwen_cli, "_intel_process_queue"),
+        patch.object(qwen_cli, "_intel_extract_topics"),
+        patch.object(qwen_cli, "_generate_session_title"),
+        patch.object(qwen_cli, "_extract_runnable_code", return_value=None),
+        patch.object(qwen_cli, "_looks_like_plan", return_value=False),
+        patch.object(qwen_cli, "_main_llm_busy_lock", MagicMock()),
+        patch.object(qwen_cli, "AUTO_SEARCH_MODE", "aggressive"),
+    ):
+        stack.enter_context(cm)
+    return stack
+
+
+def test_reverify_triggers_on_hedged_reply_without_search(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            qwen_cli._last_turn_tool_names[:] = []  # no search performed
+            return _HEDGED_REPLY
+        return "It's version 3.2, confirmed via the changelog."
+
+    with _patch_common(qwen_cli, fake_run_turn):
+        _run_turn_and_handle_reply(ctx, "what version is it")
+
+    assert len(calls) == 2  # original + one forced reverify pass
+    assert ctx.history[-1]["content"] == "It's version 3.2, confirmed via the changelog."
+    # The reverify prompt appended to the LLM messages, not to permanent history
+    assert len(ctx.history) == 2
+    assert any("hedging language" in (m.get("content") or "") for m in calls[1])
+
+
+def test_reverify_skipped_when_search_already_ran(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(messages)
+        qwen_cli._last_turn_tool_names[:] = ["web_search"]
+        return _HEDGED_REPLY
+
+    with _patch_common(qwen_cli, fake_run_turn):
+        _run_turn_and_handle_reply(ctx, "what version is it")
+
+    assert len(calls) == 1  # already searched — don't loop again
+    assert ctx.history[-1]["content"] == _HEDGED_REPLY
+
+
+def test_reverify_skipped_when_tools_disabled(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(messages)
+        qwen_cli._last_turn_tool_names[:] = []
+        return _HEDGED_REPLY
+
+    with _patch_common(qwen_cli, fake_run_turn):
+        _run_turn_and_handle_reply(ctx, "what version is it", allow_tools=False)
+
+    assert len(calls) == 1  # -- no-tools mode: never force a search
+    assert ctx.history[-1]["content"] == _HEDGED_REPLY
+
+
+def test_reverify_skipped_when_auto_search_off(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(messages)
+        qwen_cli._last_turn_tool_names[:] = []
+        return _HEDGED_REPLY
+
+    with _patch_common(qwen_cli, fake_run_turn) as stack:
+        stack.enter_context(patch.object(qwen_cli, "AUTO_SEARCH_MODE", "off"))
+        _run_turn_and_handle_reply(ctx, "what version is it")
+
+    assert len(calls) == 1
+    assert ctx.history[-1]["content"] == _HEDGED_REPLY
+
+
+def test_reverify_falls_back_to_original_when_revised_is_empty(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(messages)
+        qwen_cli._last_turn_tool_names[:] = []
+        return _HEDGED_REPLY if len(calls) == 1 else None
+
+    with _patch_common(qwen_cli, fake_run_turn):
+        _run_turn_and_handle_reply(ctx, "what version is it")
+
+    assert len(calls) == 2
+    assert ctx.history[-1]["content"] == _HEDGED_REPLY  # kept the original, not lost it
+
+
+def test_reverify_not_triggered_when_reply_is_confident(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _run_turn_and_handle_reply
+
+    ctx = _ReplContext([], "system", "client")
+    calls = []
+
+    def fake_run_turn(client, messages, allow_tools=True):
+        calls.append(messages)
+        qwen_cli._last_turn_tool_names[:] = []
+        return "It's version 3.2."
+
+    with _patch_common(qwen_cli, fake_run_turn):
+        _run_turn_and_handle_reply(ctx, "what version is it")
+
+    assert len(calls) == 1
 
 
 # ==============================================================================

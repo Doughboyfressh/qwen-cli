@@ -192,6 +192,41 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
     if not reply:
         return
 
+    # Low-confidence self-correction: _confidence_warning() below only *tells*
+    # the user a reply hedges heavily — it doesn't do anything about it. If the
+    # model hedged (multiple "I think"/"might"/"probably"-style phrases) and
+    # never actually searched to verify, force one grounding pass instead of
+    # handing back an unverified answer. Scoped to plain chat only (not
+    # /agent or /task, via allow_tools) since "might"/"could" are often
+    # legitimate engineering judgment there, not factual uncertainty.
+    if (
+        allow_tools
+        and _main.AUTO_SEARCH_MODE != "off"
+        and len(_main._HEDGE_RE.findall(reply)) >= 3
+        and not any(name in ("web_search", "search_news") for name in _main._last_turn_tool_names)
+    ):
+        console.print("[dim yellow]  [low confidence — verifying with a search before answering][/dim yellow]")
+        messages.append({"role": "assistant", "content": reply})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your last answer used a lot of hedging language (e.g. 'I think', 'might', 'probably') "
+                    "without searching to verify. Use web_search now to check the specific facts you were "
+                    "unsure about, then give a corrected, grounded answer."
+                ),
+            }
+        )
+        with _main._main_llm_busy_lock:
+            _main._main_llm_busy = True
+        try:
+            revised = _main.run_turn(ctx.client, messages, allow_tools=allow_tools)
+        finally:
+            with _main._main_llm_busy_lock:
+                _main._main_llm_busy = False
+        if revised:
+            reply = revised
+
     ctx.history.append({"role": "user", "content": user_input})
     ctx.history.append({"role": "assistant", "content": reply})
     _main._turn_count += 1
