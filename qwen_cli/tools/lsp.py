@@ -77,8 +77,15 @@ _LSP_LANGUAGE: str | None = None
 # a broken handshake degrades to "LSP disabled" instead of freezing the CLI.
 _LSP_STARTUP_TIMEOUT: int = 20  # seconds
 _LSP_REQUEST_TIMEOUT: int = 15  # seconds — bounds every definition/references/hover/etc. call
-_LSP_LAST_START_FAILURE: float = 0.0
-_LSP_FAILURE_COOLDOWN: int = 60  # seconds — don't retry a just-failed/hung server on every call
+
+# A startup failure here (bad handshake, missing binary, version mismatch) is a
+# deterministic environmental problem, not a transient blip — retrying on a timer
+# just re-pays the ~20s timeout forever. Measured live: patch_file's LSP pre/post-edit
+# hooks made the FIRST patch on a code file cost 20s and, with a time-based cooldown,
+# every patch after the cooldown expired cost another 20s — a recurring tax on the
+# tool the system prompt tells the model to prefer. Disable per-language for the rest
+# of the process once a real startup failure is observed; /lsp shutdown resets it.
+_LSP_DISABLED_LANGUAGES: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +199,7 @@ def _create_server(file_path: str = "") -> Any:
     enter it (via ``with`` or manual ``__enter__``) so that the internal event
     loop is created and the server process is actually launched.
     """
-    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE, _LSP_LAST_START_FAILURE
+    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
 
     if not _multilspy_available:
         msg = "multilspy is not installed. Install with: pip install multilspy"
@@ -200,11 +207,12 @@ def _create_server(file_path: str = "") -> Any:
             msg,
         )
 
-    if _LSP_LAST_START_FAILURE and time.time() - _LSP_LAST_START_FAILURE < _LSP_FAILURE_COOLDOWN:
-        msg = "LSP server failed to start recently; skipping retry for a bit (see qwen.log)"
+    language = _detect_language(file_path)
+
+    if language in _LSP_DISABLED_LANGUAGES:
+        msg = f"LSP server for '{language}' failed to start earlier this session; not retrying (run /lsp shutdown to reset)"
         raise RuntimeError(msg)
 
-    language = _detect_language(file_path)
     root = _get_project_root(file_path)
 
     lang_enum = _language_to_multilspy_enum(language)
@@ -238,12 +246,12 @@ def _create_server(file_path: str = "") -> Any:
     _thread.start()
     _thread.join(timeout=_LSP_STARTUP_TIMEOUT)
     if _thread.is_alive():
-        _LSP_LAST_START_FAILURE = time.time()
+        _LSP_DISABLED_LANGUAGES.add(language)
         msg = f"LSP server for '{language}' did not initialize within {_LSP_STARTUP_TIMEOUT}s (handshake hung)"
         _logger.warning(msg)
         raise RuntimeError(msg)
     if "error" in _result:
-        _LSP_LAST_START_FAILURE = time.time()
+        _LSP_DISABLED_LANGUAGES.add(language)
         raise _result["error"]
     lsp._start_ctx = ctx  # keep alive for shutdown
 
@@ -298,7 +306,12 @@ def _ensure_server(file_path: str = "") -> Any:
 
 
 def shutdown() -> None:
-    """Explicitly shut down the LSP server."""
+    """Explicitly shut down the LSP server and clear any startup-failure history.
+
+    This is the user's explicit escape hatch to retry a language that previously
+    failed to start (e.g. after fixing the underlying environment issue) — see
+    _LSP_DISABLED_LANGUAGES.
+    """
     global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
 
     with _LSP_LOCK:
@@ -307,6 +320,7 @@ def shutdown() -> None:
             _LSP_SERVER = None
             _LSP_ROOT = None
             _LSP_LANGUAGE = None
+        _LSP_DISABLED_LANGUAGES.clear()
 
 
 def _check_idle_shutdown() -> None:

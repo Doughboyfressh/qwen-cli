@@ -2183,26 +2183,6 @@ def do_patch_file(path: str, diff: str) -> str:
         except Exception:
             _logger.debug("LSP pre-edit check failed for %s (non-critical)", p)
 
-        # Feature 5: Rename safety -- check renamed symbols have all refs updated
-        try:
-            _lsp = _get_lsp()
-            if _lsp._is_code_file(str(p)):
-                for dline in diff.split("\n"):
-                    if dline.startswith("+") and not dline.startswith("+++"):
-                        stripped = dline.lstrip("+").strip()
-                        if any(kw in stripped for kw in ("class ", "def ", " = ", "import ")):
-                            words = stripped.split()
-                            for w in words:
-                                if w.isidentifier() and len(w) > 2:
-                                    refs = _lsp.lsp_references(str(p), w)
-                                    if refs.get("count", 0) > 1:
-                                        console.print(
-                                            f'[dim yellow]  Rename safety: "{w}" has {refs["count"]} references -- verify all updated[/dim yellow]',
-                                        )
-                                    break
-        except Exception:
-            _logger.debug("LSP rename-safety check failed for %s (non-critical)", p)
-
         # Feature 6+10: Post-edit trend tracking + import check
         try:
             _lsp = _get_lsp()

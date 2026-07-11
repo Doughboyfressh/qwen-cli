@@ -308,3 +308,39 @@ def test_language_to_multilspy_enum_returns_mapping(lsp_client):
     else:
         result = lsp_client._language_to_multilspy_enum("python")
         assert result is not None
+
+
+# --- Per-language startup-failure disablement -------------------------------
+# A startup failure (bad handshake, missing binary) is deterministic, not a
+# transient blip — _create_server() must not retry it on a timer; it should
+# refuse immediately until /lsp shutdown explicitly resets it.
+
+
+def test_create_server_skips_previously_disabled_language(lsp_client):
+    if not lsp_client._multilspy_available:
+        pytest.skip("multilspy not installed in this environment")
+    lsp_client._LSP_DISABLED_LANGUAGES.add("python")
+    try:
+        with pytest.raises(RuntimeError, match="not retrying"):
+            lsp_client._create_server("foo.py")
+    finally:
+        lsp_client._LSP_DISABLED_LANGUAGES.discard("python")
+
+
+def test_disabled_languages_is_per_language_not_global(lsp_client):
+    # The old mechanism was a single global timestamp: python's failure would
+    # have wrongly blocked every other language too. Confirm the replacement
+    # (a set keyed by language) doesn't have that problem.
+    lsp_client._LSP_DISABLED_LANGUAGES.add("python")
+    try:
+        assert lsp_client._detect_language("foo.go") == "go"
+        assert "go" not in lsp_client._LSP_DISABLED_LANGUAGES
+    finally:
+        lsp_client._LSP_DISABLED_LANGUAGES.discard("python")
+
+
+def test_shutdown_clears_disabled_languages(lsp_client):
+    lsp_client._LSP_DISABLED_LANGUAGES.add("python")
+    lsp_client._LSP_DISABLED_LANGUAGES.add("go")
+    lsp_client.shutdown()
+    assert lsp_client._LSP_DISABLED_LANGUAGES == set()
