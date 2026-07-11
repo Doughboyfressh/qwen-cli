@@ -2,6 +2,13 @@
 set PYTHONUTF8=1
 set PYDANTIC_DISABLE_ANNOTATIONLIB=1
 
+REM CLI input-token budget. Keep well under (server -c below) minus the preset
+REM max_tokens output reservation (32768 for thinking/code) -- 65536 - 32768 =
+REM 32768 ceiling, so 28000 leaves ~4.7k headroom for tokenizer-estimate drift
+REM and tool schemas. This is the committed fallback for a fresh clone with no
+REM config.toml (gitignored, personal); a config.toml token_limit still wins.
+set QWEN_TOKEN_LIMIT=28000
+
 REM CUDA 12 runtime DLLs
 set PATH=%USERPROFILE%\.lmstudio\extensions\backends\vendor\win-llama-cuda12-vendor-v2;%PATH%
 
