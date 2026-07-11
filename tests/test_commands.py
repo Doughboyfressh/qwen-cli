@@ -320,7 +320,7 @@ def test_cmd_remember_adds_fact(qwen_cli, monkeypatch):
     saved = []
     monkeypatch.setattr(qwen_cli, "save_memory", lambda t: saved.append(t))
     output = _run_and_capture_print(_cmd_remember, qwen_cli, ctx, "my fact")
-    assert saved == ["existing memory\n- my fact"]
+    assert saved == ["existing memory\n\n- my fact"]
     assert "remembered" in output
 
 

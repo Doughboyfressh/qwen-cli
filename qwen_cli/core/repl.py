@@ -335,6 +335,17 @@ def _repl_setup(client: object) -> tuple[str, list, _ReplContext]:
         console.print("[dim]Project detected — loading context automatically (/project to reload)[/dim]")
         _main.load_project_context("", history)
 
+    # _consume_handoff() reads (and deletes) whatever the previous session left
+    # behind on exit or crash — see _save_exit_handoff(). Injected the same way
+    # load_project_context() injects the project tree: as a "user"-role context
+    # message the model sees on the next turn, not something requiring an
+    # immediate reply.
+    handoff = _main._consume_handoff()
+    if handoff:
+        turns_note = f" ({handoff['turns']} turns)" if handoff.get("turns") else ""
+        console.print(f"[dim]Resuming from previous session{turns_note}...[/dim]")
+        history.append({"role": "user", "content": handoff["prompt"]})
+
     return base_system, history, ctx
 
 
@@ -365,6 +376,7 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
             console.print()
             if history:
                 _main.save_session(history, base_system)
+                _main._save_exit_handoff(history)
             with contextlib.suppress(Exception):
                 _main.record_session_changes_memory(ctx.client)
             _cleanup_watch()

@@ -15,5 +15,9 @@ readability-lxml
 multilspy
 python-lsp-server[all]
 jedi
+# Process liveness checks for team_spawn_agent's stale-agent detection
+# (already pulled in transitively by multilspy; declared explicitly since
+# we now import it directly)
+psutil
 # Clipboard support for /copy and /paste
 pyperclip

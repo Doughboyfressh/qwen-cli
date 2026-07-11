@@ -103,7 +103,11 @@ class TestLegacyStringMembers:
 
     def test_spawn_leader_resolution_does_not_crash_on_legacy_config(self, ct, tmp_path, monkeypatch):
         self._write_legacy_config(tmp_path)
-        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", lambda *a, **k: None)
+
+        class _FakeProc:
+            pid = 1234
+
+        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", lambda *a, **k: _FakeProc())
         result = ct._ct_spawn("legacy", "worker1", "do the thing")
         assert "Spawned agent 'worker1'" in result
 
@@ -362,3 +366,87 @@ class TestSpawn:
         assert args[1].endswith("qwen-cli.py")
         assert args[2] == "--task"
         assert "creationflags" in captured["kwargs"]
+
+    def test_ct_spawn_records_pid_in_task_metadata(self, ct, monkeypatch):
+        class _FakeProc:
+            pid = 5678
+
+        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", lambda *a, **k: _FakeProc())
+        ct._ct_spawn("myteam", "worker1", "do the thing")
+
+        tasks = ct._ct_task_list("myteam")
+        assert len(tasks) == 1
+        assert tasks[0]["metadata"]["pid"] == 5678
+        assert "spawned_at" in tasks[0]["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# Stale-agent detection — team_spawn_agent's Popen() is fire-and-forget with
+# no timeout or heartbeat. A hung or crashed agent otherwise goes unnoticed
+# forever; _ct_check_stale() flags tasks whose recorded process has died or
+# that haven't been updated in a while.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckStale:
+    def test_flags_task_with_dead_process(self, ct):
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        ct._ct_record_spawn_pid("watch", task["id"], 999_999_999)  # essentially guaranteed not to exist
+
+        stale = ct._ct_check_stale("watch")
+
+        assert len(stale) == 1
+        assert stale[0]["id"] == task["id"]
+        assert "process no longer running" in stale[0]["_stale_reason"]
+
+    def test_does_not_flag_task_with_alive_process(self, ct):
+        import os
+
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        ct._ct_record_spawn_pid("watch", task["id"], os.getpid())  # this test process — definitely alive
+
+        stale = ct._ct_check_stale("watch")
+
+        assert stale == []
+
+    def test_ignores_completed_tasks_regardless_of_pid(self, ct):
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        ct._ct_record_spawn_pid("watch", task["id"], 999_999_999)
+        ct._ct_task_update("watch", task["id"], status="completed")
+
+        assert ct._ct_check_stale("watch") == []
+
+    def test_ignores_blocked_tasks_regardless_of_pid(self, ct):
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        ct._ct_record_spawn_pid("watch", task["id"], 999_999_999)
+        ct._ct_task_update("watch", task["id"], status="blocked")
+
+        assert ct._ct_check_stale("watch") == []
+
+    def test_flags_task_with_no_pid_based_on_age_alone(self, ct):
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        # No PID recorded at all — simulate an old, never-updated task.
+        path = ct._ct_tasks_dir("watch") / f"task-{task['id']}.json"
+        stale_task = dict(task)
+        stale_task["updated_at"] = "2020-01-01T00:00:00+00:00"
+        ct._ct_atomic_write(path, json.dumps(stale_task))
+
+        stale = ct._ct_check_stale("watch", stale_minutes=20)
+
+        assert len(stale) == 1
+        assert "no update in" in stale[0]["_stale_reason"]
+
+    def test_board_render_shows_stale_marker(self, ct):
+        ct._ct_team_create("watch")
+        task = ct._ct_task_add("watch", "do work", owner="worker1")
+        ct._ct_record_spawn_pid("watch", task["id"], 999_999_999)
+
+        board = ct._ct_board_render("watch")
+
+        assert "STALE" in board
+        assert "process no longer running" in board

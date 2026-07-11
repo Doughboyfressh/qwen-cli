@@ -33,6 +33,7 @@ def _cmd_exit(ctx: _ReplContext, arg: str) -> None:
 
     if ctx.history:
         _main.save_session(ctx.history, ctx.base_system)
+        _main._save_exit_handoff(ctx.history)
     with contextlib.suppress(Exception):
         _main.record_session_changes_memory(ctx.client)
     _main.console.print("[dim]Bye.[/dim]")
@@ -229,7 +230,10 @@ def _cmd_remember(ctx: _ReplContext, arg: str) -> None:
     else:
         with _main._memory_lock:
             mem = _main.load_memory()
-            _main.save_memory((mem + f"\n- {arg}").strip())
+            # Blank-line separated so _enforce_memory_cap() can drop individual
+            # remembered facts rather than lumping them into one block that's
+            # either kept or dropped wholesale.
+            _main.save_memory((mem + f"\n\n- {arg}").strip())
         _main.console.print("[green][remembered — persists across sessions][/green]")
 
 

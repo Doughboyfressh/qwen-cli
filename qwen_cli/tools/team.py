@@ -245,6 +245,7 @@ def _ct_board_render(team: str) -> str:
     for m in members:
         lines.append(f"  {m.get('name', '?')}  ({m.get('agentType', 'agent')})")
     lines.append(f"\nTasks ({len(tasks)}):")
+    stale_reasons = {t["id"]: t["_stale_reason"] for t in _ct_check_stale(team)}
     by_status: dict[str, list] = {}
     for t in tasks:
         by_status.setdefault(t.get("status", "pending"), []).append(t)
@@ -259,7 +260,8 @@ def _ct_board_render(team: str) -> str:
             pri_tag = f"  [{pri}]" if pri != "medium" else ""
             nn = len(t.get("notes", []))
             notes_tag = f"  ({nn} note{'s' if nn != 1 else ''})" if nn else ""
-            lines.append(f"    [{t['id'][:6]}] {t.get('subject', '?')}{owner_tag}{pri_tag}{notes_tag}")
+            stale_tag = f"  [!] STALE: {stale_reasons[t['id']]}" if t["id"] in stale_reasons else ""
+            lines.append(f"    [{t['id'][:6]}] {t.get('subject', '?')}{owner_tag}{pri_tag}{notes_tag}{stale_tag}")
     return "\n".join(lines)
 
 
@@ -384,11 +386,65 @@ def _ct_spawn(team: str, agent_name: str, task: str, cwd: str = "") -> str:
         # quoting rules) entirely — it's a native CreateProcess flag that opens a
         # new console directly, at the cost of a generic window title instead of
         # a custom "qwen-<name>" one.
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             cwd=work_dir,
         )
+        _ct_record_spawn_pid(team, task_id, proc.pid)
         return f"Spawned agent '{agent_name}' for team '{team}'.\nTask ID: {task_id[:6]}\nBrief: {task_file}"
     except Exception as e:
         return f"[spawn error: {e}]"
+
+
+def _ct_record_spawn_pid(team: str, task_id: str, pid: int) -> None:
+    """Record the spawned process's PID in its task metadata so a later health
+    check (_ct_check_stale) can tell whether the agent is still running.
+    Best-effort — a failure here shouldn't fail the spawn itself.
+    """
+    path = _ct_tasks_dir(team) / f"task-{task_id}.json"
+    if not path.exists():
+        return
+    try:
+        task = json.loads(path.read_text(encoding="utf-8"))
+        task.setdefault("metadata", {})["pid"] = pid
+        task["metadata"]["spawned_at"] = _ct_now()
+        _ct_atomic_write(path, json.dumps(task, indent=2, ensure_ascii=False))
+    except Exception:
+        _logger.debug("Failed to record spawn PID for task %s", task_id)
+
+
+def _ct_check_stale(team: str, stale_minutes: int = 20) -> list[dict]:
+    """Return tasks that look abandoned: not completed/blocked, and either the
+    recorded spawn process has died, or the task hasn't been updated in over
+    `stale_minutes` minutes. team_spawn_agent's Popen() call is fire-and-forget
+    with no timeout or heartbeat — a hung agent otherwise runs (or sits dead)
+    unnoticed forever. Best-effort: psutil is a direct multilspy dependency
+    already present, but if it's ever missing, degrade to the time-based check
+    alone rather than failing.
+    """
+    try:
+        import psutil
+
+        has_psutil = True
+    except ImportError:
+        has_psutil = False
+
+    stale = []
+    now = datetime.now(UTC)
+    for t in _ct_task_list(team):
+        if t.get("status") in ("completed", "blocked"):
+            continue
+        pid = t.get("metadata", {}).get("pid")
+        process_dead = has_psutil and pid and not psutil.pid_exists(pid)
+        try:
+            updated = datetime.fromisoformat(t["updated_at"])
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=UTC)
+            age_min = (now - updated).total_seconds() / 60
+        except (KeyError, ValueError):
+            age_min = 0
+        if process_dead or age_min > stale_minutes:
+            reason = "process no longer running" if process_dead else f"no update in {int(age_min)}m"
+            stale.append({**t, "_stale_reason": reason})
+    return stale

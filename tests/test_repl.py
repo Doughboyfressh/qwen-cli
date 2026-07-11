@@ -424,6 +424,7 @@ def test_repl_setup_returns_tuple(qwen_cli):
         patch.object(qwen_cli, "_INTEL_CRAWLERS", 3),
         patch.object(qwen_cli, "BASE_SYSTEM", "test system"),
         patch.object(qwen_cli, "KEY_FILES", frozenset()),
+        patch.object(qwen_cli, "_consume_handoff", return_value=None),
         patch("qwen_cli.core.repl.console", console),
     ):
         base_system, history, ctx = _repl_setup("fake_client")
@@ -433,6 +434,43 @@ def test_repl_setup_returns_tuple(qwen_cli):
     assert isinstance(ctx, _ReplContext)
     output = buf.getvalue()
     assert "Qwen CLI" in output or "Model" in output
+
+
+def test_repl_setup_injects_handoff_when_present(qwen_cli):
+    """_consume_handoff() reads (and deletes) whatever the previous session left
+    behind on exit or crash. _repl_setup() must inject it into history the same
+    way load_project_context() injects the project tree — as a "user"-role
+    message the model sees on the next turn."""
+    from qwen_cli.core.repl import _repl_setup
+
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=True, legacy_windows=False)
+    handoff = {"prompt": "Resuming: you were mid-refactor of foo.py", "last_user": "refactor foo.py", "turns": 4}
+
+    with (
+        patch("qwen_cli.core.repl._setup_tab_completion"),
+        patch("qwen_cli.core.repl._make_pt_session"),
+        patch.object(qwen_cli, "start_intel_crawlers"),
+        patch.object(qwen_cli, "load_project_context"),
+        patch.object(qwen_cli, "ACTIVE_BACKEND", "llama.cpp"),
+        patch.object(qwen_cli, "BASE_URL", "http://localhost:8080"),
+        patch.object(qwen_cli, "MODEL", "qwen2.5"),
+        patch.object(qwen_cli, "_active_preset", "thinking"),
+        patch.object(qwen_cli, "AUTO_SEARCH_MODE", "off"),
+        patch.object(qwen_cli, "DATA_DIR", "/tmp/data"),
+        patch.object(qwen_cli, "_HAS_PT", False),
+        patch.object(qwen_cli, "_INTEL_CRAWLERS", 3),
+        patch.object(qwen_cli, "BASE_SYSTEM", "test system"),
+        patch.object(qwen_cli, "KEY_FILES", frozenset()),
+        patch.object(qwen_cli, "_consume_handoff", return_value=handoff),
+        patch("qwen_cli.core.repl.console", console),
+    ):
+        _base_system, history, _ctx = _repl_setup("fake_client")
+
+    assert len(history) == 1
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "Resuming: you were mid-refactor of foo.py"
+    assert "Resuming from previous session" in buf.getvalue()
 
 
 # ==============================================================================
@@ -451,6 +489,79 @@ def test_repl_loop_exit_on_slash_exit(qwen_cli):
         patch.object(qwen_cli, "save_session"),
     ):
         _repl_loop(ctx, ctx.history, ctx.base_system)
+
+
+def test_cmd_exit_writes_handoff_with_nonempty_history(qwen_cli):
+    from qwen_cli.core.commands import _cmd_exit
+    from qwen_cli.core.repl import _ReplContext
+
+    ctx = _ReplContext([{"role": "user", "content": "hi"}], "system", "client")
+    with (
+        patch.object(qwen_cli, "save_session"),
+        patch.object(qwen_cli, "_save_exit_handoff") as mock_handoff,
+        patch.object(qwen_cli, "record_session_changes_memory"),
+        pytest.raises(StopIteration),
+    ):
+        _cmd_exit(ctx, "")
+    mock_handoff.assert_called_once_with(ctx.history)
+
+
+def test_cmd_exit_skips_handoff_with_empty_history(qwen_cli):
+    from qwen_cli.core.commands import _cmd_exit
+    from qwen_cli.core.repl import _ReplContext
+
+    ctx = _ReplContext([], "system", "client")
+    with (
+        patch.object(qwen_cli, "save_session"),
+        patch.object(qwen_cli, "_save_exit_handoff") as mock_handoff,
+        patch.object(qwen_cli, "record_session_changes_memory"),
+        pytest.raises(StopIteration),
+    ):
+        _cmd_exit(ctx, "")
+    mock_handoff.assert_not_called()
+
+
+def test_repl_loop_eof_writes_handoff_with_nonempty_history(qwen_cli):
+    from qwen_cli.core.repl import _ReplContext, _repl_loop
+
+    ctx = _ReplContext([{"role": "user", "content": "hi"}], "system", "client")
+
+    def _raise_eof():
+        raise EOFError
+
+    with (
+        patch("qwen_cli.core.repl.read_input", side_effect=_raise_eof),
+        patch.object(qwen_cli, "_watch_pending", []),
+        patch.object(qwen_cli, "save_session"),
+        patch.object(qwen_cli, "_save_exit_handoff") as mock_handoff,
+        patch.object(qwen_cli, "record_session_changes_memory"),
+    ):
+        _repl_loop(ctx, ctx.history, ctx.base_system)
+
+    mock_handoff.assert_called_once_with(ctx.history)
+
+
+def test_main_crash_path_writes_handoff(qwen_cli):
+    """main()'s fatal-error handler already autosaves on a crash; it must also
+    write a handoff so the *next* session starts with context instead of
+    silently losing it."""
+    history_marker = [{"role": "user", "content": "mid-task"}]
+
+    with (
+        patch.object(qwen_cli, "make_client", return_value="fake_client"),
+        patch("sys.stdin") as mock_stdin,
+        patch.object(qwen_cli, "_repl_setup", return_value=("system", history_marker, "fake_ctx")),
+        patch.object(qwen_cli, "_repl_loop", side_effect=RuntimeError("boom")),
+        patch.object(qwen_cli, "_silent_autosave") as mock_autosave,
+        patch.object(qwen_cli, "_save_exit_handoff") as mock_handoff,
+        patch("threading.Thread"),
+        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
+    ):
+        mock_stdin.isatty.return_value = True
+        qwen_cli.main()
+
+    mock_autosave.assert_called_once()
+    mock_handoff.assert_called_once_with(history_marker)
 
 
 def test_repl_loop_empty_input_continues(qwen_cli):
@@ -618,6 +729,7 @@ def test_repl_loop_watch_pending_injected(qwen_cli, tmp_path):
         patch("qwen_cli.core.repl.read_input", side_effect=lambda: next(inputs)),
         patch.object(qwen_cli, "_watch_pending", [str(test_file)]),
         patch.object(qwen_cli, "save_session"),
+        patch.object(qwen_cli, "_save_exit_handoff"),
         patch.object(qwen_cli, "LANG_MAP", {".py": "python"}),
         patch("qwen_cli.core.repl.console", console),
     ):

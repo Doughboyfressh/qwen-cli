@@ -117,6 +117,7 @@ INTEL_QUEUE = INTEL_DIR / "queue.json"
 INTEL_TOPICS = INTEL_DIR / "topics.json"
 PT_HISTORY_FILE = DATA_DIR / "pt_history.txt"
 CONTEXT_SNAPSHOTS_DIR = DATA_DIR / "context_snapshots"
+AUDIT_LOG_FILE = DATA_DIR / "audit.log"  # append-only record of every run_command/run_script execution
 
 TOOL_RESULT_LIMIT = 16_000
 AUTO_SAVE_INTERVAL = 1  # save after every turn — lose at most one on crash

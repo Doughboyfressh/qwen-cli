@@ -65,6 +65,7 @@ from qwen_cli.core.config import (  # noqa: E402
     _TOOL_TIMEOUT_FAST,
     _TOOL_TIMEOUT_NET,
     _TOOL_TIMEOUT_SLOW,
+    AUDIT_LOG_FILE,
     AUTOSAVE_FILE,
     AUX_LLM_TIMEOUT,
     BACKUPS_DIR,
@@ -269,6 +270,11 @@ def _intel_default_topics() -> list[dict]:
 _INTEL_DEFAULT_TOPICS: list[dict] = _intel_default_topics()
 
 MEMORY_CURATE_INTERVAL = 10  # consolidate memory.md every N auto-extractions
+# _curate_memory()'s periodic LLM-based consolidation is a *soft* mechanism —
+# it depends on the model actually compressing well, and only runs every
+# MEMORY_CURATE_INTERVAL auto-extractions, not on /remember at all. This is
+# the deterministic backstop so memory.md can never grow unbounded regardless.
+MEMORY_MAX_CHARS = 8000
 
 
 _PARALLEL_TOOLS = frozenset(
@@ -399,11 +405,13 @@ _DANGEROUS_CMD_RE = re.compile(
 from qwen_cli.tools.team import (  # noqa: E402, F401  — re-exported for tests / qwen_cli package
     _ct_atomic_write,
     _ct_board_render,
+    _ct_check_stale,
     _ct_inbox_dir,
     _ct_inbox_receive,
     _ct_inbox_send,
     _ct_load_team,
     _ct_now,
+    _ct_record_spawn_pid,
     _ct_save_team,
     _ct_spawn,
     _ct_task_add,
@@ -651,9 +659,35 @@ def load_memory() -> str:
     return MEMORY_FILE.read_text(encoding="utf-8").strip() if MEMORY_FILE.exists() else ""
 
 
+def _enforce_memory_cap(text: str, max_chars: int = MEMORY_MAX_CHARS) -> str:
+    """Hard cap on memory.md size — drops the OLDEST entries first (they're
+    also the most likely to be superseded), preserving whole entries rather
+    than truncating mid-fact. Entries are blank-line-separated blocks; always
+    keeps at least one even if it alone exceeds the cap, so a single large
+    fact can't wipe out memory entirely.
+    """
+    if len(text) <= max_chars:
+        return text
+    blocks = [b for b in text.split("\n\n") if b.strip()]
+    kept: list[str] = []
+    total = 0
+    for block in reversed(blocks):  # walk newest-first, drop oldest once over cap
+        block_len = len(block) + 2  # +2 for the "\n\n" separator
+        if total + block_len > max_chars and kept:
+            break
+        kept.append(block)
+        total += block_len
+    kept.reverse()
+    return "\n\n".join(kept)
+
+
 def save_memory(text: str) -> None:
     """Save Memory."""
-    MEMORY_FILE.write_text(text, encoding="utf-8")
+    # max_chars passed explicitly (not relying on _enforce_memory_cap's own
+    # default) so this always reads the current MEMORY_MAX_CHARS at call
+    # time — a default parameter value is bound once at def-time and would
+    # never see a later change to the module-level constant.
+    MEMORY_FILE.write_text(_enforce_memory_cap(text, max_chars=MEMORY_MAX_CHARS), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +1034,8 @@ def _silent_autosave(history: list, system_prompt: str) -> None:
         _logger.exception("Autosave failed — session data may be lost on crash")
 
 
-HANDOFF_PROMPT_TEMPLATE = """You are resuming a session that ran out of context window. Here is what happened:
+HANDOFF_PROMPT_TEMPLATE = """You are resuming a previous session (it ended via context overflow, a normal exit, \
+or a crash). Here is what happened:
 
 {summary}
 
@@ -1959,6 +1994,21 @@ _SCRIPT_INTERP: dict[str, tuple[str, str]] = {
 }
 
 
+def _audit_log(command: str, cwd: Path, outcome: str) -> None:
+    """Append a line to ~/.qwen-cli/audit.log recording a shell command execution.
+
+    The only prior trace of what a model actually ran was chat history — no
+    persistent, append-only record of what ran, when, or from where. Best-effort:
+    a logging failure must never break the command it's recording.
+    """
+    try:
+        line = f"{datetime.now().isoformat()} | cwd={cwd} | {outcome} | {command[:500]}\n"
+        with AUDIT_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        _logger.debug("Failed to write audit log entry")
+
+
 def do_run_command(
     command: str, cwd: str = "", timeout: int = 30, env: dict | None = None, stdin: str = "", quiet: bool = False
 ) -> str:
@@ -1971,6 +2021,7 @@ def do_run_command(
         console.print(f"[bold red]  [dangerous][/bold red] {command}")
         answer = console.input("[bold red]  Run anyway? [y/N]:[/bold red] ").strip().lower()
         if answer != "y":
+            _audit_log(command, work_dir, "declined_by_user")
             return "[command cancelled by user]"
     elif not quiet:
         console.print(f"[bold yellow]  [run_command][/bold yellow] {command}")
@@ -2038,6 +2089,7 @@ def do_run_command(
             proc.kill()
             t_out.join(timeout=1)
             t_err.join(timeout=1)
+            _audit_log(command, work_dir, f"timed_out({timeout}s)")
             partial = "".join(stdout_buf).strip()
             return f"[timed out after {timeout}s]\n\n{partial}" if partial else f"[timed out after {timeout}s]"
         except KeyboardInterrupt:
@@ -2046,6 +2098,7 @@ def do_run_command(
             t_out.join(timeout=1)
             t_err.join(timeout=1)
             console.print("\n[dim][command cancelled][/dim]")
+            _audit_log(command, work_dir, "cancelled_by_ctrl_c")
             partial = "".join(stdout_buf).strip()
             return f"[cancelled]\n\n{partial}" if partial else "[cancelled]"
 
@@ -2067,8 +2120,10 @@ def do_run_command(
             parts.append("stderr:\n" + full_err)
         rc_note = "✓" if proc.returncode == 0 else "✗"
         parts.append(f"exit code: {proc.returncode} {rc_note}  ({elapsed:.1f}s)")
+        _audit_log(command, work_dir, f"exit={proc.returncode}")
         return "\n\n".join(parts)
     except Exception as e:
+        _audit_log(command, work_dir, f"error={e}")
         return f"[error: {e}]"
 
 
@@ -4671,6 +4726,7 @@ def main() -> None:
     except Exception as _fatal:
         _logger.exception("Fatal error in REPL loop")
         _silent_autosave(history, base_system)
+        _save_exit_handoff(history)
         console.print(f"\n[red][fatal error] {_fatal}[/red]")
         console.print("[dim]Session autosaved. Check qwen.log for details.[/dim]")
 

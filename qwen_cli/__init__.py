@@ -6,7 +6,7 @@ __all__: list[str] = []
 def __getattr__(name):
     """Lazy-load symbols from qwen_cli.main on first access.
 
-    Avoids pulling in the entire 6869-line main module at package import time.
+    Avoids pulling in the entire (large) main module at package import time.
     """
     import importlib
 
