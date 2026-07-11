@@ -105,6 +105,47 @@ class TestPatchFile:
         result = qwen_cli.do_patch_file(str(tmp_path / "ghost.txt"), "@@ -1 +1 @@\n-x\n+y\n")
         assert "not found" in result
 
+    def test_backup_uses_shared_helper_and_records_original_content(self, qwen_cli, tmp_path, monkeypatch):
+        # do_patch_file used to duplicate _backup_file()'s logic inline instead
+        # of calling it — verify it now goes through the shared path.
+        p = tmp_path / "code.txt"
+        p.write_text("alpha\n", encoding="utf-8")
+        _auto_confirm(monkeypatch, qwen_cli, "y")
+        _patch_backups(monkeypatch, qwen_cli, tmp_path)
+        monkeypatch.setattr(qwen_cli, "_backup_stack", [])
+        diff = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n"
+        qwen_cli.do_patch_file(str(p), diff)
+        assert len(qwen_cli._backup_stack) == 1
+        assert qwen_cli._backup_stack[0]["content"] == "alpha\n"
+
+    def test_backups_do_not_collide_within_same_second(self, qwen_cli, tmp_path, monkeypatch):
+        # Two patches to the same file in the same wall-clock second used to
+        # overwrite each other's on-disk backup — the only recovery path left
+        # if the in-memory _backup_stack doesn't survive a crash.
+        class _FrozenDatetime:
+            @staticmethod
+            def now():
+                from datetime import datetime as _dt
+
+                return _dt(2026, 1, 1, 12, 0, 0)
+
+        p = tmp_path / "code.txt"
+        p.write_text("v1\n", encoding="utf-8")
+        _auto_confirm(monkeypatch, qwen_cli, "y")
+        _patch_backups(monkeypatch, qwen_cli, tmp_path)
+        monkeypatch.setattr(qwen_cli, "_backup_stack", [])
+        monkeypatch.setattr(qwen_cli, "datetime", _FrozenDatetime)
+
+        diff1 = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-v1\n+v2\n"
+        diff2 = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-v2\n+v3\n"
+        qwen_cli.do_patch_file(str(p), diff1)
+        qwen_cli.do_patch_file(str(p), diff2)
+
+        backups = sorted(tmp_path.glob("code.txt.*.bak"))
+        assert len(backups) == 2
+        contents = {b.read_text(encoding="utf-8") for b in backups}
+        assert contents == {"v1\n", "v2\n"}
+
 
 # ---------------------------------------------------------------------------
 # do_delete_file

@@ -2229,14 +2229,15 @@ def do_patch_file(path: str, diff: str) -> str:
         if answer != "y":
             return "[patch cancelled by user]"
 
-        # Backup and write
-        global _backup_stack
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
-        backup.write_text(original, encoding="utf-8")
-        _backup_stack.append({"original": p, "backup": backup, "content": original})
-        if len(_backup_stack) > _MAX_BACKUP_STACK:
-            _backup_stack.pop(0)
+        # Backup and write. Uses the shared _backup_file() helper (same one
+        # write_file/move_file/delete_file use) rather than duplicating its
+        # logic inline — this path used to skip both the same-second
+        # collision fix and the BACKUPS_DIR cleanup cap, so a session
+        # dominated by patch_file (the tool the system prompt prefers) could
+        # grow backups unbounded and, for rapid same-file retries, silently
+        # lose the true original content on disk (the only recovery path if
+        # the in-memory _backup_stack doesn't survive a crash).
+        _backup_file(p)
 
         p.write_text(patched, encoding="utf-8")
         lines_changed = sum(
@@ -2430,10 +2431,22 @@ def _cleanup_backups(keep: int = 50, keep_per_file: int = 10) -> None:
 
 
 def _backup_file(p: Path) -> None:
-    """Internal helper: backup file."""
+    """Internal helper: backup file.
+
+    /undo restores from the in-memory _backup_stack, not this file, so a
+    filename collision here is invisible during normal use — but the on-disk
+    .bak is the only recovery path left after a crash (the stack doesn't
+    survive one), so a second same-file edit within the same wall-clock
+    second must not silently overwrite the first edit's backup.
+    """
     global _backup_stack
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
+    if backup.exists():
+        n = 1
+        while (BACKUPS_DIR / f"{p.name}.{stamp}_{n}.bak").exists():
+            n += 1
+        backup = BACKUPS_DIR / f"{p.name}.{stamp}_{n}.bak"
     content = p.read_text(encoding="utf-8", errors="replace")
     backup.write_text(content, encoding="utf-8")
     _backup_stack.append({"original": p, "backup": backup, "content": content})
