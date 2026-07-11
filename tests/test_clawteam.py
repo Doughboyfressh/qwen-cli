@@ -335,10 +335,18 @@ class TestSpawnCommand:
 
 class TestSpawn:
     def test_ct_spawn_uses_resolved_command(self, ct, monkeypatch):
+        # Launches the resolved [python, entry_script, --task, ...] argv directly
+        # via CREATE_NEW_CONSOLE rather than through `cmd.exe /c start "title" cmd
+        # /k ...` — that wrapper's title argument must be quoted or Windows treats
+        # it as the program to run instead of a title ("The system cannot find the
+        # file qwen-<name>"), confirmed live, and there's no reliable way to make
+        # cmd.exe see a properly quoted title through subprocess's own
+        # list-to-command-line quoting (it escapes embedded quotes as literal data).
         captured = {}
 
         def fake_popen(args, **kwargs):
             captured["args"] = args
+            captured["kwargs"] = kwargs
 
             class _P:
                 pid = 1234
@@ -350,8 +358,7 @@ class TestSpawn:
 
         assert "Spawned agent 'worker1'" in result
         args = captured["args"]
-        assert args[:5] == ["cmd.exe", "/c", "start", "qwen-worker1", "cmd"]
-        assert args[5] == "/k"
-        assert args[6].endswith("python.exe")
-        assert args[7].endswith("qwen-cli.py")
-        assert args[8] == "--task"
+        assert args[0].endswith("python.exe")
+        assert args[1].endswith("qwen-cli.py")
+        assert args[2] == "--task"
+        assert "creationflags" in captured["kwargs"]

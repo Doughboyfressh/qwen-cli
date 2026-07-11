@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -371,12 +370,23 @@ def _ct_spawn(team: str, agent_name: str, task: str, cwd: str = "") -> str:
     _ct_atomic_write(task_file, prompt)
 
     work_dir = cwd or str(Path.cwd())
-    safe_name = re.sub(r"[^\w-]", "", agent_name)[:32]
     try:
         cmd = _spawn_command(task_file)
+        # Previously: ["cmd.exe", "/c", "start", f"qwen-{safe_name}", "cmd", "/k", *cmd].
+        # cmd.exe's `start` treats an unquoted title as the program to run instead of
+        # a title — confirmed live: "/spawn audit sometest ..." failed with "The
+        # system cannot find the file qwen-sometest." Embedding literal quote
+        # characters in the title doesn't fix it either: subprocess's own
+        # list-to-command-line quoting (list2cmdline) escapes embedded quotes as
+        # literal data rather than passing them through as cmd.exe syntax, so
+        # there's no reliable way to make `start` see a properly quoted title via
+        # a plain argument list. CREATE_NEW_CONSOLE sidesteps `start` (and its
+        # quoting rules) entirely — it's a native CreateProcess flag that opens a
+        # new console directly, at the cost of a generic window title instead of
+        # a custom "qwen-<name>" one.
         subprocess.Popen(
-            ["cmd.exe", "/c", "start", f"qwen-{safe_name}", "cmd", "/k", *cmd],
-            shell=False,
+            cmd,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
             cwd=work_dir,
         )
         return f"Spawned agent '{agent_name}' for team '{team}'.\nTask ID: {task_id[:6]}\nBrief: {task_file}"
