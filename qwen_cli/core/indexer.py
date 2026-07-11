@@ -93,7 +93,7 @@ def _extract_generic_symbols(filepath: Path, ext: str) -> dict:
             m = re.match(r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(", s)
             if m:
                 functions.append(m.group(1))
-            m = re.match(r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", s)
+            m = re.match(r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)", s)
             if m:
                 classes.append(m.group(1))
         elif ext == ".go":
