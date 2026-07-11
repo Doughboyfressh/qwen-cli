@@ -116,6 +116,7 @@ INTEL_FEED = INTEL_DIR / "feed.md"
 INTEL_QUEUE = INTEL_DIR / "queue.json"
 INTEL_TOPICS = INTEL_DIR / "topics.json"
 PT_HISTORY_FILE = DATA_DIR / "pt_history.txt"
+CONTEXT_SNAPSHOTS_DIR = DATA_DIR / "context_snapshots"
 
 TOOL_RESULT_LIMIT = 16_000
 AUTO_SAVE_INTERVAL = 1  # save after every turn — lose at most one on crash
@@ -125,7 +126,7 @@ AUTO_SEARCH_MODE = _cfg("auto_search", "QWEN_AUTO_SEARCH", "smart").lower()
 if AUTO_SEARCH_MODE not in ("off", "smart", "aggressive"):
     AUTO_SEARCH_MODE = "aggressive"
 
-for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR):
+for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR, CONTEXT_SNAPSHOTS_DIR):
     _d.mkdir(exist_ok=True)
 
 _LONG_OUTPUT = 81920

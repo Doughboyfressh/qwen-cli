@@ -14,6 +14,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from qwen_cli.core.config import CONTEXT_SNAPSHOTS_DIR as _SNAPSHOT_DIR
+
 UTC = timezone.utc  # noqa: UP017 — datetime.UTC exists only on 3.11+; alias keeps 3.10 compat
 
 _logger = logging.getLogger(__name__)
@@ -29,9 +31,11 @@ IMPORTANCE_DISPOSABLE = "disposable"  # Drop first: status, progress, repeated i
 
 # ---------------------------------------------------------------------------
 # Snapshot storage
+#
+# _SNAPSHOT_DIR lives in ~/.qwen-cli/ (like memory.md, sessions/, backups/)
+# rather than inside the package source tree — otherwise a reinstall/upgrade
+# that replaces the qwen_cli package directory silently loses every snapshot.
 # ---------------------------------------------------------------------------
-
-_SNAPSHOT_DIR = Path(__file__).parent / "context_snapshots"
 
 
 def _ensure_snapshot_dir() -> Path:

@@ -87,7 +87,8 @@ class TestImportanceClassifier:
 
 
 class TestContextSnapshot:
-    def test_create_returns_snapshot(self, qwen_context, tmp_path):
+    def test_create_returns_snapshot(self, qwen_context, tmp_path, monkeypatch):
+        monkeypatch.setattr(qwen_context, "_SNAPSHOT_DIR", tmp_path)
         classifier = qwen_context.ImportanceClassifier()
         history = [
             {"role": "system", "content": "CURRENT TASK: build feature"},
@@ -99,7 +100,8 @@ class TestContextSnapshot:
         assert snap["message_count"] == 2
         assert snap["current_task"] == "build feature"
 
-    def test_create_extracts_critical_and_decisions(self, qwen_context, tmp_path):
+    def test_create_extracts_critical_and_decisions(self, qwen_context, tmp_path, monkeypatch):
+        monkeypatch.setattr(qwen_context, "_SNAPSHOT_DIR", tmp_path)
         classifier = qwen_context.ImportanceClassifier()
         history = [
             {"role": "user", "content": "decision: use FastAPI"},
@@ -110,7 +112,8 @@ class TestContextSnapshot:
         assert any("decision" in d.lower() for d in snap["decisions"])
         assert any("error" in e.lower() for e in snap["errors"])
 
-    def test_create_respects_cap_lengths(self, qwen_context, tmp_path):
+    def test_create_respects_cap_lengths(self, qwen_context, tmp_path, monkeypatch):
+        monkeypatch.setattr(qwen_context, "_SNAPSHOT_DIR", tmp_path)
         classifier = qwen_context.ImportanceClassifier()
         long = "X" * 2000
         history = [{"role": "user", "content": f"requirement: {long}"}]
