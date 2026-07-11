@@ -3,13 +3,21 @@
 qwen_cli is now a proper package; tests import it normally.
 """
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Redirect qwen_cli.main's file logging away from the production qwen.log.
+# Tests deliberately exercise failure paths, and their tracebacks otherwise
+# pile up in the real log. Must be set before qwen_cli.main is imported —
+# conftest loads before any test module, so this top-level assignment is safe.
+os.environ.setdefault("QWEN_LOG_FILE", str(Path(tempfile.gettempdir()) / "qwen-cli-test.log"))
 
 
 def _import_module(name: str):

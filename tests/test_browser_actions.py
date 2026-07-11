@@ -167,3 +167,36 @@ class TestNewTabDetection:
         assert "element not found" in result
         assert "clicked" not in result.lower()
         assert "new tab/popup" not in result
+
+
+class TestScreenshotPath:
+    """screenshot_path comes straight from the model, which routinely writes
+    "~/shot.png" — unexpanded, that creates a literal folder named "~" on
+    Windows (observed in a live session)."""
+
+    class _ShotPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.saved_to = None
+
+        def screenshot(self, path, full_page=True):
+            self.saved_to = path
+
+    def test_tilde_is_expanded(self):
+        page = self._ShotPage()
+        result = br._browser_do_screenshot(page, screenshot_path="~/qwen_test_shot.png")
+        assert "~" not in page.saved_to
+        assert page.saved_to.endswith("qwen_test_shot.png")
+        assert "~" not in result.splitlines()[0]
+
+    def test_missing_parent_dir_is_created(self, tmp_path):
+        page = self._ShotPage()
+        target = tmp_path / "new_dir" / "shot.png"
+        br._browser_do_screenshot(page, screenshot_path=str(target))
+        assert (tmp_path / "new_dir").is_dir()
+        assert page.saved_to == str(target)
+
+    def test_default_path_is_home(self):
+        page = self._ShotPage()
+        br._browser_do_screenshot(page)
+        assert page.saved_to == str(br.Path.home() / "screenshot.png")

@@ -35,6 +35,7 @@ models/
 
 # Test artifacts
 .coverage
+livetest_*.log
 
 # OS files
 Thumbs.db

@@ -39,19 +39,29 @@ def _get_openai():
     return _openai_mod.OpenAI
 
 
+# QWEN_LOG_FILE lets test runs (see tests/conftest.py) redirect logging away
+# from the production qwen.log, which otherwise fills with expected tracebacks
+# from tests that exercise failure paths.
+_LOG_FILE = os.environ.get("QWEN_LOG_FILE") or str(Path.home() / ".qwen-cli" / "qwen.log")
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _logging.basicConfig(
-    filename=str(Path.home() / ".qwen-cli" / "qwen.log"),
+    filename=_LOG_FILE,
     level=_logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format=_LOG_FORMAT,
 )
 _logger = _logging.getLogger("qwen")
 try:
     _h = _logging_handlers.RotatingFileHandler(
-        str(Path.home() / ".qwen-cli" / "qwen.log"), maxBytes=1_048_576, backupCount=3, encoding="utf-8"
+        _LOG_FILE, maxBytes=1_048_576, backupCount=3, encoding="utf-8"
     )
+    _h.setFormatter(_logging.Formatter(_LOG_FORMAT))
     _logger.handlers = [_h]
+    # Without this, every message is ALSO handled by basicConfig's root
+    # handler on the same file: each line landed twice, once with no
+    # timestamp (this handler had no formatter) and once formatted.
+    _logger.propagate = False
 except Exception:
-    _logger.handlers = []  # logging unavailable, continue without file logging
+    _logger.handlers = []  # logging unavailable, fall back to root's handler
 
 # ---------------------------------------------------------------------------
 # Config — constants from config.toml / env vars (qwen_cli/core/config.py)

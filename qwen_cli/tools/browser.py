@@ -1014,7 +1014,11 @@ def _browser_do_get_links(page, url="", selector="", value="", screenshot_path="
 
 
 def _browser_do_screenshot(page, url="", selector="", value="", screenshot_path=""):
-    path = screenshot_path or str(Path.home() / "screenshot.png")
+    # expanduser: the model routinely passes "~/shot.png", and an unexpanded
+    # "~" becomes a literal folder named "~" on Windows.
+    p = Path(screenshot_path).expanduser() if screenshot_path else Path.home() / "screenshot.png"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    path = str(p)
     console.print(f"[bold cyan]  [browser][/bold cyan] screenshot → {path}")
     page.screenshot(path=path, full_page=True)
     return f"[screenshot saved: {path}]\nURL: {page.url}\nTitle: {page.title()}"
