@@ -3750,11 +3750,18 @@ _TIMEOUT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name
 atexit.register(lambda: _TIMEOUT_POOL.shutdown(wait=False))
 
 
-def _call_with_timeout(name: str, fn, *args, timeout: int, **kwargs) -> str:
-    """Call a tool function with a timeout using a shared thread pool."""
+def _call_with_timeout(name: str, fn, *args, timeout: int, status: str = "", **kwargs) -> str:
+    """Call a tool function with a timeout using a shared thread pool.
+
+    If `status` is given, shows a spinner with that message while waiting —
+    these tools (web search, fetch, etc.) otherwise print nothing until they
+    finish, which can look like a hang on a slow network call.
+    """
     fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
+    cm = console.status(status, spinner="dots") if status else contextlib.nullcontext()
     try:
-        return fut.result(timeout=timeout)
+        with cm:
+            return fut.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         fut.cancel()
         return f"[{name}] timed out after {timeout}s. The operation took too long to complete."
@@ -3809,20 +3816,25 @@ def do_update_plan(steps: list) -> str:
 _TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
     "update_plan": lambda a: do_update_plan(a.get("steps", [])),
     "web_search": lambda a: _call_with_timeout(
-        "web_search", do_web_search, a.get("query", ""), timeout=_TOOL_TIMEOUT_SLOW
+        "web_search", do_web_search, a.get("query", ""), timeout=_TOOL_TIMEOUT_SLOW,
+        status=f"  Searching the web for '{a.get('query', '')}'…",
     ),
     "search_news": lambda a: _call_with_timeout(
-        "search_news", do_search_news, a.get("query", ""), a.get("max_results", 8), timeout=_TOOL_TIMEOUT_SLOW
+        "search_news", do_search_news, a.get("query", ""), a.get("max_results", 8), timeout=_TOOL_TIMEOUT_SLOW,
+        status=f"  Searching news for '{a.get('query', '')}'…",
     ),
     "fetch_url": lambda a: _call_with_timeout(
-        "fetch_url", do_fetch_url, a.get("url", ""), a.get("max_chars", 20_000), timeout=_TOOL_TIMEOUT_NET
+        "fetch_url", do_fetch_url, a.get("url", ""), a.get("max_chars", 20_000), timeout=_TOOL_TIMEOUT_NET,
+        status=f"  Fetching {a.get('url', '')}…",
     ),
     "describe_image": lambda a: _call_with_timeout(
-        "describe_image", do_describe_image, a.get("url", ""), timeout=_TOOL_TIMEOUT_NET
+        "describe_image", do_describe_image, a.get("url", ""), timeout=_TOOL_TIMEOUT_NET,
+        status=f"  Describing image {a.get('url', '')}…",
     ),
     "get_video_transcript": lambda a: _call_with_timeout(
         "get_video_transcript", do_get_video_transcript, a.get("url", ""), a.get("lang", "en"),
         timeout=_TOOL_TIMEOUT_SLOW,
+        status=f"  Fetching video transcript for {a.get('url', '')}…",
     ),
     "read_file": lambda a: _call_with_timeout(
         "read_file", do_read_file, a.get("path", ""), a.get("offset", 0), a.get("limit", 0),
@@ -3838,6 +3850,7 @@ _TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
     "search_files": lambda a: _call_with_timeout(
         "search_files", do_search_files, a.get("path", ""), a.get("query", ""),
         a.get("pattern", "**/*"), a.get("context", 0), timeout=_TOOL_TIMEOUT_FAST,
+        status=f"  Searching files for '{a.get('query', '')}'…",
     ),
     "team_task_list": lambda a: _ct_render_task_list(
         a.get("team", ""), a.get("owner", ""), a.get("status", "")
@@ -4745,8 +4758,13 @@ def main() -> None:
         _logger.exception("Fatal error in REPL loop")
         _silent_autosave(history, base_system)
         _save_exit_handoff(history)
-        console.print(f"\n[red][fatal error] {_fatal}[/red]")
-        console.print("[dim]Session autosaved. Check qwen.log for details.[/dim]")
+        console.print(
+            Panel(
+                f"{_fatal}\n\n[dim]Session autosaved. Check qwen.log for details.[/dim]",
+                title="[bold red]Fatal Error[/bold red]",
+                border_style="red",
+            )
+        )
 
 
 def _print_turn_footer(elapsed: float) -> None:

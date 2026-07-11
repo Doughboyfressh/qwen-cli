@@ -294,7 +294,7 @@ def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
             # A bug in any single command must not end the whole session —
             # mirror the recovery the plain-chat turn path already gets.
             _logger.exception("Unhandled error in command %s", directive)
-            console.print(f"\n[red]  [error running {directive}] {e}[/red]")
+            console.print(Panel(str(e), title=f"[bold red]Error running {directive}[/bold red]", border_style="red"))
     else:
         _cmd_unknown(ctx, directive)
     return False
@@ -406,8 +406,13 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
             _run_turn_and_handle_reply(ctx, user_input, allow_tools=not no_tools)
         except Exception as _repl_err:
             _logger.exception("Unhandled error in turn")
-            console.print(f"\n[red]  [error] {_repl_err}[/red]")
-            console.print("[dim]  Type /retry to try again.[/dim]")
+            console.print(
+                Panel(
+                    f"{_repl_err}\n\n[dim]Type /retry to try again.[/dim]",
+                    title="[bold red]Error[/bold red]",
+                    border_style="red",
+                )
+            )
 
 
 def _cleanup_watch() -> None:
