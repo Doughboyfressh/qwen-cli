@@ -476,7 +476,12 @@ def _browser_smart_wait(page, timeout: int = 8000) -> None:
 
 
 def _browser_check_captcha_pause(page) -> str:
-    """If a CAPTCHA is detected, pause and let the user solve it. Returns status string."""
+    """If a CAPTCHA is detected, pause and let the user solve it. Returns status string.
+
+    Only for the headed (visible) browser_action session — the user needs an
+    actual window to solve a CAPTCHA in. For headless contexts, use
+    _browser_captcha_hint instead.
+    """
     if not _browser_has_captcha(page):
         return ""
     console.print("[bold yellow]  [browser] CAPTCHA / human-verification detected.[/bold yellow]")
@@ -485,6 +490,23 @@ def _browser_check_captcha_pause(page) -> str:
         console.input("")
     _browser_save_cookies(page)
     return "[captcha-paused: user resolved]"
+
+
+def _browser_captcha_hint(page) -> str:
+    """Non-blocking CAPTCHA check for headless pages (fetch_rendered).
+
+    There's no visible window here for a human to solve anything in, unlike
+    browser_action's headed session — blocking on console.input() would just
+    hang waiting for a CAPTCHA nobody can see. Flag it and point at
+    browser_action instead.
+    """
+    if not _browser_has_captcha(page):
+        return ""
+    return (
+        "[CAPTCHA/human-verification detected — this is a headless page with no visible "
+        "window, so it can't be solved here. Use browser_action (navigate) instead, which "
+        "opens a real visible browser window.]"
+    )
 
 
 def _browser_do_close(url="", selector="", value="", screenshot_path=""):
@@ -923,8 +945,10 @@ def do_fetch_rendered(url: str, max_chars: int = 15000) -> str:
         # Wait for JS content to settle
         _browser_smart_wait(page, timeout=10000)
 
-        # Check for CAPTCHA (headless triggers it less, but still possible)
-        captcha_note = _browser_check_captcha_pause(page)
+        # Check for CAPTCHA (headless triggers it less, but still possible).
+        # Non-blocking: this page has no visible window, so there's no one who
+        # could solve it here even if we paused.
+        captcha_note = _browser_captcha_hint(page)
 
         # Extract text: prefer trafilatura/readability on full rendered HTML
         try:

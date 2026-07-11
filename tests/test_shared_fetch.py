@@ -1,5 +1,6 @@
-"""Unit tests for do_fetch_url's JS-shell detection in qwen_cli.tools.shared."""
+"""Unit tests for do_fetch_url's JS-shell and anti-bot detection in qwen_cli.tools.shared."""
 
+import urllib.error
 from unittest.mock import patch
 
 import qwen_cli.tools.shared as shared
@@ -27,6 +28,20 @@ class TestLooksLikeJsShell:
         html = "<html><body>" + ("<!-- padding -->" * 200) + "You need to enable JavaScript to run this app.</body></html>"
         text = "You need to enable JavaScript to run this app."
         assert shared._looks_like_js_shell(html, text) is True
+
+
+class TestLooksLikeAntibotBlock:
+    def test_normal_page_is_not_flagged(self):
+        html = "<html><body>" + ("<p>Some real article text.</p>" * 20) + "</body></html>"
+        assert shared._looks_like_antibot_block(html) is False
+
+    def test_cloudflare_challenge_is_flagged(self):
+        html = "<html><title>Just a moment...</title><body>Checking your browser before accessing</body></html>"
+        assert shared._looks_like_antibot_block(html) is True
+
+    def test_captcha_page_is_flagged(self):
+        html = "<html><body>Please complete the CAPTCHA to continue</body></html>"
+        assert shared._looks_like_antibot_block(html) is True
 
 
 class FakeResponse:
@@ -67,3 +82,29 @@ class TestDoFetchUrlJsShellHint:
         with patch("urllib.request.urlopen", return_value=FakeResponse(html.encode())):
             result = shared.do_fetch_url("http://example.com/normal-page")
         assert "fetch_rendered" not in result
+
+    def test_antibot_challenge_response_gets_escalation_hint(self):
+        html = "<html><title>Just a moment...</title><body>Checking your browser before accessing example.com</body></html>"
+        with patch("urllib.request.urlopen", return_value=FakeResponse(html.encode())):
+            result = shared.do_fetch_url("http://example.com/blocked-page")
+        assert "anti-bot" in result
+        assert "browser_action" in result
+
+
+class TestDoFetchUrlHttpErrorHints:
+    def setup_method(self):
+        shared._FETCH_CACHE.clear()
+
+    def test_403_gets_antibot_hint(self):
+        err = urllib.error.HTTPError("http://example.com/x", 403, "Forbidden", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = shared.do_fetch_url("http://example.com/x")
+        assert "HTTP 403" in result
+        assert "anti-bot" in result
+
+    def test_404_has_no_antibot_hint(self):
+        err = urllib.error.HTTPError("http://example.com/x", 404, "Not Found", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = shared.do_fetch_url("http://example.com/x")
+        assert "HTTP 404" in result
+        assert "anti-bot" not in result

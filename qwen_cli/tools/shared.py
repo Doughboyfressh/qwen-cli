@@ -660,13 +660,44 @@ def _looks_like_js_shell(html: str, text: str) -> bool:
     return any(marker in lowered for marker in _JS_SHELL_MARKERS) or len(stripped) < 40
 
 
+_ANTIBOT_MARKERS = (
+    "checking your browser",
+    "cf-browser-verification",
+    "cf-challenge",
+    "just a moment",
+    "captcha",
+    "hcaptcha",
+    "recaptcha",
+    "cloudflare turnstile",
+    "ddos protection by",
+    "access denied",
+    "request blocked",
+    "perimeterx",
+    "datadome",
+    "please verify you are a human",
+    "please enable cookies",
+)
+
+
+def _looks_like_antibot_block(html: str) -> bool:
+    """Heuristic: is this an anti-bot/CAPTCHA interstitial rather than real content?
+
+    Plain HTTP sends no cookies, no JS execution, and no browser fingerprint —
+    it's the fetch method most likely to trip these walls. Flag it so the
+    caller escalates instead of treating "Just a moment..." as the real page.
+    """
+    lowered = html.lower()
+    return any(marker in lowered for marker in _ANTIBOT_MARKERS)
+
+
 def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
     """Fetch the raw text content of a URL.
 
     Handles redirects, compression, PDF extraction, and HTML-to-text conversion.
-    Plain HTTP can't run JavaScript — if the response looks like an empty
-    client-rendered SPA shell, a hint is appended telling the caller to retry
-    with fetch_rendered instead.
+    Plain HTTP can't run JavaScript, hold cookies, or pass a fingerprint check —
+    if the response looks like an empty client-rendered SPA shell or an
+    anti-bot/CAPTCHA interstitial, a hint is appended telling the caller to
+    retry with fetch_rendered or browser_action instead.
     """
     cached = _fetch_cache_get(url)
     if cached:
@@ -713,18 +744,25 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
                 return result
 
             # HTML extraction
-            js_shell_hint = ""
+            escalation_hint = ""
             if "html" in ctype or stripped[:9].lower() in ("<!doctype", "<html"):
                 extracted = _html_to_text(text, url=url)
-                if _looks_like_js_shell(text, extracted):
-                    js_shell_hint = (
+                if _looks_like_antibot_block(text):
+                    escalation_hint = (
+                        "\n\n[NOTE: this response looks like an anti-bot/CAPTCHA challenge page, "
+                        "not real content — plain HTTP sends no cookies or browser fingerprint to "
+                        "pass it. Retry with fetch_rendered (may pass simple JS checks) or "
+                        "browser_action (handles CAPTCHA) instead.]"
+                    )
+                elif _looks_like_js_shell(text, extracted):
+                    escalation_hint = (
                         "\n\n[NOTE: this page returned little to no text over plain HTTP — "
                         "it looks like a JavaScript-rendered app (SPA shell). Retry with "
                         "fetch_rendered to get the actual content.]"
                     )
                 text = extracted
 
-            result = f"URL: {url}\n\n{_smart_truncate(text, max_chars)}{js_shell_hint}"
+            result = f"URL: {url}\n\n{_smart_truncate(text, max_chars)}{escalation_hint}"
             _fetch_cache_set(url, result)
             return result
 
@@ -732,6 +770,12 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
             if e.code in (429, 503, 502) and attempt < 2:
                 last_err = e
                 continue
+            if e.code in (401, 403, 429):
+                return (
+                    f"[HTTP {e.code}: {e.reason} — {url}]\n"
+                    "Tip: this looks like an anti-bot or access-control block. Try fetch_rendered "
+                    "or browser_action instead of plain HTTP."
+                )
             return f"[HTTP {e.code}: {e.reason} — {url}]"
         except Exception as e:
             last_err = e

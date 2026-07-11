@@ -64,6 +64,27 @@ class TestJitterMouse:
             assert 3 <= steps <= 8
 
 
+class TestCaptchaHint:
+    def test_clean_page_returns_empty(self):
+        page = FakePage(title="Example Domain", body="This domain is for examples.")
+        assert br._browser_captcha_hint(page) == ""
+
+    def test_captcha_page_returns_non_blocking_hint(self):
+        # Must not call console.input() -- this is the headless fetch_rendered
+        # path, where there's no visible window for a human to solve anything in.
+        page = FakePage(title="Verify you are human", body="Please complete the captcha below")
+        hint = br._browser_captcha_hint(page)
+        assert "headless" in hint
+        assert "browser_action" in hint
+
+    def test_page_error_returns_empty(self):
+        class ExplodingPage:
+            def title(self):
+                raise RuntimeError("page gone")
+
+        assert br._browser_captcha_hint(ExplodingPage()) == ""
+
+
 class TestDetectAntibot:
     def test_clean_page_returns_empty(self):
         page = FakePage(title="Example Domain", body="This domain is for examples.")
