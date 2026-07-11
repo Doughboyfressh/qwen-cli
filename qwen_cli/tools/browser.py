@@ -18,6 +18,34 @@ from qwen_cli.tools.shared import _html_to_text
 console = Console(force_terminal=True, legacy_windows=False)
 _CFG = _load_config()
 
+
+def _clear_loitering_event_loop() -> None:
+    """Close a leftover "running" asyncio loop on this thread before starting Playwright.
+
+    Playwright's sync API refuses to start if it detects a running asyncio
+    event loop on the current thread ("Sync API inside asyncio loop"). LSP
+    handshakes and other background work can leave the main thread's asyncio
+    state marked as running without cleanly returning control, which is
+    exactly what core.repl._close_loitering_event_loop() already guards
+    against before every input prompt for the same reason. sync_playwright()
+    calls here need the identical guard, or a stale loop from earlier
+    background work makes browser_action/fetch_rendered fail outright.
+    """
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(RuntimeError):
+            loop.close()
+    except RuntimeError:
+        pass
+    with contextlib.suppress(Exception):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 # ---------------------------------------------------------------------------
 # Browser automation (Playwright) — stealth, smart waits, CAPTCHA pause, cookies
 # ---------------------------------------------------------------------------
@@ -668,6 +696,7 @@ def _launch_persistent_chromium(
 def _get_page() -> Any:
     """Internal helper: get page."""
     if "page" not in _browser_state or _browser_state.get("closed"):
+        _clear_loitering_event_loop()
         sync_playwright = _resolve_sync_playwright()
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
@@ -1161,6 +1190,7 @@ def do_browser_action(
 def _get_render_page() -> Any:
     """Get (or create) the dedicated headless Playwright page used by fetch_rendered."""
     if "page" not in _render_state or _render_state.get("closed"):
+        _clear_loitering_event_loop()
         sync_playwright = _resolve_sync_playwright()
         pw = sync_playwright().start()
         _ua = _browser_random_ua()
