@@ -564,6 +564,45 @@ def test_main_crash_path_writes_handoff(qwen_cli):
     mock_handoff.assert_called_once_with(history_marker)
 
 
+def test_main_skips_lsp_prewarm_for_task_mode(qwen_cli):
+    """--task (team_spawn_agent's spawned agents) essentially never touch /lsp
+    diagnostics — starting the prewarm thread for every spawned agent in a
+    team is pure overhead, and one that compounds badly if the LSP handshake
+    is broken on the host machine (each spawned agent would otherwise burn a
+    thread on a doomed ~20s jedi-language-server attempt)."""
+    with (
+        patch.object(qwen_cli, "make_client", return_value="fake_client"),
+        patch("sys.stdin") as mock_stdin,
+        patch("sys.argv", ["qwen-cli.py", "--task", "do something"]),
+        patch.object(qwen_cli, "expand_at_refs", side_effect=lambda t: t),
+        patch.object(qwen_cli, "cmd_agent"),
+        patch("threading.Thread") as mock_thread,
+        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
+    ):
+        mock_stdin.isatty.return_value = True
+        qwen_cli.main()
+
+    prewarm_calls = [c for c in mock_thread.call_args_list if c.kwargs.get("name") == "lsp-prewarm"]
+    assert prewarm_calls == []
+
+
+def test_main_starts_lsp_prewarm_for_interactive_mode(qwen_cli):
+    with (
+        patch.object(qwen_cli, "make_client", return_value="fake_client"),
+        patch("sys.stdin") as mock_stdin,
+        patch("sys.argv", ["qwen-cli.py"]),
+        patch.object(qwen_cli, "_repl_setup", return_value=("system", [], "fake_ctx")),
+        patch.object(qwen_cli, "_repl_loop"),
+        patch("threading.Thread") as mock_thread,
+        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
+    ):
+        mock_stdin.isatty.return_value = True
+        qwen_cli.main()
+
+    prewarm_calls = [c for c in mock_thread.call_args_list if c.kwargs.get("name") == "lsp-prewarm"]
+    assert len(prewarm_calls) == 1
+
+
 def test_repl_loop_empty_input_continues(qwen_cli):
     from qwen_cli.core.repl import _ReplContext, _repl_loop
 

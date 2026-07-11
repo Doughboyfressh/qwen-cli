@@ -4679,18 +4679,35 @@ def main() -> None:
 
     _session_start = time.monotonic()
 
-    def _lsp_prewarm() -> None:
-        try:
-            from qwen_cli.tools import lsp as _lsp_mod
+    _auto_task: str | None = None
+    _cli_args = sys.argv[1:]
+    if "--task" in _cli_args:
+        _idx = _cli_args.index("--task")
+        if _idx + 1 < len(_cli_args):
+            _auto_task = _cli_args[_idx + 1]
+            sys.argv = [sys.argv[0], *_cli_args[:_idx], *_cli_args[_idx + 2 :]]
 
-            _lsp_mod._ensure_server("")
-            _lsp_mod.lsp_query("diagnostics", "")
-        except Exception:
-            _logger.debug("LSP server startup pre-warm failed (non-critical)")
+    # --task (spawned agents — see team_spawn_agent) and piped mode essentially
+    # never touch /lsp diagnostics, so the prewarm below is pure overhead for
+    # them — and it's overhead that compounds: a team of N spawned agents each
+    # silently burns a thread and a jedi-language-server subprocess attempt
+    # that times out after 20s if the handshake is broken on this machine
+    # (confirmed elsewhere in this codebase). Only worth paying for the
+    # interactive REPL, where /lsp commands and code-file edits are common.
+    if sys.stdin.isatty() and not _auto_task:
 
-    # Run off the main thread: even with _create_server()'s internal timeout,
-    # nothing should ever block the user from reaching the prompt at startup.
-    threading.Thread(target=_lsp_prewarm, daemon=True, name="lsp-prewarm").start()
+        def _lsp_prewarm() -> None:
+            try:
+                from qwen_cli.tools import lsp as _lsp_mod
+
+                _lsp_mod._ensure_server("")
+                _lsp_mod.lsp_query("diagnostics", "")
+            except Exception:
+                _logger.debug("LSP server startup pre-warm failed (non-critical)")
+
+        # Run off the main thread: even with _create_server()'s internal timeout,
+        # nothing should ever block the user from reaching the prompt at startup.
+        threading.Thread(target=_lsp_prewarm, daemon=True, name="lsp-prewarm").start()
 
     from qwen_cli.core.context import clean_old_snapshots as _clean_snaps
 
@@ -4700,14 +4717,6 @@ def main() -> None:
 
     client = make_client()
     _cli_client = client
-
-    _auto_task: str | None = None
-    _cli_args = sys.argv[1:]
-    if "--task" in _cli_args:
-        _idx = _cli_args.index("--task")
-        if _idx + 1 < len(_cli_args):
-            _auto_task = _cli_args[_idx + 1]
-            sys.argv = [sys.argv[0], *_cli_args[:_idx], *_cli_args[_idx + 2 :]]
 
     if not sys.stdin.isatty():
         run_piped(client)

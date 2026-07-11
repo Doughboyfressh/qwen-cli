@@ -15,6 +15,7 @@ pt_history.txt
 handoff.json
 qwen.log
 qwen.log.*
+audit.log
 
 # Config may contain API keys
 config.toml
