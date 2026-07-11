@@ -247,7 +247,7 @@ def test_reverify_triggers_on_hedged_reply_without_search(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(list(messages))
         if len(calls) == 1:
             qwen_cli._last_turn_tool_names[:] = []  # no search performed
@@ -270,7 +270,7 @@ def test_reverify_skipped_when_search_already_ran(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(messages)
         qwen_cli._last_turn_tool_names[:] = ["web_search"]
         return _HEDGED_REPLY
@@ -288,7 +288,7 @@ def test_reverify_skipped_when_tools_disabled(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(messages)
         qwen_cli._last_turn_tool_names[:] = []
         return _HEDGED_REPLY
@@ -306,7 +306,7 @@ def test_reverify_skipped_when_auto_search_off(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(messages)
         qwen_cli._last_turn_tool_names[:] = []
         return _HEDGED_REPLY
@@ -325,7 +325,7 @@ def test_reverify_falls_back_to_original_when_revised_is_empty(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(messages)
         qwen_cli._last_turn_tool_names[:] = []
         return _HEDGED_REPLY if len(calls) == 1 else None
@@ -343,7 +343,7 @@ def test_reverify_not_triggered_when_reply_is_confident(qwen_cli):
     ctx = _ReplContext([], "system", "client")
     calls = []
 
-    def fake_run_turn(client, messages, allow_tools=True):
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
         calls.append(messages)
         qwen_cli._last_turn_tool_names[:] = []
         return "It's version 3.2."
@@ -846,3 +846,21 @@ def test_run_turn_and_handle_reply_autosave(qwen_cli):
         _run_turn_and_handle_reply(ctx, "test")
 
     mock_autosave.assert_called_once()
+
+
+class TestHedgeRegex:
+    """Recommendation modals must not count as hedging: a live session saw an
+    improvement-list answer ("could add X", "could use more tests") trip the
+    forced re-search. Only modal+be/have reads as factual uncertainty."""
+
+    def test_recommendations_are_not_hedging(self, qwen_cli):
+        text = (
+            "You could add rate limiting. The error messages could use more detail. "
+            "Splitting main.py would help; you may want to start with tool dispatch. "
+            "I could not find any dead code."
+        )
+        assert len(qwen_cli._HEDGE_RE.findall(text)) == 0
+
+    def test_factual_uncertainty_still_counts(self, qwen_cli):
+        text = "It might be v3. It could have changed. This may be outdated. Probably fine."
+        assert len(qwen_cli._HEDGE_RE.findall(text)) >= 3

@@ -503,6 +503,7 @@ _SKIP_PRESEARCH_RE = re.compile(
     r"\bedit\s+(the\s+file|this\s+file)|"
     r"\brun\s+this|"
     r"\bwhat\s+(are|is)\s+(you|your)|"
+    r"\bhow\s+(can|could|do|should|would|might|will)\s+you\s+be\b|"
     r"\btell\s+me\s+about\s+(your|you)\b|"
     r"\bshow\s+me\s+(your|the)\s+(code|files?|source)|"
     r"\bhow\s+(can|do|should|would)\s+(we|i|you)\s+(improve|fix|update|change|use)\s+"

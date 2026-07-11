@@ -217,3 +217,28 @@ class TestMoveFile:
         result = qwen_cli.do_move_file(str(src), str(dst))
         assert "[moved:" in result
         assert dst.read_text(encoding="utf-8") == "new"
+
+
+class TestProjectContextBudget:
+    """load_project_context caps total key-file content at ~25% of the
+    context window — a live session opened at 68% context used, one turn
+    from auto-trim, before the user typed anything."""
+
+    def test_key_files_respect_total_budget(self, qwen_cli, tmp_path, monkeypatch):
+        # Three key files of 12k chars each would blow a small budget.
+        for name in ("README.md", "package.json", "pyproject.toml"):
+            (tmp_path / name).write_text("x" * 12_000, encoding="utf-8")
+        monkeypatch.setattr(qwen_cli, "TOKEN_LIMIT", 8_000)  # budget: 8k chars
+        history = []
+        assert qwen_cli.load_project_context(str(tmp_path), history) is True
+        content = history[-1]["content"]
+        # All content (tree + key files) must be far below the uncapped 36k.
+        assert len(content) < 12_000
+        assert "Not inlined" in content  # skipped files are still named
+
+    def test_small_project_is_untouched(self, qwen_cli, tmp_path):
+        (tmp_path / "README.md").write_text("hello project", encoding="utf-8")
+        history = []
+        assert qwen_cli.load_project_context(str(tmp_path), history) is True
+        assert "hello project" in history[-1]["content"]
+        assert "Not inlined" not in history[-1]["content"]

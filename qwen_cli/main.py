@@ -380,9 +380,15 @@ _SUMMARIZE_TOOLS = frozenset(
 _RUNNABLE_LANGS = {"bash", "sh", "shell", "powershell", "ps1", "python", "py", "cmd", "batch", "bat"}
 
 _PLAN_RE = re.compile(r"^\s*\d+[\.\)]\s+[^\n]+", re.MULTILINE)
+# Bare modals (might/may/could) are deliberately NOT counted: an answer that
+# *recommends* things ("could add tests", "may want to split this") is giving
+# engineering judgment, not hedging — a live session saw such an answer trip
+# the forced re-search in repl.py. Only modal+be/have reads as uncertainty
+# about facts ("could be a race", "may have changed"); "could not find" is
+# factual reporting and stays excluded.
 _HEDGE_RE = re.compile(
     r"\b(?:i(?:'m| am) not (?:sure|certain)|i (?:think|believe|suspect)|"
-    r"might|may|could|probably|possibly|perhaps|unclear|uncertain|"
+    r"(?:might|may|could) (?:be|have)|probably|possibly|perhaps|unclear|uncertain|"
     r"i don't know|not certain|i'm unsure)\b",
     re.IGNORECASE,
 )
@@ -549,10 +555,13 @@ BASE_SYSTEM = (
 if sys.platform == "win32":
     BASE_SYSTEM += (
         "\n\n# Host Environment\n\n"
-        "Shell commands run on Windows via cmd.exe. Unix tools — tail, head, grep, awk, sed, wc, "
-        "xargs, sort -rn — are NOT available; piping to them fails with 'not recognized'. Use "
-        "PowerShell equivalents (Select-Object -First/-Last N, Select-String, Measure-Object) or "
-        "run_script with Python instead."
+        "run_command executes on Windows via cmd.exe — NOT PowerShell and NOT a Unix shell. "
+        "Two whole tool families fail with 'not recognized' when piped to: Unix tools (tail, head, "
+        "grep, awk, sed, wc, xargs) AND bare PowerShell cmdlets (Select-Object, Select-String, "
+        "Measure-Object — these only exist inside PowerShell). To filter or truncate output, do ONE of: "
+        '(a) pipe to findstr with literal-string syntax findstr /C:"some text" (the colon is required), '
+        '(b) wrap the entire pipeline in powershell -NoProfile -Command "...", or '
+        "(c) use run_script with Python — the reliable choice for anything beyond a simple match."
     )
 
 HELP_TEXT = """
@@ -1926,17 +1935,33 @@ def load_project_context(arg: str, history: list) -> bool:
     console.print(f"[dim]Loading project: {root}[/dim]")
     tree = build_project_tree(root)
     key_sections: list[str] = []
+    # Total budget for key-file content: ~25% of the context window (tokens ≈
+    # chars/4). Without it, several 12k-char key files can eat most of a small
+    # window at session start — a live session opened at 68% context used,
+    # one turn from auto-trim, before the user asked anything.
+    budget = TOKEN_LIMIT  # chars; = (TOKEN_LIMIT/4 tokens) * (4 chars/token) -> 25% of the window
+    skipped: list[str] = []
     for fpath in sorted(root.iterdir(), key=lambda p: p.name):
         if fpath.name in KEY_FILES and fpath.is_file():
+            if budget <= 0:
+                skipped.append(fpath.name)
+                continue
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")
-                if len(text) > 12_000:
-                    text = text[:12_000] + "\n... [truncated]"
+                cap = min(12_000, budget)
+                if len(text) > cap:
+                    text = text[:cap] + "\n... [truncated]"
+                budget -= len(text)
                 lang = LANG_MAP.get(fpath.suffix.lower(), "")
                 key_sections.append(f"### {fpath.name}\n```{lang}\n{text}\n```")
             except Exception as e:
                 _logger.warning("Could not read key file %s: %s", fpath, e)
                 console.print(f"[dim yellow]  [project: skipped unreadable {fpath.name} — {e}][/dim yellow]")
+    if skipped:
+        key_sections.append(
+            "### (context budget reached)\nNot inlined — read with read_file if needed: " + ", ".join(skipped)
+        )
+        console.print(f"[dim yellow]  [project: context budget reached — {len(skipped)} key file(s) not inlined][/dim yellow]")
     parts = [f"# Project Context — {root}\n\n## Directory Tree\n```\n{tree}\n```"]
     if key_sections:
         parts.append("## Key Files\n\n" + "\n\n".join(key_sections))
@@ -4116,12 +4141,17 @@ def _compact_tool_loop(working: list, keep_recent_tools: int = 4, head_chars: in
     return new
 
 
-def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | None:
-    """Full turn with tool-use loop. Returns reply, '' on cancel, None on error."""
+def run_turn(client: object, messages: list, allow_tools: bool = True, presearch: bool = True) -> str | None:
+    """Full turn with tool-use loop. Returns reply, '' on cancel, None on error.
+
+    presearch=False skips the auto-web-search grounding pass — used for
+    synthetic follow-up messages (e.g. the hedging re-check) that already
+    instruct the model to search itself.
+    """
     global _last_turn_tokens, _real_ctx_tokens
     del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
     _turn_read_cache.clear()  # fresh read-dedup window for this turn
-    working = _auto_presearch(list(messages)) if allow_tools else list(messages)
+    working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
     # Feature 10: Surface unresolved errors from prior turn
     try:
         trend = _get_lsp().lsp_trend_report()

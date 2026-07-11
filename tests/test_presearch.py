@@ -76,3 +76,14 @@ def test_query_extracted_from_long_message(qwen_tools):
     expected = f"What is the current price of an RTX 5090? {datetime.datetime.now().year}"
     assert query == expected
     assert len(query) <= 200
+
+
+def test_passive_self_referential_is_skipped(qwen_tools):
+    # "how can you be improved?" asks about the assistant, not the web —
+    # a live session on aggressive mode web-searched it and got junk.
+    for t in (
+        "how can you be improved?",
+        "How could you be better at coding?",
+        "how would you be made faster",
+    ):
+        assert _search(qwen_tools, t, "aggressive") is False, t

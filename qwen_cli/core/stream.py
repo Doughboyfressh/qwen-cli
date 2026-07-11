@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -218,6 +219,14 @@ TOOLS = [
                 "Run a shell command and stream its stdout + stderr in real-time. "
                 "Use for git, pip, npm, system checks, package installs, and anything that runs in a terminal. "
                 "Dangerous commands (rm -rf, format, etc.) require explicit user confirmation."
+                + (
+                    " Runs via cmd.exe: Unix tools (grep, tail, head, wc) and bare PowerShell cmdlets "
+                    "(Select-Object, Select-String) are NOT available in pipelines — use "
+                    'findstr /C:"text", wrap the whole pipeline in powershell -Command "...", '
+                    "or use run_script for filtering."
+                    if sys.platform == "win32"
+                    else ""
+                )
             ),
             "parameters": {
                 "type": "object",

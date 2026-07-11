@@ -254,7 +254,10 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
         with _main._main_llm_busy_lock:
             _main._main_llm_busy = True
         try:
-            revised = _main.run_turn(ctx.client, messages, allow_tools=allow_tools)
+            # presearch=False: this synthetic message already tells the model
+            # to search; auto-presearching it just web-searches the critique
+            # text itself ("hedging language..."), which is noise.
+            revised = _main.run_turn(ctx.client, messages, allow_tools=allow_tools, presearch=False)
         finally:
             with _main._main_llm_busy_lock:
                 _main._main_llm_busy = False
