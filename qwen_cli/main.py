@@ -67,7 +67,9 @@ from qwen_cli.core.config import (  # noqa: E402
     _TOOL_TIMEOUT_SLOW,
     AUDIT_LOG_FILE,
     AUTOSAVE_FILE,
+    AUX_BASE_URL,
     AUX_LLM_TIMEOUT,
+    AUX_MODEL,
     BACKUPS_DIR,
     BASE_URL,
     BRAVE_API_KEY,
@@ -167,6 +169,7 @@ except Exception:
 _pt_session = None
 
 _cli_client: object | None = None  # set in main(); allows tool fns to make direct API calls
+_aux_client: object | None = None  # second llama-server (AUX_BASE_URL) for background LLM work; None if unreachable
 
 _backup_stack: list[dict] = []  # stack of backups; /undo pops the most recent
 _MAX_BACKUP_STACK = 10
@@ -2782,8 +2785,9 @@ def record_session_changes_memory(client: object | None = None) -> None:
                     },
                     {"role": "user", "content": "\n\n".join(chunks)[:6000]},
                 ]
-                resp = client.chat.completions.create(
-                    model=MODEL, messages=prompt, stream=False, max_tokens=80, timeout=AUX_LLM_TIMEOUT
+                bg_client, bg_model = _bg_llm(client)
+                resp = bg_client.chat.completions.create(
+                    model=bg_model, messages=prompt, stream=False, max_tokens=80, timeout=AUX_LLM_TIMEOUT
                 )
                 summary = (resp.choices[0].message.content or "").strip().splitlines()[0].strip()
                 if 10 < len(summary) <= 200:
@@ -2813,7 +2817,9 @@ def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
     """Pull memorable facts from this exchange and append to memory.md."""
     global _auto_memory_count
     with _main_llm_busy_lock:
-        if _main_llm_busy:
+        # With an aux backend this work doesn't touch the main model's slot,
+        # so there's no reason to skip it while the main model is busy.
+        if _main_llm_busy and _aux_client is None:
             return
     try:
         excerpt = f"User: {user_msg[:600]}\n\nAssistant: {assistant_msg[:1000]}"
@@ -2830,8 +2836,9 @@ def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
             },
             {"role": "user", "content": excerpt},
         ]
-        resp = client.chat.completions.create(
-            model=MODEL,
+        bg_client, bg_model = _bg_llm(client)
+        resp = bg_client.chat.completions.create(
+            model=bg_model,
             messages=prompt,
             stream=False,
             max_tokens=200,
@@ -2870,8 +2877,9 @@ def _curate_memory(client: object, locked: bool = False) -> None:
                 },
                 {"role": "user", "content": mem},
             ]
-            resp = client.chat.completions.create(
-                model=MODEL,
+            bg_client, bg_model = _bg_llm(client)
+            resp = bg_client.chat.completions.create(
+                model=bg_model,
                 messages=prompt,
                 stream=False,
                 max_tokens=600,
@@ -2995,7 +3003,7 @@ def _intel_process_queue(client) -> None:
     if not items:
         return
     with _main_llm_busy_lock:
-        if _main_llm_busy:
+        if _main_llm_busy and _aux_client is None:
             return
     for item in items:
         try:
@@ -3010,8 +3018,9 @@ def _intel_process_queue(client) -> None:
                 },
                 {"role": "user", "content": f"Topic: {item['topic']}\n\n{item['raw'][:3000]}"},
             ]
-            resp = client.chat.completions.create(
-                model=MODEL,
+            bg_client, bg_model = _bg_llm(client)
+            resp = bg_client.chat.completions.create(
+                model=bg_model,
                 messages=prompt,
                 stream=False,
                 max_tokens=250,
@@ -3044,8 +3053,9 @@ def _intel_train_memory(client: object, topic_name: str, summary: str) -> None:
             },
             {"role": "user", "content": f"Topic: {topic_name}\n{summary}"},
         ]
-        resp = client.chat.completions.create(
-            model=MODEL,
+        bg_client, bg_model = _bg_llm(client)
+        resp = bg_client.chat.completions.create(
+            model=bg_model,
             messages=prompt,
             stream=False,
             max_tokens=120,
@@ -3065,7 +3075,7 @@ def _intel_train_memory(client: object, topic_name: str, summary: str) -> None:
 def _intel_extract_topics(client, user_msg: str, reply: str) -> None:
     """Post-turn: extract new search-worthy topics from this exchange and track them."""
     with _main_llm_busy_lock:
-        if _main_llm_busy:
+        if _main_llm_busy and _aux_client is None:
             return
     try:
         prompt = [
@@ -3081,8 +3091,9 @@ def _intel_extract_topics(client, user_msg: str, reply: str) -> None:
             },
             {"role": "user", "content": f"User: {user_msg[:400]}\nAssistant: {reply[:400]}"},
         ]
-        resp = client.chat.completions.create(
-            model=MODEL,
+        bg_client, bg_model = _bg_llm(client)
+        resp = bg_client.chat.completions.create(
+            model=bg_model,
             messages=prompt,
             stream=False,
             max_tokens=80,
@@ -3569,7 +3580,7 @@ def _generate_session_title(client: object, history: list) -> None:
     """Background: generate a short session title after the first exchange."""
     global _session_title
     with _main_llm_busy_lock:
-        if _main_llm_busy:
+        if _main_llm_busy and _aux_client is None:
             return
     with _title_lock:
         if _session_title:
@@ -3588,8 +3599,9 @@ def _generate_session_title(client: object, history: list) -> None:
             },
             {"role": "user", "content": excerpt},
         ]
-        resp = client.chat.completions.create(
-            model=MODEL,
+        bg_client, bg_model = _bg_llm(client)
+        resp = bg_client.chat.completions.create(
+            model=bg_model,
             messages=prompt,
             stream=False,
             max_tokens=15,
@@ -3685,8 +3697,9 @@ def _smart_cap(client: object, result: str, name: str, context: str = "") -> str
                 ),
             },
         ]
-        resp = client.chat.completions.create(
-            model=MODEL,
+        bg_client, bg_model = _bg_llm(client)
+        resp = bg_client.chat.completions.create(
+            model=bg_model,
             messages=prompt,
             stream=False,
             max_tokens=1500,
@@ -4710,6 +4723,9 @@ def show_config() -> None:
     t.add_row("Config file", str(CONFIG_FILE) + (" ✓" if CONFIG_FILE.exists() else " (not found)"))
     t.add_row("base_url", BASE_URL)
     t.add_row("model", MODEL)
+    aux_status = "online (background work)" if _aux_client is not None else "offline"
+    t.add_row("aux_base_url", f"{AUX_BASE_URL} — {aux_status}")
+    t.add_row("aux_model", AUX_MODEL)
     t.add_row("token_limit", str(TOKEN_LIMIT))
     t.add_row("max_tool_depth", str(MAX_TOOL_DEPTH))
     t.add_row("auto_search", AUTO_SEARCH_MODE)
@@ -4726,6 +4742,34 @@ def show_config() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def make_aux_client():  # returns OpenAI instance or None
+    """Connect to the optional aux llama-server (fast MoE model for background work).
+
+    Aux is strictly optional: if the server is down or aux_base_url is empty,
+    background calls fall back to the main client exactly as before.
+    """
+    if not AUX_BASE_URL:
+        return None
+    import httpx
+
+    _timeout = httpx.Timeout(connect=5.0, read=120.0, write=60.0, pool=10.0)
+    try:
+        aux = _get_openai()(base_url=AUX_BASE_URL, api_key="no-key", timeout=_timeout)
+        aux.models.list()
+        return aux
+    except Exception:
+        _logger.debug("aux llama-server unreachable at %s — background work stays on main model", AUX_BASE_URL)
+        return None
+
+
+def _bg_llm(client) -> tuple:
+    """Return (client, model) for background LLM calls — prefers the aux backend
+    so memory/intel/summary work never queues behind the main conversation's slot."""
+    if _aux_client is not None:
+        return _aux_client, AUX_MODEL
+    return client, MODEL
 
 
 def make_client():  # returns OpenAI instance
@@ -4814,6 +4858,11 @@ def main() -> None:
 
     client = make_client()
     _cli_client = client
+
+    global _aux_client
+    _aux_client = make_aux_client()
+    if _aux_client is not None:
+        console.print(f"[dim]  aux model online: {AUX_MODEL} ({AUX_BASE_URL}) — handles background work[/dim]")
 
     if not sys.stdin.isatty():
         run_piped(client)

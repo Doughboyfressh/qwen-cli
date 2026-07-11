@@ -38,6 +38,8 @@ def _validate_config(cfg: dict) -> None:
     known_keys = {
         "base_url",
         "model",
+        "aux_base_url",
+        "aux_model",
         "token_limit",
         "max_tool_depth",
         "max_auto_continue",
@@ -91,6 +93,11 @@ def _cfg(key: str, env: str, default: str) -> str:
 
 BASE_URL = _cfg("base_url", "QWEN_BASE_URL", "http://localhost:8080/v1")
 MODEL = _cfg("model", "QWEN_MODEL", "Qwen3.6-27B")
+# Optional second llama-server: fast MoE model that absorbs background LLM work
+# (memory extraction, summaries, intel, titles) so it never queues behind the
+# main conversation's single slot. Empty aux_base_url disables the aux backend.
+AUX_BASE_URL = _cfg("aux_base_url", "QWEN_AUX_BASE_URL", "http://localhost:8081/v1")
+AUX_MODEL = _cfg("aux_model", "QWEN_AUX_MODEL", "Qwen3.6-35B-A3B")
 TOKEN_LIMIT = int(_cfg("token_limit", "QWEN_TOKEN_LIMIT", "32000"))
 MAX_TOOL_DEPTH = int(_cfg("max_tool_depth", "QWEN_MAX_TOOL_DEPTH", "20"))
 MAX_AUTO_CONTINUE = int(_cfg("max_auto_continue", "QWEN_MAX_AUTO_CONTINUE", "4"))

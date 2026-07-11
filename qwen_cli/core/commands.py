@@ -394,21 +394,40 @@ def _cmd_mode(ctx: _ReplContext, arg: str) -> None:
 
 
 def _cmd_model(ctx: _ReplContext, arg: str) -> None:
-    """Display the current model, list available models, or switch to a different model."""
+    """Display the current model, list models on both backends, or switch chat between them."""
     import qwen_cli.main as _main
 
+    aux = _main._aux_client
     if not arg:
-        _main.console.print(f"[dim][model: {_main.MODEL}][/dim]")
+        backend = "aux" if ctx.client is aux and aux is not None else "main"
+        _main.console.print(f"[dim][model: {_main.MODEL} ({backend} backend)][/dim]")
+        if aux is not None and ctx.client is not aux:
+            _main.console.print(f"[dim][aux available: /model {_main.AUX_MODEL}][/dim]")
     elif arg == "list":
-        models = _main.list_models(ctx.client)
-        for m in models:
+        for m in _main.list_models(_main._cli_client or ctx.client):
             mark = "  [bold green]<- current[/bold green]" if m == _main.MODEL else ""
-            _main.console.print(f"  [cyan]{m}[/cyan]{mark}")
-        if not models:
-            _main.console.print("[dim][no models found][/dim]")
+            _main.console.print(f"  [cyan]{m}[/cyan] [dim](main)[/dim]{mark}")
+        if aux is not None:
+            for m in _main.list_models(aux):
+                mark = "  [bold green]<- current[/bold green]" if m == _main.MODEL else ""
+                _main.console.print(f"  [cyan]{m}[/cyan] [dim](aux)[/dim]{mark}")
     else:
-        _main.MODEL = arg
-        _main.console.print(f"[green][model switched to: {_main.MODEL}][/green]")
+        aux_models = _main.list_models(aux) if aux is not None else []
+        if arg in aux_models or (aux is not None and arg == _main.AUX_MODEL):
+            ctx.client = aux
+            _main.MODEL = arg
+            # Aux server runs a smaller context window — cap the input budget and
+            # output reservation so chat turns fit inside its slot.
+            _main.TOKEN_LIMIT = min(_main._TOKEN_LIMIT_BASE, 28000)
+            _main._model_params["max_tokens"] = 8192
+            _main.console.print(f"[green][chat switched to aux model: {arg} — output capped at 8192 tokens][/green]")
+        else:
+            if aux is not None and ctx.client is aux:
+                ctx.client = _main._cli_client or ctx.client
+            _main.MODEL = arg
+            _main.TOKEN_LIMIT = _main._TOKEN_LIMIT_BASE
+            _main._model_params.pop("max_tokens", None)
+            _main.console.print(f"[green][model switched to: {_main.MODEL}][/green]")
 
 
 def _cmd_index(ctx: _ReplContext, arg: str) -> None:
