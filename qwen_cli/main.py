@@ -221,6 +221,7 @@ _VERIFYING_TOOLS = frozenset(
     {"read_file", "run_command", "run_script", "lsp_query", "search_files", "find_files", "list_directory"}
 )
 _last_turn_tool_names: list[str] = []  # tool names executed during the current run_turn, in order
+_turn_read_cache: set[tuple] = set()  # (path, offset, limit, mtime) already served this turn
 
 _model_params: dict = {}  # runtime overrides — layered on top of active preset
 
@@ -531,6 +532,15 @@ BASE_SYSTEM = (
     "Be direct and concise. Lead with the answer, then supporting detail. Don't narrate every tool "
     "call or pad responses with caveats about what you're about to do. Plain text only, no emoji."
 )
+
+if sys.platform == "win32":
+    BASE_SYSTEM += (
+        "\n\n# Host Environment\n\n"
+        "Shell commands run on Windows via cmd.exe. Unix tools — tail, head, grep, awk, sed, wc, "
+        "xargs, sort -rn — are NOT available; piping to them fails with 'not recognized'. Use "
+        "PowerShell equivalents (Select-Object -First/-Last N, Select-String, Measure-Object) or "
+        "run_script with Python instead."
+    )
 
 HELP_TEXT = """
 ## Commands
@@ -2041,6 +2051,15 @@ def do_run_command(
     Dangerous commands (rm -rf, format, etc.) require explicit confirmation.
     """
     work_dir = _resolve(cwd) if cwd else Path.cwd()
+    stripped = command.strip()
+    if not stripped:
+        return "[tool_call_error: empty command — send the complete command to run]"
+    if re.search(r"(?:\|\||&&|[|;&])\s*$", stripped):
+        _audit_log(command, work_dir, "rejected_malformed")
+        return (
+            "[tool_call_error: command ends with a dangling operator — "
+            "send the complete pipeline in a single call]"
+        )
     if _is_dangerous(command):
         console.print(f"[bold red]  [dangerous][/bold red] {command}")
         answer = console.input("[bold red]  Run anyway? [y/N]:[/bold red] ").strip().lower()
@@ -2210,6 +2229,14 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
         p = _resolve(path)
         if not p.exists():
             return f"[file not found: {p}]"
+        # Dedup identical re-reads within one turn — repeat reads of an unchanged
+        # file are pure context waste (the content is already in the conversation).
+        # mtime in the key means a file modified between reads is re-read normally.
+        read_key = (str(p), offset, limit, p.stat().st_mtime_ns)
+        if read_key in _turn_read_cache:
+            console.print(f"[dim cyan]  {p}  (already read this turn — skipping)[/dim cyan]")
+            return f"[{p} lines {offset or 1}+{f' limit {limit}' if limit else ''}: identical content already returned earlier this turn — reuse it]"
+        _turn_read_cache.add(read_key)
         raw = p.read_bytes()
         if b"\x00" in raw[:8192]:
             return f"[binary file not supported: {p.name}]"
@@ -4070,6 +4097,7 @@ def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | 
     """Full turn with tool-use loop. Returns reply, '' on cancel, None on error."""
     global _last_turn_tokens, _real_ctx_tokens
     del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
+    _turn_read_cache.clear()  # fresh read-dedup window for this turn
     working = _auto_presearch(list(messages)) if allow_tools else list(messages)
     # Feature 10: Surface unresolved errors from prior turn
     try:
@@ -4089,12 +4117,15 @@ def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | 
     total_completion = 0
     final_segments: list[str] = []  # final-answer pieces, joined across auto-continues
     auto_continue = 0  # how many times we've resumed a cut-off answer
+    empty_retries = 0  # nudges sent after an empty final reply (no text, no tools)
 
     while True:
         # Mid-run compaction: a long tool loop can pile up large tool results and
         # overflow the context window before the task finishes. When the working set
         # nears the limit, shrink older tool results in place so the run keeps going.
-        if depth > 0 and approx_tokens(working) >= TOKEN_LIMIT * 0.85:
+        # approx_tokens underestimates when tool results are token-dense, so also
+        # trust the real prompt count the server reported for the previous call.
+        if depth > 0 and max(approx_tokens(working), _real_ctx_tokens) >= TOKEN_LIMIT * 0.85:
             working = _compact_tool_loop(working)
 
         if depth >= MAX_TOOL_DEPTH:
@@ -4154,7 +4185,10 @@ def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | 
                         padding=(0, 1),
                     )
                 )
-            console.print(Markdown(text) if text else Markdown("*(no response)*"))
+            if text:
+                console.print(Markdown(text))
+            elif not tool_calls:
+                console.print(Markdown("*(no response)*"))
         except KeyboardInterrupt:
             console.print("\n[dim][cancelled][/dim]")
             return ""
@@ -4201,6 +4235,22 @@ def run_turn(client: object, messages: list, allow_tools: bool = True) -> str | 
             _real_ctx_tokens = usage["prompt"]
 
         if not tool_calls:
+            # An empty final reply (no text, no tools) burns the whole turn — seen
+            # in practice as "(no response)" iterations. Nudge the model once
+            # before giving up.
+            if not text.strip() and not final_segments and empty_retries < 1:
+                empty_retries += 1
+                console.print("[yellow]  \\[empty response — asking the model to answer][/yellow]")
+                working.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your last response was empty. Answer the request now — if you need "
+                            "information, call a tool; otherwise state your answer directly."
+                        ),
+                    }
+                )
+                continue
             final_segments.append(text)
             # The model produced a final answer with no tool calls. If it was cut
             # off mid-output (token cap hit, or the stream dropped), it hasn't
