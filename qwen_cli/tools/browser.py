@@ -444,6 +444,11 @@ def _get_page() -> Any:
         ctx.add_init_script(_STEALTH_JS)
         _browser_load_cookies(ctx)
         page = ctx.new_page()
+        # Links with target="_blank", OAuth popups, and window.open() all spawn a
+        # new Playwright Page in this context. Without this, _browser_state["page"]
+        # would keep pointing at the now-background original tab, and every
+        # subsequent action would silently act on stale content.
+        ctx.on("page", lambda new_page: _browser_state.update(page=new_page))
         _browser_state.update(playwright=pw, browser=browser, context=ctx, page=page, closed=False)
     return _browser_state["page"]
 
@@ -669,6 +674,53 @@ def _browser_do_screenshot(page, url="", selector="", value="", screenshot_path=
     return f"[screenshot saved: {path}]\nURL: {page.url}\nTitle: {page.title()}"
 
 
+def _browser_do_go_back(page, url="", selector="", value="", screenshot_path=""):
+    console.print("[bold cyan]  [browser][/bold cyan] go_back")
+    resp = page.go_back(wait_until="domcontentloaded", timeout=15000)
+    if resp is None:
+        return "[go_back: no previous page in history]"
+    _browser_smart_wait(page, timeout=8000)
+    return f"[navigated back — now at: {page.url}]\nPage title: {page.title()}"
+
+
+def _browser_do_go_forward(page, url="", selector="", value="", screenshot_path=""):
+    console.print("[bold cyan]  [browser][/bold cyan] go_forward")
+    resp = page.go_forward(wait_until="domcontentloaded", timeout=15000)
+    if resp is None:
+        return "[go_forward: no next page in history]"
+    _browser_smart_wait(page, timeout=8000)
+    return f"[navigated forward — now at: {page.url}]\nPage title: {page.title()}"
+
+
+def _browser_do_evaluate(page, url="", selector="", value="", screenshot_path=""):
+    if not value:
+        return "[evaluate requires a JS expression in 'value', e.g. 'document.title' or '[...document.querySelectorAll(\"h2\")].map(e => e.innerText)']"
+    console.print(f"[bold cyan]  [browser][/bold cyan] evaluate: {value[:80]!r}")
+    try:
+        result = page.evaluate(value)
+    except Exception as e:
+        return f"[evaluate error: {e}]"
+    try:
+        text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(result)
+    if len(text) > 8000:
+        text = text[:8000] + "\n...[truncated]"
+    return f"[evaluate result]\n{text}"
+
+
+def _browser_do_upload_file(page, url="", selector="", value="", screenshot_path=""):
+    if not selector or not value:
+        return "[upload_file requires selector (file input) and value (file path)]"
+    file_path = Path(value).expanduser()
+    if not file_path.is_file():
+        return f"[upload_file error: file not found: {value}]"
+    console.print(f"[bold cyan]  [browser][/bold cyan] upload_file {selector!r} = {value!r}")
+    loc = _browser_resolve_selector(page, selector)
+    loc.first.set_input_files(str(file_path))
+    return f"[uploaded {value!r} to {selector!r}]"
+
+
 def _browser_do_get_text(page, url="", selector="", value="", screenshot_path=""):
     console.print("[bold cyan]  [browser][/bold cyan] get_text")
     if selector:
@@ -700,7 +752,23 @@ _BROWSER_HANDLERS: dict[str, Callable] = {
     "get_links": _browser_do_get_links,
     "screenshot": _browser_do_screenshot,
     "get_text": _browser_do_get_text,
+    "go_back": _browser_do_go_back,
+    "go_forward": _browser_do_go_forward,
+    "evaluate": _browser_do_evaluate,
+    "upload_file": _browser_do_upload_file,
 }
+
+
+# Actions that plausibly trigger a real, trusted-gesture navigation (a target=
+# "_blank" link, an OAuth "Sign in with..." button) get an active, bounded wait
+# for a popup. Playwright's sync API only delivers context.on("page", ...)
+# events on the next blocking Playwright call — a plain click() returning does
+# NOT mean a same-tick popup would already be visible to us, so without this
+# wait the switch would only be noticed one tool call later (or never, if the
+# model doesn't happen to make another call). expect_page() actively pumps
+# for the event instead of relying on it turning up incidentally.
+_POPUP_PRONE_ACTIONS = frozenset({"click", "submit", "press_key"})
+_POPUP_WAIT_MS = 900
 
 
 def do_browser_action(
@@ -709,15 +777,45 @@ def do_browser_action(
     """Control a real Chromium browser via playwright automation.
 
     Actions: navigate, fill, type, click, select, submit, wait_for, scroll,
-    hover, press_key, screenshot, get_text, get_url, get_links, close.
-    Returns output text or status messages.
+    hover, press_key, screenshot, get_text, get_url, get_links, go_back,
+    go_forward, evaluate, upload_file, close.
+    Returns output text or status messages. If click/submit/press_key opens a
+    new tab (target="_blank" link, OAuth popup), that tab becomes the active
+    page and the result notes the switch. Other actions pick up the switch on
+    the next call if one happens to trigger a popup too.
     """
     try:
         page = _get_page()
         handler = _BROWSER_HANDLERS.get(action)
         if handler is None:
             return f"[unknown browser action: {action}]"
-        return handler(page, url, selector, value, screenshot_path)
+
+        if action in _POPUP_PRONE_ACTIONS:
+            # handler() runs first, outside any popup-wait scope, so a genuine
+            # error it raises (e.g. selector not found) propagates as-is —
+            # Playwright's "no popup arrived" and "your click/wait timed out"
+            # cases both raise the exact same TimeoutError class, so they must
+            # not share a try/except or a real failure could be silently
+            # misreported as "no popup, click succeeded".
+            result = handler(page, url, selector, value, screenshot_path)
+            from playwright.sync_api import TimeoutError as _PwTimeoutError
+
+            try:
+                popup_page = page.context.wait_for_event("page", timeout=_POPUP_WAIT_MS)
+            except _PwTimeoutError:
+                popup_page = None
+            if popup_page is not None:
+                _browser_state["page"] = popup_page
+                with contextlib.suppress(Exception):
+                    popup_page.wait_for_load_state("domcontentloaded", timeout=8000)
+        else:
+            result = handler(page, url, selector, value, screenshot_path)
+
+        new_page = _browser_state.get("page")
+        if new_page is not None and new_page is not page and action != "close":
+            with contextlib.suppress(Exception):
+                result += f"\n[note: a new tab/popup opened and is now the active page — url: {new_page.url}]"
+        return result
 
     except Exception as e:
         _emsg = str(e)
@@ -788,6 +886,7 @@ def _get_render_page() -> Any:
         )
         ctx.add_init_script(_STEALTH_JS)
         page = ctx.new_page()
+        ctx.on("page", lambda new_page: _render_state.update(page=new_page))
         _render_state.update(playwright=pw, browser=bro, context=ctx, page=page, closed=False)
     return _render_state["page"]
 

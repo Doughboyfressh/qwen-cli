@@ -162,6 +162,32 @@ def _fetch_cache_set(url: str, content: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Search cache — short-lived, avoids re-hitting rate-limited engines when the
+# same query is searched again shortly after (auto-presearch immediately
+# followed by an explicit web_search call, a model retry, etc.)
+# ---------------------------------------------------------------------------
+
+_SEARCH_CACHE: dict[tuple[str, int, str], tuple[float, str]] = {}
+_SEARCH_CACHE_TTL = 180  # 3 minutes — shorter than fetch cache since freshness matters more
+
+
+def _search_cache_get(key: tuple[str, int, str]) -> str | None:
+    """Retrieve a cached search result, if it exists and is not expired."""
+    entry = _SEARCH_CACHE.get(key)
+    if entry and (time.time() - entry[0]) < _SEARCH_CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _search_cache_set(key: tuple[str, int, str], content: str) -> None:
+    """Cache a search result with an expiration time."""
+    _SEARCH_CACHE[key] = (time.time(), content)
+    if len(_SEARCH_CACHE) > 40:
+        oldest = min(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k][0])
+        del _SEARCH_CACHE[oldest]
+
+
+# ---------------------------------------------------------------------------
 # Web search — all engines in parallel, merged via Reciprocal Rank Fusion
 # ---------------------------------------------------------------------------
 
@@ -353,6 +379,11 @@ def do_web_search(query: str, max_results: int = 6, type: str = "web") -> str:
     """Search the web across all engines, merge results via Reciprocal Rank Fusion."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    cache_key = (query, max_results, type)
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     if type == "news":
         engines = [
             ("DDG-news", _search_ddg_news),
@@ -391,7 +422,9 @@ def do_web_search(query: str, max_results: int = 6, type: str = "web") -> str:
         return f"[all search engines failed for: '{query}']"
 
     source_label, merged = _merge_results(all_results, max_results)
-    return _format_search_results(query, merged, source=source_label)
+    formatted = _format_search_results(query, merged, source=source_label)
+    _search_cache_set(cache_key, formatted)
+    return formatted
 
 
 def do_search_news(query: str, max_results: int = 8) -> str:
@@ -600,11 +633,40 @@ def _pdf_to_text(data: bytes, max_chars: int) -> str:
         return f"[PDF extraction error: {e}]"
 
 
+_JS_SHELL_MARKERS = (
+    'id="root"',
+    'id="app"',
+    "ng-version",
+    "data-reactroot",
+    "__next",
+    "you need to enable javascript",
+)
+
+
+def _looks_like_js_shell(html: str, text: str) -> bool:
+    """Heuristic: does this response look like an empty client-rendered SPA shell?
+
+    Plain HTTP fetches can't execute JS, so React/Vue/Angular apps often come back
+    as a near-empty <div id="root"> with all real content injected client-side.
+    Flag it so the caller knows to escalate to fetch_rendered instead of silently
+    treating a near-empty page as "this page just doesn't have much content."
+    """
+    stripped = text.strip()
+    if len(stripped) >= 250:
+        return False
+    if len(html) < 1500:
+        return False
+    lowered = html.lower()
+    return any(marker in lowered for marker in _JS_SHELL_MARKERS) or len(stripped) < 40
+
+
 def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
     """Fetch the raw text content of a URL.
 
     Handles redirects, compression, PDF extraction, and HTML-to-text conversion.
-    Falls back to a JS-rendered fetch if plain HTTP returns empty content.
+    Plain HTTP can't run JavaScript — if the response looks like an empty
+    client-rendered SPA shell, a hint is appended telling the caller to retry
+    with fetch_rendered instead.
     """
     cached = _fetch_cache_get(url)
     if cached:
@@ -651,10 +713,18 @@ def do_fetch_url(url: str, max_chars: int = 20000, **kwargs) -> str:
                 return result
 
             # HTML extraction
+            js_shell_hint = ""
             if "html" in ctype or stripped[:9].lower() in ("<!doctype", "<html"):
-                text = _html_to_text(text, url=url)
+                extracted = _html_to_text(text, url=url)
+                if _looks_like_js_shell(text, extracted):
+                    js_shell_hint = (
+                        "\n\n[NOTE: this page returned little to no text over plain HTTP — "
+                        "it looks like a JavaScript-rendered app (SPA shell). Retry with "
+                        "fetch_rendered to get the actual content.]"
+                    )
+                text = extracted
 
-            result = f"URL: {url}\n\n{_smart_truncate(text, max_chars)}"
+            result = f"URL: {url}\n\n{_smart_truncate(text, max_chars)}{js_shell_hint}"
             _fetch_cache_set(url, result)
             return result
 

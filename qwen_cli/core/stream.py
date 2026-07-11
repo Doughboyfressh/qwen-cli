@@ -145,11 +145,16 @@ TOOLS = [
                 "Control a real Chromium browser to automate web interactions: "
                 "navigate to pages, fill forms, click buttons, select dropdowns, submit forms, "
                 "scroll pages, hover over elements, press keyboard shortcuts, take screenshots, "
-                "read page text, extract all links, or get the current URL. "
+                "read page text, extract all links, upload files, run JS, or get the current URL. "
                 "Use this when a page requires JavaScript interaction. "
+                "If a click/submit opens a new tab (target=_blank link, OAuth popup, window.open), "
+                "that tab automatically becomes the active page for subsequent calls. "
                 "Actions: navigate, fill, type, click, select, submit, wait_for, "
                 "scroll (value=pixels or selector=element), hover, "
                 "press_key (value=key e.g. Enter/Tab/Escape/Control+A), "
+                "go_back, go_forward, "
+                "evaluate (value=JS expression, returns JSON-serialized result), "
+                "upload_file (selector=file input, value=local file path), "
                 "screenshot, get_text (selector optional), get_url, get_links, close."
             ),
             "parameters": {
@@ -172,6 +177,10 @@ TOOLS = [
                             "get_text",
                             "get_url",
                             "get_links",
+                            "go_back",
+                            "go_forward",
+                            "evaluate",
+                            "upload_file",
                         ],
                         "description": "The browser action to perform.",
                     },
@@ -180,14 +189,16 @@ TOOLS = [
                         "type": "string",
                         "description": (
                             "CSS selector or semantic shorthand: 'label:Text', 'button:Name', 'link:Name', 'text:Text'. "
-                            "Used by fill, type, click, select, wait_for, hover, press_key, get_text, scroll."
+                            "Used by fill, type, click, select, wait_for, hover, press_key, get_text, scroll, upload_file "
+                            "(file input element)."
                         ),
                     },
                     "value": {
                         "type": "string",
                         "description": (
                             "Text to fill/type, option label for select, "
-                            "pixels to scroll (negative = up), or key for press_key (e.g. 'Enter', 'Control+A')."
+                            "pixels to scroll (negative = up), key for press_key (e.g. 'Enter', 'Control+A'), "
+                            "JS expression for evaluate, or local file path for upload_file."
                         ),
                     },
                     "screenshot_path": {
