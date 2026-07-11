@@ -1,5 +1,6 @@
 """REPL module — interactive loop, input, watch, setup, turn execution."""
 
+import asyncio
 import atexit
 import contextlib
 import logging
@@ -105,6 +106,34 @@ def _make_pt_session() -> None:
     )
 
 
+def _close_loitering_event_loop() -> None:
+    """Close a leftover running asyncio loop on this thread, if any.
+
+    Background work (LSP handshakes, browser automation, intelligence
+    threads) can leave the main thread's asyncio state marked as "running"
+    without actually returning control cleanly. prompt_toolkit's
+    PromptSession.prompt() calls asyncio.run() internally, which raises
+    "cannot be called from a running event loop" if that happens — this
+    clears it defensively before every prompt.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        try:
+            loop.close()
+        except RuntimeError:
+            pass
+    except RuntimeError:
+        pass
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    except Exception:
+        pass
+
+
 def _read_input_inline() -> str:
     import qwen_cli.main as _main
 
@@ -152,7 +181,12 @@ def _read_input_in_thread() -> str:
 
 
 def read_input() -> str:
-    return _read_input_inline()
+    _close_loitering_event_loop()
+    try:
+        asyncio.get_running_loop()
+        return _read_input_in_thread()
+    except RuntimeError:
+        return _read_input_inline()
 
 
 def _watch_worker(mtimes: dict[str, float]) -> None:
