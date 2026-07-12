@@ -19,6 +19,8 @@ qwen-cli.lock
 qwen.log
 qwen.log.*
 audit.log
+llama-main.log
+llama-aux.log
 
 # Config may contain API keys
 config.toml

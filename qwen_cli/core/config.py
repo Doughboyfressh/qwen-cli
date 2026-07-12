@@ -163,9 +163,11 @@ _TOOL_RETRYABLE_TOOLS = frozenset(
 # max_tokens=16384 pairs with the server's -c 49152 (start-qwen.bat): the
 # input ceiling is 49152 - 16384 = 32768, so TOKEN_LIMIT=28000 keeps the same
 # ~4.7k tokenizer-drift headroom as the old 65536/32768 split. The context was
-# traded down to afford --cache-type-k q8_0 (q4_0 K cache measurably hurts
-# long-context quality) in the same VRAM. /long mode still raises output to
-# 81,920 on servers with a bigger -c.
+# traded down to afford a q8_0 KV cache (q4_0 K measurably hurts long-context
+# quality). NOTE: K and V cache types must match under flash-attn — a mixed
+# q8_0/q4_0 cache fell off the FA CUDA fast path and prompt processing
+# collapsed 2500 -> 69 t/s (benchmarked live; see start-qwen.bat). /long mode
+# still raises output to 81,920 on servers with a bigger -c.
 SAMPLING_PRESETS: dict[str, dict] = {
     "thinking": {
         "temperature": 1.0,

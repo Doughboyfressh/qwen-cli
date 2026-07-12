@@ -6,10 +6,18 @@ REM CLI input-token budget. Keep well under (server -c below) minus the preset
 REM max_tokens output reservation (16384, see core/config.py) -- 49152 - 16384
 REM = 32768 ceiling, so 28000 leaves ~4.7k headroom for tokenizer-estimate
 REM drift and tool schemas. -c was traded from 65536 down to 49152 to afford
-REM --cache-type-k q8_0 in the same VRAM (q4_0 K cache measurably hurts
-REM long-context quality; V stays q4_0, which is nearly free). This is the
-REM committed fallback for a fresh clone with no config.toml (gitignored,
-REM personal); a config.toml token_limit still wins.
+REM q8_0 KV cache (q4_0 K measurably hurts long-context quality).
+REM
+REM K and V cache types MUST MATCH with --flash-attn on: mixed q8_0/q4_0
+REM falls off the FA CUDA fast path on this build (2.24.0, RTX 5090) --
+REM prompt processing collapsed 2500 t/s -> 69 t/s, hanging every long
+REM prompt (benchmarked live 2026-07-11). Matched q8_0/q8_0: 1900+ t/s.
+REM Costs ~660 MiB more VRAM than q4_0/q4_0@65536 (~760 MiB headroom left
+REM with aux up). To reclaim headroom at the cost of long-context quality:
+REM q4_0/q4_0 and -c 65536, and raise preset max_tokens back to 32768.
+REM
+REM This is the committed fallback for a fresh clone with no config.toml
+REM (gitignored, personal); a config.toml token_limit still wins.
 set QWEN_TOKEN_LIMIT=28000
 
 REM CUDA 12 runtime DLLs
@@ -67,11 +75,12 @@ start "Qwen LLM Server" "%LLAMA_PATH%" ^
   -ngl 64 ^
   -c 49152 ^
   --cache-type-k q8_0 ^
-  --cache-type-v q4_0 ^
+  --cache-type-v q8_0 ^
   -np 1 ^
   -t 16 ^
   --flash-attn on ^
-  --image-min-tokens 1024
+  --image-min-tokens 1024 ^
+  --log-file "%USERPROFILE%\.qwen-cli\llama-main.log"
 
 echo [start-qwen] Loading model (30-90 seconds)...
 set "_WAIT=0"
@@ -117,7 +126,8 @@ start "Qwen Aux LLM Server" "%LLAMA_PATH%" ^
   -np 1 ^
   -t 16 ^
   --flash-attn on ^
-  --chat-template-kwargs "{\"enable_thinking\":false}"
+  --chat-template-kwargs "{\"enable_thinking\":false}" ^
+  --log-file "%USERPROFILE%\.qwen-cli\llama-aux.log"
 set "_WAIT=0"
 :wait_aux
 curl.exe -sf http://127.0.0.1:8081/health -o NUL >nul 2>&1
