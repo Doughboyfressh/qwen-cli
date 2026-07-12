@@ -380,3 +380,52 @@ class TestToolGating:
 
         self._fresh(qwen_cli, monkeypatch, mode="all")
         assert qwen_cli.active_tools() == TOOLS
+
+
+# ---------------------------------------------------------------------------
+# Intel crawlers opt-in — no background threads unless configured or /intel on
+# ---------------------------------------------------------------------------
+
+
+class TestIntelOptIn:
+    def _setup(self, qwen_cli, tmp_path, monkeypatch, mode):
+        import threading as _threading
+
+        started = []
+
+        class _FakeThread:
+            def __init__(self, *a, **k):
+                started.append(k.get("name", ""))
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(qwen_cli.threading, "Thread", _FakeThread)
+        topics = tmp_path / "topics.json"
+        topics.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(qwen_cli, "INTEL_TOPICS", topics)
+        monkeypatch.setattr(qwen_cli, "INTEL_MODE", mode)
+        monkeypatch.setattr(qwen_cli, "_intel_threads_started", False)
+        monkeypatch.setattr(qwen_cli, "_intel_enabled", _threading.Event())
+        return started
+
+    def test_off_by_default_starts_nothing(self, qwen_cli, tmp_path, monkeypatch):
+        started = self._setup(qwen_cli, tmp_path, monkeypatch, "off")
+        qwen_cli.start_intel_crawlers()
+        assert started == []
+        assert not qwen_cli._intel_enabled.is_set()
+
+    def test_on_mode_starts_at_launch(self, qwen_cli, tmp_path, monkeypatch):
+        started = self._setup(qwen_cli, tmp_path, monkeypatch, "on")
+        qwen_cli.start_intel_crawlers()
+        assert len(started) == qwen_cli._INTEL_CRAWLERS
+        assert qwen_cli._intel_enabled.is_set()
+
+    def test_force_starts_once_and_reenables(self, qwen_cli, tmp_path, monkeypatch):
+        started = self._setup(qwen_cli, tmp_path, monkeypatch, "off")
+        qwen_cli.start_intel_crawlers(force=True)  # /intel on
+        assert len(started) == qwen_cli._INTEL_CRAWLERS
+        qwen_cli._intel_enabled.clear()  # /intel off
+        qwen_cli.start_intel_crawlers(force=True)  # /intel on again
+        assert len(started) == qwen_cli._INTEL_CRAWLERS  # no duplicate threads
+        assert qwen_cli._intel_enabled.is_set()  # but crawling resumed

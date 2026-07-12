@@ -58,8 +58,11 @@ def test_smart_fires_on_questions(qwen_tools):
         assert _search(qwen_tools, t, "smart") is True
 
 
-def test_unknown_mode_defaults_to_aggressive(qwen_tools):
-    assert _search(qwen_tools, "center a div in css please", "wat") is True
+def test_unknown_mode_defaults_to_smart(qwen_tools):
+    # An invalid mode falls back to "smart" (the documented default), which
+    # skips how-to phrasing without factual intent markers.
+    assert _search(qwen_tools, "center a div in css please", "wat") is False
+    assert _search(qwen_tools, "what is the latest python version", "wat") is True
 
 
 def test_query_extracted_from_long_message(qwen_tools):

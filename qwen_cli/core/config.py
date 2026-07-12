@@ -135,7 +135,15 @@ AUX_LLM_TIMEOUT = float(_cfg("aux_timeout", "QWEN_AUX_TIMEOUT", "120"))
 
 AUTO_SEARCH_MODE = _cfg("auto_search", "QWEN_AUTO_SEARCH", "smart").lower()
 if AUTO_SEARCH_MODE not in ("off", "smart", "aggressive"):
-    AUTO_SEARCH_MODE = "aggressive"
+    AUTO_SEARCH_MODE = "smart"  # match the documented default on invalid values
+
+# Live Intelligence background crawlers (3 browser threads + a feed injected
+# into the system prompt) are opt-in: they cost tokens and background work
+# that a coding session rarely wants. "on" starts them at launch; /intel on
+# starts them mid-session regardless.
+INTEL_MODE = _cfg("intel", "QWEN_INTEL", "off").lower()
+if INTEL_MODE not in ("on", "off"):
+    INTEL_MODE = "off"
 
 # "auto": optional tool groups (browser/media/team) are sent only after the
 # model enables them via enable_tools — their schemas are context the 28k

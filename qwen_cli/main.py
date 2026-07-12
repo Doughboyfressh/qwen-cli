@@ -135,6 +135,7 @@ _CFG = _config._load_config()
 ACTIVE_BACKEND = "llama.cpp"  # updated at startup if fallback activates
 AUTO_SEARCH_MODE = _config.AUTO_SEARCH_MODE
 TOOL_GROUPS_MODE = _config.TOOL_GROUPS_MODE
+INTEL_MODE = _config.INTEL_MODE
 
 from qwen_cli.core.indexer import (  # noqa: E402
     IGNORE_DIRS,
@@ -250,16 +251,30 @@ _tool_call_retry_log: dict[int, list] = {}  # depth → list of (tool, error) fo
 _enabled_tool_groups: set[str] = set()
 
 
+def _mcp_server_configs() -> dict:
+    """MCP server definitions from config.toml ([mcp.servers.<name>] tables)."""
+    mcp_cfg = _CFG.get("mcp") or {}
+    servers = mcp_cfg.get("servers") or {}
+    return servers if isinstance(servers, dict) else {}
+
+
 def active_tools() -> list:
     """The tool schemas to send: core + session-enabled groups (or everything
-    in 'all' mode). Sorted group order keeps the serialized prompt stable."""
+    in 'all' mode). Sorted group order keeps the serialized prompt stable.
+    MCP schemas are discovered from running servers, so that group is always
+    resolved dynamically."""
     from qwen_cli.core.stream import CORE_TOOLS, TOOL_GROUPS
 
     if TOOL_GROUPS_MODE == "all":
-        return TOOLS
-    tools = list(CORE_TOOLS)
-    for group in sorted(_enabled_tool_groups):
-        tools.extend(TOOL_GROUPS[group])
+        tools = list(TOOLS)
+    else:
+        tools = list(CORE_TOOLS)
+        for group in sorted(_enabled_tool_groups - {"mcp"}):
+            tools.extend(TOOL_GROUPS[group])
+    if "mcp" in _enabled_tool_groups:
+        from qwen_cli.tools import mcp as _mcp
+
+        tools.extend(_mcp.tool_schemas())
     return tools
 
 
@@ -268,16 +283,35 @@ def do_enable_tools(group: str) -> str:
     from qwen_cli.core.stream import TOOL_GROUPS
 
     g = (group or "").strip().lower()
-    targets = list(TOOL_GROUPS) if g == "all" else [g]
-    if g != "all" and g not in TOOL_GROUPS:
-        return f"[enable_tools error: unknown group '{group}' — available: {', '.join(TOOL_GROUPS)}, all]"
+    known = list(TOOL_GROUPS) + (["mcp"] if _mcp_server_configs() else [])
+    targets = known if g == "all" else [g]
+    if g != "all" and g not in known:
+        if g == "mcp":
+            return (
+                "[enable_tools error: no MCP servers configured — add a [mcp.servers.<name>] "
+                "table with command/args to config.toml]"
+            )
+        return f"[enable_tools error: unknown group '{group}' — available: {', '.join(known)}, all]"
     new = [t for t in targets if t not in _enabled_tool_groups]
     if not new:
         return f"[tool group(s) already enabled: {', '.join(targets)} — call the tools directly]"
+    names: list[str] = []
+    if "mcp" in new:
+        from qwen_cli.tools import mcp as _mcp
+
+        summary = _mcp.start_all(_mcp_server_configs())
+        schemas = _mcp.tool_schemas()
+        if not schemas:
+            new.remove("mcp")
+            if not new:
+                return f"[enable_tools error: no MCP server came up — {summary}]"
+        else:
+            console.print(f"[dim]  [mcp] {summary}[/dim]")
+            names += [t["function"]["name"] for t in schemas]
     _enabled_tool_groups.update(new)
-    names = ", ".join(t["function"]["name"] for grp in new for t in TOOL_GROUPS[grp])
+    names += [t["function"]["name"] for grp in new if grp != "mcp" for t in TOOL_GROUPS[grp]]
     console.print(f"[dim]  [tools] enabled group(s): {', '.join(new)}[/dim]")
-    return f"[enabled tool group(s) {', '.join(new)} for this session — now available: {names}]"
+    return f"[enabled tool group(s) {', '.join(new)} for this session — now available: {', '.join(names)}]"
 
 
 # --- Visible plan / progress tracking (/agent, /task, update_plan tool) -----
@@ -529,9 +563,9 @@ BASE_SYSTEM = (
     "into memory.md and injected every turn under '=== Persistent Memory ==='; /remember adds facts "
     "manually. Never claim you have no memory.\n"
     "- Current information: your knowledge is NOT capped at a training cutoff — you search the web "
-    "in real time (see Accuracy below), and a '=== Live Intelligence ===' section (background "
-    "crawlers tracking news, releases, CVEs) gives you fresh, pre-verified data without needing an "
-    "extra search.\n"
+    "in real time (see Accuracy below). When a '=== Live Intelligence ===' section is present "
+    "(background crawlers tracking news, releases, CVEs), it gives you fresh, pre-verified data "
+    "without needing an extra search.\n"
     "- Math/logic: use run_script for reliable computation instead of claiming you're unreliable at "
     "arithmetic.\n"
     "- Files, shell, browser: full local filesystem access, arbitrary shell commands, and real "
@@ -741,7 +775,7 @@ HELP_TEXT = """
 
 `web_search` · `fetch_url` · `run_command` · `run_script` · `read_file` · **`edit_file`** · `patch_file` · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan` · `enable_tools`
 
-**On-demand groups** (model enables via `enable_tools`, or set `tool_groups = "all"` in config.toml): `browser` (`browser_action`, `fetch_rendered`) · `media` (`describe_image`, `get_video_transcript`) · `team` (`team_list`, `team_board`, `team_task_add/list/update`, `team_inbox_send/receive`, `team_spawn_agent`)
+**On-demand groups** (model enables via `enable_tools`, or set `tool_groups = "all"` in config.toml): `browser` (`browser_action`, `fetch_rendered`) · `media` (`describe_image`, `get_video_transcript`) · `team` (`team_list`, `team_board`, `team_task_add/list/update`, `team_inbox_send/receive`, `team_spawn_agent`) · `mcp` (external MCP servers — define `[mcp.servers.<name>]` with `command`/`args` in config.toml; `/mcp` shows status, `/mcp on` connects)
 
 Team data lives in `~/.clawteam/` and is compatible with the ClawTeam CLI if installed.
 
@@ -3434,14 +3468,30 @@ def _intel_crawler_thread(delay_s: int) -> None:
         _intel_stop.wait(timeout=_INTEL_INTERVAL)
 
 
-def start_intel_crawlers() -> None:
-    """Start _INTEL_CRAWLERS background crawler threads, staggered."""
+_intel_threads_started = False  # crawler threads spawn at most once per process
+
+
+def start_intel_crawlers(force: bool = False) -> None:
+    """Start _INTEL_CRAWLERS background crawler threads, staggered.
+
+    Opt-in: crawlers cost 3 background browser threads plus system-prompt
+    tokens for the injected feed. They start at launch only with config
+    intel="on" (or QWEN_INTEL=on); /intel on passes force=True to start
+    them mid-session. Idempotent — a second call just re-enables crawling
+    if it was paused with /intel off.
+    """
+    global _intel_threads_started
+    if not force and INTEL_MODE != "on":
+        return
     if not INTEL_TOPICS.exists():
         _intel_save_topics([dict(t) for t in _INTEL_DEFAULT_TOPICS])
     # threading.Event() starts unset; without this, _intel_crawl_once()'s
     # `if not _intel_enabled.is_set(): return` guard is true forever and no
     # crawler thread ever does real work.
     _intel_enabled.set()
+    if _intel_threads_started:
+        return
+    _intel_threads_started = True
     stagger = max(15, _INTEL_INTERVAL // _INTEL_CRAWLERS)
     for i in range(_INTEL_CRAWLERS):
         t = threading.Thread(
@@ -4359,6 +4409,14 @@ def _dispatch_interactive(name: str, args: dict) -> str:
     """Dispatch an interactive tool (may prompt user — must run on main thread)."""
     handler = _TOOL_HANDLERS_INTERACTIVE.get(name)
     if handler is None:
+        if name.startswith("mcp_"):
+            # Dynamically discovered MCP tools aren't in the static handler
+            # tables; route them to their server. Serial by design — MCP
+            # servers may be stateful.
+            from qwen_cli.tools import mcp as _mcp
+
+            _last_turn_tool_names.append(name)
+            return _mcp.dispatch(name, args)
         return f"[unknown tool: {name}]"
     _last_turn_tool_names.append(name)
     return handler(args)

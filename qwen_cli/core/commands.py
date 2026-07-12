@@ -719,6 +719,34 @@ def _cmd_inbox(ctx: _ReplContext, arg: str) -> None:
         _main.console.print("[yellow][usage: /inbox <team> [agent] | /inbox send <team> <to> <message>][/yellow]")
 
 
+def _cmd_mcp(ctx: _ReplContext, arg: str) -> None:
+    """Show MCP server status; /mcp on connects configured servers now."""
+    import qwen_cli.main as _main
+    from qwen_cli.tools import mcp as _mcp
+
+    configs = _main._mcp_server_configs()
+    if not configs:
+        _main.console.print(
+            "[dim][no MCP servers configured — add a [mcp.servers.<name>] table with "
+            "command/args to config.toml][/dim]"
+        )
+        return
+    if arg.strip().lower() == "on":
+        _main.console.print(f"[dim]{_main.do_enable_tools('mcp')}[/dim]")
+        return
+    connected = {s.name: s for s in _mcp._servers.values()}
+    for name in configs:
+        srv = connected.get(name)
+        if srv and srv.tools:
+            tools = ", ".join(t["name"] for t in srv.tools[:8])
+            more = f" (+{len(srv.tools) - 8} more)" if len(srv.tools) > 8 else ""
+            _main.console.print(f"  [green]{name}[/green]  {len(srv.tools)} tool(s): [dim]{tools}{more}[/dim]")
+        elif srv:
+            _main.console.print(f"  [red]{name}[/red]  failed: [dim]{srv.error}[/dim]")
+        else:
+            _main.console.print(f"  [yellow]{name}[/yellow]  configured, not connected [dim](/mcp on)[/dim]")
+
+
 def _cmd_board(ctx: _ReplContext, arg: str) -> None:
     """Display the task board for a team (or all teams)."""
     import qwen_cli.main as _main
@@ -879,8 +907,10 @@ def _cmd_intel(ctx: _ReplContext, arg: str) -> None:
         _main._intel_enabled.clear()
         _main.console.print("[dim][intel crawlers paused — /intel on to resume][/dim]")
     elif sub == "on":
-        _main._intel_enabled.set()
-        _main.console.print("[dim][intel crawlers resumed][/dim]")
+        # Starts the crawler threads if they never launched (intel is opt-in
+        # at startup) and re-sets the enable flag if they were paused.
+        _main.start_intel_crawlers(force=True)
+        _main.console.print("[dim][intel crawlers running][/dim]")
     elif sub.startswith("topics"):
         topics = _main._intel_load_topics()
         from rich.table import Table as _T
@@ -1081,6 +1111,7 @@ _REPL_COMMANDS: dict[str, callable] = {
     "/spawn": _cmd_spawn,
     "/inbox": _cmd_inbox,
     "/board": _cmd_board,
+    "/mcp": _cmd_mcp,
     "/history": _cmd_history,
     "/note": _cmd_note,
     "/compact": _cmd_compact,

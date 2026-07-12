@@ -646,14 +646,15 @@ _ALL_TOOLS = [
                 "directly. Groups: 'browser' (browser_action — clicks/forms/screenshots; "
                 "fetch_rendered — JS-rendered read-only page fetch), 'media' (describe_image, "
                 "get_video_transcript), 'team' (multi-agent task boards, inboxes, spawning "
-                "subagents). Call this as soon as a task needs one of those capabilities."
+                "subagents), 'mcp' (external MCP servers from config.toml, if any are configured). "
+                "Call this as soon as a task needs one of those capabilities."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "group": {
                         "type": "string",
-                        "enum": ["browser", "media", "team", "all"],
+                        "enum": ["browser", "media", "team", "mcp", "all"],
                         "description": "Tool group to enable ('all' for every group)",
                     },
                 },

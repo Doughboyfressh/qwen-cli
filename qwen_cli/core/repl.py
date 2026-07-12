@@ -415,7 +415,8 @@ def _repl_setup(client: object) -> tuple[str, list, _ReplContext]:
             f"[bold]Search[/bold]  [dim]{_main.AUTO_SEARCH_MODE} (/autosearch to change)[/dim]\n"
             f"[bold]Data[/bold]    [cyan]{_main.DATA_DIR}[/cyan]\n\n"
             f"[dim]@file \xb7 @file::symbol \xb7 /team \xb7 /spawn \xb7 /inbox \xb7 /board \xb7 /help \xb7 Ctrl+C cancels \xb7 /exit[/dim]\n"
-            f"[dim]Input: {pt_note}{'  (Ctrl+R history, Tab completion)' if _main._HAS_PT else ''}  \xb7 {_main._INTEL_CRAWLERS} intel crawlers (/intel)[/dim]",
+            f"[dim]Input: {pt_note}{'  (Ctrl+R history, Tab completion)' if _main._HAS_PT else ''}  \xb7 "
+            f"{f'{_main._INTEL_CRAWLERS} intel crawlers (/intel)' if _main.INTEL_MODE == 'on' else 'intel off (/intel on)'}[/dim]",
             title="[bold green]Qwen CLI[/bold green]",
             border_style="green",
         )

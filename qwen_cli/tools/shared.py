@@ -547,20 +547,21 @@ def _presearch_query(text: str) -> str:
     return t[:200]
 
 
-def presearch_decision(text: str, mode: str = "aggressive") -> tuple[bool, str]:
+def presearch_decision(text: str, mode: str = "smart") -> tuple[bool, str]:
     """Decide whether to auto-run a web search before the model's first reply.
 
         mode = "off"        -> never auto-search
                "smart"      -> search only when the message shows factual intent
+                               (the default)
                "aggressive" -> search anything that isn't chit-chat, a code block,
-                               or a text-transform / meta task (the default)
+                               or a text-transform / meta task
 
     Returns (should_search, query).
     """
     t = (text or "").strip()
-    mode = (mode or "aggressive").lower()
+    mode = (mode or "smart").lower()
     if mode not in ("off", "smart", "aggressive"):
-        mode = "aggressive"
+        mode = "smart"
     if mode == "off" or not t:
         return (False, "")
     if len(t.split()) < 2:
