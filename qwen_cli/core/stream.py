@@ -22,11 +22,18 @@ _logger = logging.getLogger(__name__)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 _XML_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
 _XML_PARAM_RE = re.compile(r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>', re.DOTALL)
-# Format C (Llama-style, Qwen drifts into it on long contexts):
+# Format C (Llama-style, Qwen drifts into it on long contexts). Both the
+# unclosed and the closed spelling occur in the wild:
 #   <function=name> <parameter=key> value <parameter=key2> value2 </function>
+#   <function=name><parameter=key>value</parameter></function>
+# The value lookahead MUST include </parameter>. Without it the closing tag was
+# swallowed into the value itself — read_file(path="main.py</parameter>") is a
+# file-not-found, and update_plan's steps array stopped being valid JSON, so it
+# decoded to a string, failed the tool's isinstance(steps, list) check, and the
+# plan was silently dropped.
 _FN_EQ_RE = re.compile(r"<function=([^>\s]+)>", re.IGNORECASE)
 _PARAM_EQ_RE = re.compile(
-    r"<parameter=([^>\s]+)>\s*(.*?)\s*(?=<parameter=|</function|$)",
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*(?=</parameter>|<parameter=|</function|$)",
     re.DOTALL | re.IGNORECASE,
 )
 
