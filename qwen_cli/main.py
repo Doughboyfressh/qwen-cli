@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import typing
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -56,6 +57,7 @@ class _SafeRotatingFileHandler(_logging_handlers.RotatingFileHandler):
     size threshold trips.
     """
 
+    @typing.override
     def doRollover(self):
         try:
             super().doRollover()
@@ -255,6 +257,13 @@ _VERIFYING_TOOLS = frozenset(
 )
 _last_turn_tool_names: list[str] = []  # tool names executed during the current run_turn, in order
 _turn_read_cache: set[tuple] = set()  # (path, offset, limit, mtime) already served this turn
+# Compact per-turn record of consequential tool activity (reads with ranges,
+# file mutations, commands). Appended to the stored assistant message by the
+# REPL so the next turn knows what was actually done — persistent history keeps
+# only user text + final reply, so without this every turn starts amnesiac
+# about its own tool work.
+_turn_ledger: list[str] = []
+_turn_hit_round_cap = False  # last run_turn ended at MAX_TOOL_DEPTH (task likely unfinished)
 
 _model_params: dict = {}  # runtime overrides — layered on top of active preset
 
@@ -2343,6 +2352,16 @@ def do_run_script(language: str, code: str, cwd: str = "", timeout: int = 30) ->
 _READ_PREVIEW_LINES = 40  # console preview cap for full-file reads (model gets everything)
 
 
+# Per-call read caps. A full read of a big file used to be silently chopped to
+# the first TOOL_RESULT_LIMIT chars by _cap_result under a header claiming the
+# whole file was returned — the model then "knew" content it never saw. Now
+# read_file paginates itself with honest headers and an explicit continuation
+# hint, and its results are exempt from _smart_cap (see there).
+_MAX_READ_LINES = 400
+_MAX_READ_CHARS = 16_000
+_MAX_READ_FILE_BYTES = 50_000_000  # refuse to decode beyond this
+
+
 def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
     """Handle read file operation."""
     try:
@@ -2357,6 +2376,8 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
             console.print(f"[dim cyan]  {p}  (already read this turn — skipping)[/dim cyan]")
             return f"[{p} lines {offset or 1}+{f' limit {limit}' if limit else ''}: identical content already returned earlier this turn — reuse it]"
         _turn_read_cache.add(read_key)
+        if p.stat().st_size > _MAX_READ_FILE_BYTES:
+            return f"[file too large to read: {p.name} ({p.stat().st_size:,} bytes) — use search_files or run_command]"
         raw = p.read_bytes()
         if b"\x00" in raw[:8192]:
             return f"[binary file not supported: {p.name}]"
@@ -2364,25 +2385,33 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
         lines = text.splitlines()
         total = len(lines)
 
-        if offset or limit:
-            start = max(0, offset - 1)
-            end = (start + limit) if limit else total
-            snippet = "\n".join(lines[start:end])
-            header = f"{p}  (lines {start + 1}–{min(end, total)} of {total})"
-        else:
-            if len(raw) > 150_000:
-                text = text[:150_000] + "\n... [truncated at 150 KB]"
-                lines = text.splitlines()
-            snippet = "\n".join(lines)
+        start = max(0, offset - 1) if offset else 0
+        if start >= total > 0:
+            return f"[offset {offset} is beyond the end of {p.name} ({total} lines)]"
+        want = min(limit, _MAX_READ_LINES) if limit else _MAX_READ_LINES
+        end = min(start + want, total)
+        chunk = lines[start:end]
+        # Char guard for long-line files (minified JS, JSON blobs): shrink the
+        # window until it fits, so the range in the header stays truthful.
+        while len(chunk) > 1 and sum(len(ln) + 1 for ln in chunk) > _MAX_READ_CHARS:
+            chunk.pop()
+        snippet = "\n".join(chunk)
+        if len(snippet) > _MAX_READ_CHARS:
+            snippet = snippet[:_MAX_READ_CHARS] + "\n... [single line truncated]"
+        end = start + len(chunk)
+
+        if start == 0 and end >= total:
             header = f"{p}  ({total} lines)"
-
-        lang = LANG_MAP.get(p.suffix.lower(), "")
-        # Console shows a brief summary; the model receives the full snippet.
-        # Rendering large files through Rich syntax highlighting floods the
-        # terminal and is slow. Agent sessions read whole files constantly.
-        console.print(f"[dim]read {p} ({total} lines, {p.stat().st_size} bytes)[/dim]")
-
-        return f"{header}\n\n{snippet}"
+            console.print(f"[dim]read {p} ({total} lines, {p.stat().st_size} bytes)[/dim]")
+        else:
+            header = f"{p}  (lines {start + 1}–{end} of {total})"
+            console.print(f"[dim]read {p} (lines {start + 1}-{end} of {total})[/dim]")
+        footer = (
+            f"\n\n[showing lines {start + 1}–{end} of {total}. Read the next part with offset={end + 1}]"
+            if end < total
+            else ""
+        )
+        return f"{header}\n\n{snippet}{footer}"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -2404,6 +2433,33 @@ def _lsp_post_edit_report(p: Path) -> None:
         _logger.debug("LSP post-edit check failed for %s (non-critical)", p)
 
 
+def _recover_old_string(original: str, old_string: str) -> tuple[str | None, str]:
+    """Recover what a failed old_string was meant to match. Line endings are
+    already normalized by the caller, so the one mismatch class a model
+    produces constantly and that is safe to fix mechanically is trailing
+    whitespace per line. Returns (exact_block_from_file, note) or (None, "")
+    — never an ambiguous match.
+
+    Trailing-whitespace-tolerant sliding window over file lines; leading
+    whitespace stays strict (indentation errors are real errors).
+    """
+    target = [ln.rstrip() for ln in old_string.split("\n")]
+    file_lines = original.splitlines(keepends=True)
+    stripped = [ln.rstrip() for ln in file_lines]
+    n = len(target)
+    if not n or n > len(stripped):
+        return None, ""
+    hits = [i for i in range(len(stripped) - n + 1) if stripped[i : i + n] == target]
+    if len(hits) != 1:
+        return None, ""
+    i = hits[0]
+    last = file_lines[i + n - 1]
+    block = "".join(file_lines[i : i + n - 1]) + last.rstrip("\r\n")
+    if original.count(block) == 1 and block != old_string:
+        return block, "matched ignoring trailing whitespace"
+    return None, ""
+
+
 def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """Replace an exact string in a file — the model-friendly alternative to unified diffs."""
     try:
@@ -2414,8 +2470,24 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
             return "[edit_file error: old_string is empty — use write_file to create content]"
         if old_string == new_string:
             return "[edit_file error: old_string and new_string are identical — nothing to change]"
-        original = p.read_text(encoding="utf-8", errors="replace")
+        # Read with endings preserved, then match in LF-normalized space (models
+        # mix CRLF/LF freely) and write back in the file's own ending style.
+        # The old read_text/write_text pair normalized on read but converted
+        # every \n to os.linesep on write — every edit on Windows silently
+        # rewrote LF files as CRLF.
+        with open(p, encoding="utf-8", errors="replace", newline="") as f:
+            raw_text = f.read()
+        uses_crlf = "\r\n" in raw_text
+        original = raw_text.replace("\r\n", "\n")
+        old_string = old_string.replace("\r\n", "\n")
+        new_string = new_string.replace("\r\n", "\n")
         count = original.count(old_string)
+        fallback_note = ""
+        if count == 0:
+            recovered, fallback_note = _recover_old_string(original, old_string)
+            if recovered is not None:
+                old_string = recovered
+                count = original.count(old_string)
         if count == 0:
             return (
                 "[edit_file error: old_string not found in the file. Re-read the file and copy the "
@@ -2430,11 +2502,6 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
         if str(p) not in _session_changes:
             _session_changes[str(p)] = original
 
-        if not _confirm_action("Apply edit?"):
-            return "[edit cancelled by user]"
-
-        _backup_file(p)
-        p.write_text(patched, encoding="utf-8")
         changed_lines = list(
             difflib.unified_diff(
                 original.splitlines(keepends=True),
@@ -2444,15 +2511,31 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
                 lineterm="",
             )
         )
+        # Show what the edit will do BEFORE asking. Approving an invisible
+        # change isn't approval. Skipped under /auto, where nobody is deciding
+        # and console quiet matters (patch_file/write_file style).
+        if not _auto_approve and changed_lines:
+            preview = "\n".join(ln.rstrip("\n") for ln in changed_lines[:60])
+            if len(changed_lines) > 60:
+                preview += f"\n... ({len(changed_lines) - 60} more diff lines)"
+            console.print(Syntax(preview, "diff", theme="monokai"))
+
+        if not _confirm_action("Apply edit?"):
+            return "[edit cancelled by user]"
+
+        _backup_file(p)
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(patched.replace("\n", "\r\n") if uses_crlf else patched)
         lines_changed = sum(
             1 for ln in changed_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
+        note = f" [{fallback_note}]" if fallback_note else ""
         console.print(
             f"[bold yellow]  [edit_file][/bold yellow] {p}  "
-            f"({count if replace_all else 1} replacement(s), {lines_changed} lines changed)"
+            f"({count if replace_all else 1} replacement(s), {lines_changed} lines changed){note}"
         )
         _lsp_post_edit_report(p)
-        return f"[edited: {p}  ({count if replace_all else 1} replacement(s), {lines_changed} lines changed)]"
+        return f"[edited: {p}  ({count if replace_all else 1} replacement(s), {lines_changed} lines changed){note}]"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -3864,6 +3947,11 @@ def _run_code_block(lang: str, code: str) -> None:
 
 def _smart_cap(client: object, result: str, name: str, context: str = "") -> str:
     """Cap a tool result. Summarizes web/fetch results via LLM; hard-truncates others."""
+    if name == "read_file":
+        # read_file paginates itself with honest range headers and continuation
+        # hints; a blind head-truncation here would cut the footer and reintroduce
+        # the "model thinks it read the whole file" bug.
+        return result
     if len(result) <= TOOL_RESULT_LIMIT:
         return result
     if name not in _SUMMARIZE_TOOLS:
@@ -4301,6 +4389,35 @@ def _inject_volatile_tail(working: list) -> list:
     return new_working
 
 
+def _ledger_entry(name: str, args: dict, result: str) -> str | None:
+    """One compact line for the turn ledger — only tools whose effects the next
+    turn needs to know about (reads, file mutations, commands)."""
+    first = (result or "").strip().splitlines()[0] if result else ""
+    if name == "read_file":
+        fname = Path(str(args.get("path", ""))).name
+        m = re.search(r"\((\d[\d,]* lines|lines [\d,]+[–-][\d,]+ of [\d,]+)\)", first)
+        return f"read {fname} ({m.group(1)})" if m else f"read {fname}"
+    if name in _MUTATING_FILE_TOOLS:
+        if first.startswith("["):
+            return first[:120]
+        return f"{name} {Path(str(args.get('path', ''))).name}"
+    if name in ("run_command", "run_script"):
+        cmd = str(args.get("command") or args.get("code") or "").replace("\n", " ")[:60]
+        failed = first.lower().startswith(("[error", "[tool_call", "[timeout", "[blocked", "[cancelled"))
+        return f"{name} {cmd!r}" + (f" -> {first[:60]}" if failed else "")
+    return None
+
+
+def _format_turn_ledger() -> str:
+    """Render _turn_ledger as a tag for the stored assistant message ('' if empty)."""
+    if not _turn_ledger:
+        return ""
+    entries = list(_turn_ledger)
+    if len(entries) > 14:
+        entries = entries[:3] + [f"...{len(entries) - 13} more..."] + entries[-10:]
+    return f"\n\n[turn actions: {'; '.join(entries)[:900]}]"
+
+
 def _compact_tool_loop(working: list, keep_recent_tools: int = 4, head_chars: int = 240) -> list:
     """Shrink older tool results during an in-progress tool loop so a long agentic
     run doesn't overflow the context window before it finishes.
@@ -4338,8 +4455,10 @@ def run_turn(client: object, messages: list, allow_tools: bool = True, presearch
     synthetic follow-up messages (e.g. the hedging re-check) that already
     instruct the model to search itself.
     """
-    global _last_turn_tokens, _real_ctx_tokens
+    global _last_turn_tokens, _real_ctx_tokens, _turn_hit_round_cap
+    _turn_hit_round_cap = False  # set when this turn ends via the MAX_TOOL_DEPTH forced synthesis
     del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
+    del _turn_ledger[:]  # fresh action ledger for this turn (read by the REPL history append)
     _turn_read_cache.clear()  # fresh read-dedup window for this turn
     working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
     if allow_tools:
@@ -4374,6 +4493,7 @@ def run_turn(client: object, messages: list, allow_tools: bool = True, presearch
             working = _compact_tool_loop(working)
 
         if depth >= MAX_TOOL_DEPTH:
+            _turn_hit_round_cap = True  # REPL may auto-continue if the plan is unfinished (global decl at top)
             console.print(
                 f"[yellow][max tool depth ({MAX_TOOL_DEPTH}) reached — synthesizing with gathered data][/yellow]"
             )
@@ -4616,6 +4736,10 @@ def run_turn(client: object, messages: list, allow_tools: bool = True, presearch
             for i in range(len(tool_calls)):
                 tc_id, result = tool_results[i]
                 working.append({"role": "tool", "tool_call_id": tc_id, "content": result})
+                args_i = parsed_args[i] if isinstance(parsed_args[i], dict) else {}
+                entry = _ledger_entry(tool_calls[i]["function"]["name"], args_i, result)
+                if entry:
+                    _turn_ledger.append(entry)
 
             first_call = False
             depth += 1
@@ -4679,8 +4803,12 @@ def cmd_trim(history: list, client: object) -> list:
         console.print("[dim][history too short to trim (need ≥12 turns)][/dim]")
         return history
 
-    # Separate "work" turns (file writes/patches) from pure chat — keep work turns verbatim
-    _work_markers = ("[patched:", "[created:", "[updated:", "[write_file]", "[patch_file]")
+    # Separate "work" turns from pure chat, keyed on the turn-actions ledger the
+    # REPL appends to assistant messages (tool results themselves never enter
+    # history, so markers like "[patched:" only appear if the model happens to
+    # quote them — the ledger tag is the reliable signal). Work turns are kept
+    # in condensed form: trimmed prose + the full ledger line.
+    _work_markers = ("[turn actions:", "[patched:", "[created:", "[updated:", "[write_file]", "[patch_file]")
     work_pairs: list[tuple[int, dict, dict | None]] = []  # (orig_idx, user_msg, asst_msg)
     chat_only: list[dict] = []
 
@@ -4779,8 +4907,24 @@ def cmd_trim(history: list, client: object) -> list:
                 f"to repeat themselves:\n{rolling_summary}]"
             ),
         }
-        # Re-insert preserved work turns in their original order
-        preserved = [msg for _, u, a in sorted(work_pairs, key=lambda x: x[0]) for msg in ([u] + ([a] if a else []))]
+        # Re-insert preserved work turns in their original order, condensed to
+        # trimmed prose + the full turn-actions ledger (verbatim preservation
+        # would defeat the point of trimming).
+        def _condense_work_pair(u: dict, a: dict | None) -> list[dict]:
+            uc = u.get("content") or ""
+            out = [{"role": "user", "content": uc[:200] + ("…" if len(uc) > 200 else "")}]
+            if a is not None:
+                ac = a.get("content") or ""
+                m = re.search(r"\[turn actions:.*\]\s*$", ac, re.DOTALL)
+                ledger = m.group(0) if m else ""
+                prose = (ac[: m.start()] if m else ac).strip()
+                body = prose[:300] + ("…" if len(prose) > 300 else "")
+                out.append({"role": "assistant", "content": body + ("\n\n" + ledger if ledger else "")})
+            return out
+
+        preserved = [
+            msg for _, u, a in sorted(work_pairs, key=lambda x: x[0]) for msg in _condense_work_pair(u, a)
+        ]
         new_history = [summary_msg, *preserved, *keep]
         console.print(
             f"[dim][trimmed → 1 summary + {len(preserved)} preserved work turn(s) + {len(keep)} recent][/dim]",

@@ -280,7 +280,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file with syntax highlighting. Use offset/limit for a range.",
+            "description": (
+                "Read a file. Returns at most 400 lines per call; the header states the exact "
+                "range returned (e.g. 'lines 1–400 of 1263') and how to continue with offset. "
+                "For large files, read only the ranges you need instead of paging through everything."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

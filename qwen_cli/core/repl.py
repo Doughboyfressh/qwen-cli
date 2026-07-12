@@ -277,10 +277,53 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
             reply = revised
 
     ctx.history.append({"role": "user", "content": user_input})
-    ctx.history.append({"role": "assistant", "content": reply})
+    # The ledger records what the turn actually DID (reads, edits, commands) —
+    # tool messages never enter persistent history, so without this tag the
+    # next turn only knows the model's prose about its own work.
+    ctx.history.append({"role": "assistant", "content": reply + _main._format_turn_ledger()})
     _main._turn_count += 1
     _main._print_turn_footer(elapsed)
     _main._confidence_warning(reply)
+
+    # Auto-continue: a turn that died at the tool-round cap with an unfinished
+    # plan used to just stop — the user had to type "ok" (repeatedly) to keep a
+    # long task moving, and each manual nudge restarted the model cold. Resume
+    # automatically, bounded so a stuck task can't loop forever; Ctrl+C during
+    # the continuation cancels as usual (run_turn returns "").
+    _MAX_AUTO_CONTINUES = 3
+    auto_continues = 0
+    while (
+        allow_tools
+        and _main._turn_hit_round_cap
+        and any(s.get("status") != "completed" for s in _main._current_plan)
+        and auto_continues < _MAX_AUTO_CONTINUES
+    ):
+        auto_continues += 1
+        console.print(
+            f"[dim yellow]  [auto-continue {auto_continues}/{_MAX_AUTO_CONTINUES} — "
+            f"tool budget hit with unfinished plan][/dim yellow]"
+        )
+        ctx.history = _main._maybe_autocompact(ctx.history, ctx.base_system, ctx.client)
+        cont_prompt = (
+            "Continue working on the current plan. Pick up at the first unfinished step; "
+            "do not re-plan or redo completed steps."
+        )
+        cont_msgs = [{"role": "system", "content": _main.build_system_prompt(ctx.base_system)}, *ctx.history]
+        cont_msgs.append({"role": "user", "content": cont_prompt})
+        t_cont = time.monotonic()
+        with _main._main_llm_busy_lock:
+            _main._main_llm_busy = True
+        try:
+            reply = _main.run_turn(ctx.client, cont_msgs, allow_tools=True, presearch=False)
+        finally:
+            with _main._main_llm_busy_lock:
+                _main._main_llm_busy = False
+        if not reply:
+            break  # cancelled or errored — hand control back to the user
+        ctx.history.append({"role": "user", "content": cont_prompt})
+        ctx.history.append({"role": "assistant", "content": reply + _main._format_turn_ledger()})
+        _main._turn_count += 1
+        _main._print_turn_footer(time.monotonic() - t_cont)
 
     if allow_tools and _main._looks_like_plan(reply):
         try:
@@ -292,7 +335,7 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
                 exec_reply = _main.run_turn(ctx.client, exec_msgs, allow_tools=True)
                 if exec_reply:
                     ctx.history.append({"role": "user", "content": "Please execute this plan step by step now."})
-                    ctx.history.append({"role": "assistant", "content": exec_reply})
+                    ctx.history.append({"role": "assistant", "content": exec_reply + _main._format_turn_ledger()})
                     _main._turn_count += 1
                     _main._print_turn_footer(time.monotonic() - t1)
         except (KeyboardInterrupt, EOFError):
