@@ -607,6 +607,42 @@ _ALL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "lsp_query",
+            "description": (
+                "Query a language server about code: jump to a definition, find all references to a "
+                "symbol, read hover docs, or list a file's symbols. Use this instead of grepping when "
+                "you need to know where something is DEFINED or everything that USES it — it resolves "
+                "symbols properly rather than matching text. Line and column are 1-based. "
+                "Actions: definition, references, hover, symbols, diagnostics, completion, status."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "definition",
+                            "references",
+                            "hover",
+                            "symbols",
+                            "diagnostics",
+                            "completion",
+                            "status",
+                        ],
+                        "description": "The query to run.",
+                    },
+                    "file_path": {"type": "string", "description": "Path of the file to query"},
+                    "line": {"type": "integer", "description": "1-based line number of the symbol"},
+                    "column": {"type": "integer", "description": "1-based column number of the symbol"},
+                    "new_name": {"type": "string", "description": "Unused; reserved for rename"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_plan",
             "description": (
                 "Create or update your visible step plan. Call FIRST for any multi-step task; "
@@ -645,7 +681,8 @@ _ALL_TOOLS = [
                 "Enable an optional tool group for the rest of this session, then call its tools "
                 "directly. Groups: 'browser' (browser_action — clicks/forms/screenshots; "
                 "fetch_rendered — JS-rendered read-only page fetch), 'media' (describe_image, "
-                "get_video_transcript), 'team' (multi-agent task boards, inboxes, spawning "
+                "get_video_transcript), 'lsp' (lsp_query — go-to-definition, find-references, "
+                "hover docs, file symbols), 'team' (multi-agent task boards, inboxes, spawning "
                 "subagents), 'mcp' (external MCP servers from config.toml, if any are configured). "
                 "Call this as soon as a task needs one of those capabilities."
             ),
@@ -654,7 +691,7 @@ _ALL_TOOLS = [
                 "properties": {
                     "group": {
                         "type": "string",
-                        "enum": ["browser", "media", "team", "mcp", "all"],
+                        "enum": ["browser", "media", "lsp", "team", "mcp", "all"],
                         "description": "Tool group to enable ('all' for every group)",
                     },
                 },
@@ -668,6 +705,7 @@ _ALL_TOOLS = [
 _GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
     "browser": ("fetch_rendered", "browser_action"),
     "media": ("describe_image", "get_video_transcript"),
+    "lsp": ("lsp_query",),
     "team": (
         "team_task_list",
         "team_task_add",

@@ -1,17 +1,15 @@
-"""Shared tool implementations (web search, URL fetch, diff, backup).
+"""Shared tool implementations (web search, URL fetch, diff).
 
-Importers must set the config vars below before calling any function that
-needs them (search keys, BACKUPS_DIR, etc.).  The simplest pattern:
+Importers must set the search-key config vars below before calling any function
+that needs them.  The simplest pattern:
 
     from qwen_cli.tools import shared as _qt
     _qt.GOOGLE_API_KEY = GOOGLE_API_KEY
-    _qt.BACKUPS_DIR    = DATA_DIR / "backups"
     from qwen_cli.tools.shared import do_web_search, do_fetch_url, ...
 """
 
 from __future__ import annotations
 
-import contextlib
 import gzip as _gzip
 import json
 import logging
@@ -33,9 +31,6 @@ _logger = logging.getLogger(__name__)
 GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CSE_ID: str = os.environ.get("GOOGLE_CSE_ID", "")
 BRAVE_API_KEY: str = os.environ.get("BRAVE_API_KEY", "")
-
-_DATA_DIR_DEFAULT = Path.home() / ".qwen-cli"
-BACKUPS_DIR: Path = _DATA_DIR_DEFAULT / "backups"
 
 # ---------------------------------------------------------------------------
 # Shared utilities
@@ -162,23 +157,12 @@ def _apply_diff(original: str, diff: str) -> str:
     return "".join(result)
 
 
-def _cleanup_backups(keep: int = 50) -> None:
-    """Keep only the most recent N backup files, deleting the rest."""
-    if not BACKUPS_DIR.exists():
-        return
-    files = sorted(BACKUPS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in files[keep:]:
-        with contextlib.suppress(Exception):
-            old.unlink()
-
-
-def _backup_file(p: Path) -> None:
-    """Create a timestamped backup of a file before editing it."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = BACKUPS_DIR / f"{p.name}.{stamp}.bak"
-    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    backup.write_text(p.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    _cleanup_backups()
+# NOTE: backups live in main._backup_file / main._cleanup_backups, not here.
+# This module used to carry a second, weaker copy of both (no same-second
+# filename-collision guard, no per-file retention cap) that nothing called.
+# Two implementations of "back up a file before overwriting it" is one too many
+# — the wrong one getting imported would silently lose a file's only on-disk
+# recovery copy on rapid same-file edits.
 
 
 # ---------------------------------------------------------------------------

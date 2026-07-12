@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -458,11 +459,39 @@ def lsp_status() -> str:
         )
 
 
+# Diagnostics are expensive: each pass shells out to ruff and pyright. The
+# pre/post-edit hooks used to call lsp_diagnostics() 2-4 times for a SINGLE
+# file edit (post_edit_check + check_imports, plus pre_edit_check and
+# check_patch_impact on patch_file), so one patch_file meant four ruff runs and
+# four pyright runs. Cache on (path, mtime_ns): every call within one edit sees
+# the same file, so they collapse to one real run, and the post-edit call after
+# the write misses the cache exactly as it should.
+_DIAG_CACHE: dict[tuple[str, int], list[str]] = {}
+_DIAG_CACHE_MAX = 32
+
+# A missing linter is an environment fact, not a finding about the file. Probing
+# once and skipping keeps "[Info] ruff failed: [WinError 2]..." out of the
+# diagnostics list (where severity-counting would have to special-case it) and
+# avoids re-paying a doomed subprocess spawn on every check.
+_TOOL_PRESENT: dict[str, bool] = {}
+
+
+def _tool_available(name: str) -> bool:
+    """Is an external checker on PATH? Probed once per process."""
+    if name not in _TOOL_PRESENT:
+        import shutil
+
+        _TOOL_PRESENT[name] = shutil.which(name) is not None
+    return _TOOL_PRESENT[name]
+
+
 def _run_ruff(fp: Path, diagnostics: list) -> None:
     """Run ruff linter on a Python file and append results."""
     import json
     import subprocess
 
+    if not _tool_available("ruff"):
+        return
     try:
         r = subprocess.run(
             ["ruff", "check", "--output-format=json", str(fp)],
@@ -476,14 +505,12 @@ def _run_ruff(fp: Path, diagnostics: list) -> None:
                 col = rule.get("location", {}).get("column", "?")
                 code = rule.get("code", "?")
                 msg = rule.get("message", "")
-                severity = "Error" if rule.get("fix", {}).get("applicability") == "unsafe" else "Warning"
-                if not rule.get("fix"):
-                    severity = "Error" if code.startswith(("E", "F", "W")) else "Warning"
+                severity = "Error" if code.startswith(("E", "F", "W")) else "Warning"
                 diagnostics.append(
                     f"  [{severity}] {code}: {msg} (line {line}, col {col})",
                 )
     except Exception as e:
-        diagnostics.append(f"  [Info] ruff failed: {e}")
+        _logger.debug("ruff failed on %s: %s", fp, e)
 
 
 def _run_pyright(fp: Path, diagnostics: list) -> None:
@@ -491,6 +518,8 @@ def _run_pyright(fp: Path, diagnostics: list) -> None:
     import json
     import subprocess
 
+    if not _tool_available("pyright"):
+        return
     try:
         r = subprocess.run(
             ["pyright", "--outputjson", str(fp)],
@@ -501,22 +530,49 @@ def _run_pyright(fp: Path, diagnostics: list) -> None:
         if r.stdout:
             data = json.loads(r.stdout)
             for diag in data.get("generalDiagnostics", []):
-                line = diag.get("line", "?")
-                col = diag.get("character", "?")
+                rng = diag.get("range", {}).get("start", {})
+                line = rng.get("line", diag.get("line", "?"))
+                col = rng.get("character", diag.get("character", "?"))
                 rule = diag.get("rule", "")
                 msg = diag.get("message", "")
-                sev = diag.get("severity", "info")
-                if sev == "information":
-                    sev = "Info"
-                elif sev == "warning":
-                    sev = "Warning"
-                else:
-                    sev = "Error"
+                sev = diag.get("severity", "information")
+                sev = {"information": "Info", "warning": "Warning"}.get(sev, "Error")
                 diagnostics.append(
                     f"  [{sev}] pyright ({rule}): {msg} (line {line}, col {col})",
                 )
     except Exception as e:
-        diagnostics.append(f"  [Info] pyright failed: {e}")
+        _logger.debug("pyright failed on %s: %s", fp, e)
+
+
+def _collect_diagnostics(file_path: str) -> list[str]:
+    """Diagnostic lines for a file, cached per (path, mtime)."""
+    fp = Path(file_path).resolve()
+    try:
+        key = (str(fp), fp.stat().st_mtime_ns)
+    except OSError:
+        return []
+    cached = _DIAG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    diagnostics: list[str] = []
+    if fp.suffix.lower() in (".py", ".pyi"):
+        _run_ruff(fp, diagnostics)
+        _run_pyright(fp, diagnostics)
+
+    if len(_DIAG_CACHE) >= _DIAG_CACHE_MAX:
+        _DIAG_CACHE.pop(next(iter(_DIAG_CACHE)))
+    _DIAG_CACHE[key] = diagnostics
+    return diagnostics
+
+
+def _errors_of(diagnostics: list[str]) -> set[str]:
+    """The Error-severity lines, as a set so two runs can be diffed."""
+    return {d.strip() for d in diagnostics if d.lstrip().startswith("[Error]")}
+
+
+def _warnings_of(diagnostics: list[str]) -> set[str]:
+    return {d.strip() for d in diagnostics if d.lstrip().startswith("[Warning]")}
 
 
 def _run_lsp_diagnostics(fp: Path) -> None:
@@ -535,8 +591,8 @@ def _format_diagnostics(fp: Path, diagnostics: list) -> str:
     if not diagnostics:
         return f"Diagnostics for {fp}:\n  Clean. No issues found."
 
-    errors = sum(1 for d in diagnostics if "[Error]" in d)
-    warnings = sum(1 for d in diagnostics if "[Warning]" in d)
+    errors = len(_errors_of(diagnostics))
+    warnings = len(_warnings_of(diagnostics))
 
     lines = [
         f"Diagnostics for {fp} ({len(diagnostics)} issues):",
@@ -551,17 +607,9 @@ def lsp_diagnostics(file_path: str) -> str:
     """Run diagnostics on a file using ruff, pyright, and LSP."""
     try:
         fp = Path(file_path).resolve()
-        ext = fp.suffix.lower()
-        diagnostics: list[str] = []
-
-        if ext in (".py", ".pyi"):
-            _run_ruff(fp, diagnostics)
-            _run_pyright(fp, diagnostics)
-
+        diagnostics = _collect_diagnostics(str(fp))
         _run_lsp_diagnostics(fp)
-
         return _format_diagnostics(fp, diagnostics)
-
     except Exception as e:
         return f"Diagnostics error: {e}"
 
@@ -784,52 +832,130 @@ def lsp_preflight_check(code: str, language: str) -> dict:
     return {"clean": True, "errors": 0, "warnings": 0}
 
 
+# Error state per file, captured by lsp_pre_edit_check immediately BEFORE a write.
+# Diffing this against the post-write state is the only way to say what an edit
+# actually introduced or fixed. The old code just counted the substring "error"
+# in the formatted report (case-sensitively, against text that says "[Error]"),
+# so new_errors was always 0 and fixed_errors was hardcoded 0 — neither warning
+# could ever fire.
+_ERROR_BASELINE: dict[str, set[str]] = {}
+_UNRESOLVED: dict[str, set[str]] = {}  # path -> errors still present after the last edit
+
+
 def lsp_pre_edit_check(file_path: str) -> dict:
+    """Snapshot a file's errors before an edit. Call this BEFORE writing."""
     try:
-        diag = lsp_diagnostics(file_path)
-        errors = diag.count("error") if diag else 0
-        warnings = diag.count("warning") if diag else 0
-        return {"clean": errors == 0, "error_count": errors, "warning_count": warnings}
+        fp = str(Path(file_path).resolve())
+        diagnostics = _collect_diagnostics(fp)
+        errors = _errors_of(diagnostics)
+        _ERROR_BASELINE[fp] = errors
+        return {
+            "clean": not errors,
+            "error_count": len(errors),
+            "warning_count": len(_warnings_of(diagnostics)),
+        }
     except Exception:
+        _logger.debug("LSP pre-edit check failed for %s", file_path, exc_info=True)
         return {"clean": True, "error_count": 0, "warning_count": 0}
 
 
 def lsp_post_edit_check(file_path: str) -> dict:
+    """Compare a file's errors against the pre-edit snapshot. Call AFTER writing."""
     try:
-        diag = lsp_diagnostics(file_path)
-        errors = diag.count("error") if diag else 0
-        return {"new_errors": errors, "fixed_errors": 0}
+        fp = str(Path(file_path).resolve())
+        after = _errors_of(_collect_diagnostics(fp))
+        # No baseline (new file, or an edit path that skipped the pre-check):
+        # nothing is provably "new", so report none rather than blaming the edit
+        # for pre-existing problems.
+        before = _ERROR_BASELINE.get(fp)
+        new = after - before if before is not None else set()
+        fixed = before - after if before is not None else set()
+        _ERROR_BASELINE[fp] = after
+        if after:
+            _UNRESOLVED[fp] = after
+        else:
+            _UNRESOLVED.pop(fp, None)
+        return {
+            "new_errors": len(new),
+            "fixed_errors": len(fixed),
+            "total_errors": len(after),
+            "details": sorted(new),
+        }
     except Exception:
-        return {"new_errors": 0, "fixed_errors": 0}
+        _logger.debug("LSP post-edit check failed for %s", file_path, exc_info=True)
+        return {"new_errors": 0, "fixed_errors": 0, "total_errors": 0, "details": []}
 
 
 def lsp_check_patch_impact(file_path: str, diff: str) -> dict:
+    """Report pre-existing errors on lines the patch is about to touch."""
     try:
-        diag = lsp_diagnostics(file_path)
-        if diag and ("error" in diag or "warning" in diag):
-            if diag.count("error") > 0:
-                return {"conflicts": [f"{diag.count('error')} diagnostic issue(s) in file"]}
+        errors = _errors_of(_collect_diagnostics(str(Path(file_path).resolve())))
+        if not errors:
+            return {"conflicts": []}
+        touched = {
+            int(m.group(1))
+            for m in re.finditer(r"^@@ -(\d+)", diff, re.MULTILINE)
+        }
+        if not touched:
+            return {"conflicts": []}
+        conflicts = []
+        for err in errors:
+            m = re.search(r"\(line (\d+)", err)
+            if m and any(abs(int(m.group(1)) - start) <= 10 for start in touched):
+                conflicts.append(err)
+        return {"conflicts": conflicts}
     except Exception:
-        _logger.debug("LSP patch-impact check failed for %s", file_path)
-    return {"conflicts": []}
+        _logger.debug("LSP patch-impact check failed for %s", file_path, exc_info=True)
+        return {"conflicts": []}
+
+
+# What a genuinely unresolvable import looks like across the checkers we run.
+# The old check asked whether the substring "error" appeared anywhere in the
+# lowercased report — which matches "[Error]", i.e. ANY error of any kind. A
+# type error, a style violation, an undefined name: all were reported to the
+# user as "broken import(s)" after every edit.
+#
+# Deliberately NOT matched: ruff's F821 (undefined name) and pyright's
+# reportUndefinedVariable. A typo'd local is an undefined name, not an
+# unresolved import, and reporting it as one is the same category error this
+# check exists to fix.
+_BROKEN_IMPORT_RE = re.compile(
+    r"reportMissingImports|reportMissingModuleSource|reportMissingTypeStubs|"
+    r"could not be resolved|unresolved import|no module named|ModuleNotFoundError|ImportError",
+    re.IGNORECASE,
+)
 
 
 def lsp_check_imports(file_path: str) -> dict:
+    """Report diagnostics that specifically indicate an unresolvable import."""
     try:
-        from pathlib import Path as _Path
-
-        if not _Path(file_path).exists():
+        fp = Path(file_path)
+        if not fp.exists():
             return {"broken": [f"File not found: {file_path}"]}
-        result = lsp_diagnostics(file_path)
-        if not result or "error" not in result.lower():
-            return {"broken": []}
-        return {"broken": [result]}
+        broken = [d.strip() for d in _collect_diagnostics(str(fp.resolve())) if _BROKEN_IMPORT_RE.search(d)]
+        return {"broken": broken}
     except Exception:
+        _logger.debug("LSP import check failed for %s", file_path, exc_info=True)
         return {"broken": []}
 
 
-def lsp_trend_report() -> str:
-    return "LSP trend tracking not yet implemented. Requires server state tracking across edits."
+def lsp_trend_report() -> dict:
+    """Errors still outstanding from earlier edits this session.
+
+    Returns a dict — main.run_turn does trend.get("unresolved_errors") on this
+    every turn. It used to return a plain string, so that call raised
+    AttributeError into a bare `except Exception` on every single turn and the
+    feature never once ran.
+    """
+    unresolved = [f"{Path(p).name}: {e}" for p, errs in _UNRESOLVED.items() for e in sorted(errs)]
+    return {"unresolved_errors": unresolved, "files_with_errors": len(_UNRESOLVED)}
+
+
+def reset_error_tracking() -> None:
+    """Clear per-file error state (used by tests)."""
+    _ERROR_BASELINE.clear()
+    _UNRESOLVED.clear()
+    _DIAG_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------

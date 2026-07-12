@@ -154,7 +154,6 @@ from qwen_cli.tools import shared as _qt  # noqa: E402
 _qt.GOOGLE_API_KEY = GOOGLE_API_KEY
 _qt.GOOGLE_CSE_ID = GOOGLE_CSE_ID
 _qt.BRAVE_API_KEY = BRAVE_API_KEY
-_qt.BACKUPS_DIR = BACKUPS_DIR
 _apply_diff, do_web_search, do_fetch_url, do_get_video_transcript, do_search_news, _html_to_text, presearch_decision = (
     _qt._apply_diff,
     _qt.do_web_search,
@@ -587,7 +586,9 @@ BASE_SYSTEM = (
     "Web: web_search, search_news (recent/breaking news specifically), fetch_url (fastest, no JS).\n"
     "On-demand groups — call enable_tools(group) once, then use them for the rest of the session: "
     "'browser' (fetch_rendered — JS-rendered read-only fetch; browser_action — forms/clicks/"
-    "interaction), 'media' (describe_image, get_video_transcript), 'team' (subagents — see below).\n"
+    "interaction), 'media' (describe_image, get_video_transcript), 'lsp' (lsp_query — go-to-"
+    "definition, find-references, hover docs, file symbols; use it over grep when you need where a "
+    "symbol is DEFINED or everything that USES it), 'team' (subagents — see below).\n"
     "Other: ask_user for genuine ambiguity (not simple yes/no confirmations — just proceed).\n\n"
     "# Subagents\n\n"
     "enable_tools('team') gives task boards, inboxes, and team_spawn_agent. All agents share ONE "
@@ -756,7 +757,6 @@ HELP_TEXT = """
 | /lsp symbols <file> | List all symbols in a file |
 | /lsp rename <file> <line> <col> <new_name> | Find rename locations |
 | /lsp shutdown | Shut down LSP server |
-| `/intel on/off` | Pause/resume background crawlers |
 
 ## Team coordination (multi-agent)
 
@@ -775,7 +775,7 @@ HELP_TEXT = """
 
 `web_search` · `fetch_url` · `run_command` · `run_script` · `read_file` · **`edit_file`** · `patch_file` · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan` · `enable_tools`
 
-**On-demand groups** (model enables via `enable_tools`, or set `tool_groups = "all"` in config.toml): `browser` (`browser_action`, `fetch_rendered`) · `media` (`describe_image`, `get_video_transcript`) · `team` (`team_list`, `team_board`, `team_task_add/list/update`, `team_inbox_send/receive`, `team_spawn_agent`) · `mcp` (external MCP servers — define `[mcp.servers.<name>]` with `command`/`args` in config.toml; `/mcp` shows status, `/mcp on` connects)
+**On-demand groups** (model enables via `enable_tools`, or set `tool_groups = "all"` in config.toml): `browser` (`browser_action`, `fetch_rendered`) · `media` (`describe_image`, `get_video_transcript`) · `lsp` (`lsp_query` — go-to-definition, find-references, hover, symbols) · `team` (`team_list`, `team_board`, `team_task_add/list/update`, `team_inbox_send/receive`, `team_spawn_agent`) · `mcp` (external MCP servers — define `[mcp.servers.<name>]` with `command`/`args` in config.toml; `/mcp` shows status, `/mcp on` connects)
 
 Team data lives in `~/.clawteam/` and is compatible with the ClawTeam CLI if installed.
 
@@ -1131,6 +1131,9 @@ _COMMANDS = [
     "/plan",
     "/index",
     "/git",
+    "/lsp",
+    "/mcp",
+    "/cleanup",
     "/watch",
     "/changes",
     "/rollback",
@@ -2274,44 +2277,34 @@ def do_run_command(
 
     _shell_meta = re.compile(r"[|;&$`<>()\[\]{}!\n]")
     try:
-        if _shell_meta.search(command):
+        if sys.platform == "win32":
+            # Everything goes through cmd.exe on Windows. dir, echo, type, copy,
+            # set, cls and friends are cmd BUILTINS, not .exe files, so a
+            # shell=False argv Popen hands them to CreateProcess, which can only
+            # launch real executables — every one of them failed with WinError 2.
+            # Routing only metacharacter-bearing commands through the shell (the
+            # old behavior) made that absurd: `dir` failed while `dir | findstr x`
+            # worked. BASE_SYSTEM tells the model run_command runs "via cmd.exe";
+            # now that is actually true.
+            popen_args: str | list[str] = command
+            use_shell = True
+        elif _shell_meta.search(command):
             _logger.warning("shell=True for command with metacharacters: %.120s", command)
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=work_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=proc_env,
-            )
+            popen_args, use_shell = command, True
         else:
-            if sys.platform == "win32":
-                # posix=True shlex treats backslashes as escapes and mangles Windows
-                # paths (C:\Users\... -> C:UsersDough...); posix=False preserves them
-                # but leaves surrounding quotes on quoted tokens, so strip those.
-                cmd_parts = []
-                for tok in shlex.split(command, posix=False):
-                    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
-                        tok = tok[1:-1]
-                    cmd_parts.append(tok)
-            else:
-                cmd_parts = shlex.split(command)
-            proc = subprocess.Popen(
-                cmd_parts,
-                shell=False,
-                cwd=work_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=proc_env,
-            )
+            popen_args, use_shell = shlex.split(command), False
+        proc = subprocess.Popen(
+            popen_args,
+            shell=use_shell,
+            cwd=work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=proc_env,
+        )
         if stdin:
             try:
                 proc.stdin.write(stdin)
@@ -2385,8 +2378,22 @@ def do_run_script(language: str, code: str, cwd: str = "", timeout: int = 30) ->
         supported = ", ".join(sorted(_SCRIPT_INTERP))
         return f"[unsupported language: {language!r} — supported: {supported}]"
     interp, ext = _SCRIPT_INTERP[lang_key]
-    if _DANGEROUS_CMD_RE.search(code):
-        return "[script blocked: contains dangerous operations]"
+    # _is_dangerous(), not the bare _DANGEROUS_CMD_RE: the regex alone misses
+    # pipe-to-shell ("curl x | bash"), eval with command substitution, and
+    # variable-expanded rm — all of which run_command catches. Gating the two
+    # tools differently meant the model could route around the confirmation
+    # simply by picking run_script. Prompt rather than hard-block, so this
+    # matches run_command's behavior (and gets the same audit-log entry).
+    if _is_dangerous(code):
+        console.print(f"[bold red]  [dangerous script][/bold red] {lang_key}")
+        _audit_log(f"[run_script:{lang_key}] {code}", Path(cwd) if cwd else Path.cwd(), "dangerous_prompt")
+        try:
+            answer = console.input("[bold red]  Run anyway? [y/N]:[/bold red] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            answer = ""
+        if answer != "y":
+            _audit_log(f"[run_script:{lang_key}] {code}", Path(cwd) if cwd else Path.cwd(), "declined_by_user")
+            return "[script cancelled by user]"
     n_lines = len(code.splitlines())
     console.print(f"[bold yellow]  [run_script][/bold yellow] {lang_key}  ({n_lines} lines)")
 
@@ -2486,19 +2493,38 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
         return f"[error: {e}]"
 
 
+def _lsp_pre_edit_snapshot(p: Path) -> None:
+    """Record a file's current errors before it is written.
+
+    Without this, lsp_post_edit_check has no baseline to diff against and can't
+    tell an error the edit INTRODUCED from one that was already there. edit_file
+    and write_file previously took no snapshot at all, so their post-edit report
+    had nothing to compare with.
+    """
+    try:
+        _lsp = _get_lsp()
+        if p.exists() and _lsp._is_code_file(str(p)):
+            _lsp.lsp_pre_edit_check(str(p))
+    except Exception:
+        _logger.debug("LSP pre-edit snapshot failed for %s (non-critical)", p)
+
+
 def _lsp_post_edit_report(p: Path) -> None:
     """Print post-edit diagnostics trend + broken-import report for a just-written file."""
     try:
         _lsp = _get_lsp()
-        if _lsp._is_code_file(str(p)):
-            post = _lsp.lsp_post_edit_check(str(p))
-            if post["new_errors"] > 0:
-                console.print(f"[dim red]  Post-edit: {post['new_errors']} new error(s) introduced[/dim red]")
-            if post["fixed_errors"] > 0:
-                console.print(f"[dim green]  Post-edit: {post['fixed_errors']} error(s) fixed[/dim green]")
-            imports = _lsp.lsp_check_imports(str(p))
-            if imports["broken"]:
-                console.print(f"[dim red]  Imports: {len(imports['broken'])} broken import(s)[/dim red]")
+        if not _lsp._is_code_file(str(p)):
+            return
+        post = _lsp.lsp_post_edit_check(str(p))
+        if post["new_errors"] > 0:
+            console.print(f"[dim red]  Post-edit: {post['new_errors']} new error(s) introduced[/dim red]")
+            for detail in post.get("details", [])[:3]:
+                console.print(f"[dim red]    {detail}[/dim red]")
+        if post["fixed_errors"] > 0:
+            console.print(f"[dim green]  Post-edit: {post['fixed_errors']} error(s) fixed[/dim green]")
+        broken = _lsp.lsp_check_imports(str(p))["broken"]
+        if broken:
+            console.print(f"[dim red]  Imports: {len(broken)} unresolved import(s)[/dim red]")
     except Exception:
         _logger.debug("LSP post-edit check failed for %s (non-critical)", p)
 
@@ -2594,6 +2620,7 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
             return "[edit cancelled by user]"
 
         _backup_file(p)
+        _lsp_pre_edit_snapshot(p)
         with open(p, "w", encoding="utf-8", newline="") as f:
             f.write(patched.replace("\n", "\r\n") if uses_crlf else patched)
         lines_changed = sum(
@@ -2920,6 +2947,7 @@ def do_write_file(path: str, content: str) -> str:
             console.print(Syntax(preview, "diff", theme="monokai"))
             if not _confirm_action("Overwrite?"):
                 return "[write cancelled by user]"
+            _lsp_pre_edit_snapshot(p)
         p.write_text(content, encoding="utf-8")
         action = "updated" if existed else "created"
         console.print(f"[bold yellow]  [write_file][/bold yellow] {action}: {p}")
@@ -4290,6 +4318,12 @@ _TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
         "search_files", do_search_files, a.get("path", ""), a.get("query", ""),
         a.get("pattern", "**/*"), a.get("context", 0), timeout=_TOOL_TIMEOUT_FAST,
         status=f"  Searching files for '{a.get('query', '')}'…",
+    ),
+    "lsp_query": lambda a: _call_with_timeout(
+        "lsp_query", _get_lsp().lsp_query, a.get("action", ""), a.get("file_path", ""),
+        a.get("line", 0), a.get("column", 0), a.get("new_name", ""),
+        timeout=_TOOL_TIMEOUT_SLOW,
+        status=f"  Querying language server ({a.get('action', '')})…",
     ),
     "team_task_list": lambda a: _ct_render_task_list(
         a.get("team", ""), a.get("owner", ""), a.get("status", "")

@@ -799,6 +799,7 @@ def _cmd_stats(ctx: _ReplContext, arg: str) -> None:
 def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
     """Clean up stale teams, backups, and completed tasks."""
     import qwen_cli.main as _main
+    from qwen_cli.tools.team import _ct_tasks_dir
 
     sub = arg.strip().lower() if arg else "all"
     dry_run = sub == "dry-run"
@@ -817,34 +818,40 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
             for team_dir in sorted(ct_dir.iterdir()):
                 if not team_dir.is_dir():
                     continue
-                tasks_dir = team_dir / "tasks"
+                # Tasks live in CT_DIR/tasks/<team>/, NOT CT_DIR/teams/<team>/tasks/
+                # (see team._ct_tasks_dir). Looking in the wrong place meant
+                # tasks_dir never existed, has_active stayed False for every team,
+                # and this loop rmtree'd them all — including teams with dozens of
+                # in-progress tasks. Use the real accessor so the two can't drift.
+                tasks_dir = _ct_tasks_dir(team_dir.name)
                 has_active = False
-                if tasks_dir.is_dir():
-                    try:
-                        for tf in tasks_dir.iterdir():
-                            if tf.suffix == ".json":
-                                raw = tf.read_text(encoding="utf-8", errors="replace")
-                                td = json.loads(raw)
-                                status = td.get("status", "pending").lower()
-                                if status not in ("completed", "blocked"):
-                                    has_active = True
-                                    break
-                                # even completed/blocked tasks count as recent if modified within max_age
-                                if tf.stat().st_mtime > now_ts - max_age:
-                                    has_active = True
-                                    break
-                    except (json.JSONDecodeError, OSError):
-                        has_active = True
+                try:
+                    for tf in tasks_dir.iterdir():
+                        if tf.suffix == ".json":
+                            raw = tf.read_text(encoding="utf-8", errors="replace")
+                            td = json.loads(raw)
+                            status = td.get("status", "pending").lower()
+                            if status not in ("completed", "blocked"):
+                                has_active = True
+                                break
+                            # even completed/blocked tasks count as recent if modified within max_age
+                            if tf.stat().st_mtime > now_ts - max_age:
+                                has_active = True
+                                break
+                except (json.JSONDecodeError, OSError):
+                    has_active = True
                 if has_active:
                     continue
-                # Remove the team directory
+                # Remove the team directory and its (now orphaned) task directory
                 if not dry_run:
-                    try:
-                        import shutil
+                    import shutil
 
-                        shutil.rmtree(team_dir)
-                    except Exception:
-                        _logger.exception("Failed to remove team dir: %s", team_dir)
+                    for victim in (team_dir, tasks_dir):
+                        try:
+                            if victim.is_dir():
+                                shutil.rmtree(victim)
+                        except Exception:
+                            _logger.exception("Failed to remove dir: %s", victim)
                 removed += 1
                 if dry_run:
                     _main.console.print(f"  [dim]would remove team:[/dim] {team_dir.name}")
@@ -864,12 +871,11 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
 
     # --- Completed tasks ---
     if what in ("tasks", "all"):
-        ct_dir = _main.CT_DIR / "teams"
-        if ct_dir.is_dir():
+        tasks_root = _main.CT_DIR / "tasks"  # not teams/<team>/tasks — see above
+        if tasks_root.is_dir():
             now_ts = time.time()
             max_age = 3 * 86400  # 3 days for completed tasks
-            for team_dir in list(ct_dir.iterdir()):
-                tasks_dir = team_dir / "tasks"
+            for tasks_dir in list(tasks_root.iterdir()):
                 if not tasks_dir.is_dir():
                     continue
                 for tf in list(tasks_dir.iterdir()):
@@ -884,7 +890,7 @@ def _cmd_cleanup(ctx: _ReplContext, arg: str) -> None:
                                 tf.unlink()
                             removed += 1
                             if dry_run:
-                                _main.console.print(f"  [dim]would remove task:[/dim] {team_dir.name}/{tf.name}")
+                                _main.console.print(f"  [dim]would remove task:[/dim] {tasks_dir.name}/{tf.name}")
                     except (json.JSONDecodeError, OSError):
                         pass
 

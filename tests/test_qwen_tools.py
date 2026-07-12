@@ -164,31 +164,8 @@ def test_smart_truncate_very_long(qwen_tools):
     assert len(result) < len(text)
 
 
-# =============================================================================
-# _backup_file
-# =============================================================================
-
-
-def test_backup_file_creates_dir_and_backup(qwen_tools, tmp_path, monkeypatch):
-    backup_dir = tmp_path / "my_backups"
-    monkeypatch.setattr(qwen_tools, "BACKUPS_DIR", backup_dir)
-    src = tmp_path / "doc.txt"
-    src.write_text("important data", encoding="utf-8")
-    qwen_tools._backup_file(src)
-    assert backup_dir.is_dir()
-    backups = list(backup_dir.glob("*.bak"))
-    assert len(backups) == 1
-    assert backups[0].read_text(encoding="utf-8") == "important data"
-
-
-def test_backup_file_preserves_original(qwen_tools, tmp_path, monkeypatch):
-    backup_dir = tmp_path / "backups"
-    backup_dir.mkdir()
-    monkeypatch.setattr(qwen_tools, "BACKUPS_DIR", backup_dir)
-    src = tmp_path / "keep.txt"
-    src.write_text("original", encoding="utf-8")
-    qwen_tools._backup_file(src)
-    assert src.read_text(encoding="utf-8") == "original"
+# Backups are main._backup_file's job (tested in test_file_ops.py); the weaker
+# duplicate that used to live in tools/shared.py is gone.
 
 
 # =============================================================================
