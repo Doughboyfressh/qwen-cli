@@ -4,9 +4,12 @@ import os
 import sys
 from pathlib import Path
 
-DATA_DIR = Path.home() / ".qwen-cli"
+# QWEN_DATA_DIR redirects ALL user data (memory.md, sessions, backups, ...) —
+# set by tests/conftest.py so the suite can never pollute the real data dir
+# (test runs used to write 'modified code.txt' entries into real memory.md).
+DATA_DIR = Path(os.environ.get("QWEN_DATA_DIR") or (Path.home() / ".qwen-cli"))
 CONFIG_FILE = DATA_DIR / "config.toml"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_config() -> dict:

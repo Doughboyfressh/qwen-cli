@@ -19,6 +19,12 @@ sys.path.insert(0, str(ROOT))
 # conftest loads before any test module, so this top-level assignment is safe.
 os.environ.setdefault("QWEN_LOG_FILE", str(Path(tempfile.gettempdir()) / "qwen-cli-test.log"))
 
+# Redirect the entire data dir (memory.md, sessions/, backups/, ...) to a
+# throwaway location: the suite used to write real entries into the user's
+# memory.md ("modified code.txt, existing.txt, same.txt") and drop snapshot
+# files into the real context_snapshots/. Same before-import constraint.
+os.environ.setdefault("QWEN_DATA_DIR", tempfile.mkdtemp(prefix="qwen-cli-test-data-"))
+
 
 def _import_module(name: str):
     """Import a top-level module by name (handles hyphen-free names)."""

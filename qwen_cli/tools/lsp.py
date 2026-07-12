@@ -199,7 +199,11 @@ def _create_server(file_path: str = "") -> Any:
     enter it (via ``with`` or manual ``__enter__``) so that the internal event
     loop is created and the server process is actually launched.
     """
-    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE
+    # _LSP_LAST_ACCESS was missing from this global list (and _ensure_server's),
+    # so both assignments created locals and the module-level value stayed 0.0 —
+    # _check_idle_shutdown() then saw every running server as idle-since-epoch
+    # and killed it on EVERY public LSP call, paying a full server restart each time.
+    global _LSP_SERVER, _LSP_ROOT, _LSP_LANGUAGE, _LSP_LAST_ACCESS
 
     if not _multilspy_available:
         msg = "multilspy is not installed. Install with: pip install multilspy"
@@ -287,7 +291,7 @@ def _shutdown_server(lsp) -> None:
 
 def _ensure_server(file_path: str = "") -> Any:
     """Get or create the LSP server. Re-creates if language changed."""
-    global _LSP_SERVER, _LSP_LANGUAGE
+    global _LSP_SERVER, _LSP_LANGUAGE, _LSP_LAST_ACCESS
 
     _LSP_LAST_ACCESS = time.time()
 

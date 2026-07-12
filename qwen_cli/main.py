@@ -2963,6 +2963,41 @@ def record_session_changes_memory(client: object | None = None) -> None:
     console.print(f"[dim][memory: logged session changes — {shown}][/dim]")
 
 
+# Lines that are just the extractor saying "nothing here" — observed written into
+# memory.md as '- SKIP', 'SKIP', '- No', bulleted/bolded variants, etc. The old
+# check (facts.upper() != "SKIP") only caught the bare, unbulleted form.
+_MEMORY_JUNK_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?(?:skip|none|n/?a|no|nothing)(?:\*\*)?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+# A memory "fact" containing tool-call or thinking syntax is a malformed model
+# reply captured wholesale, not a fact — a live memory.md had a full
+# <tool_call><function=browser_action>... block saved as memory.
+_MEMORY_TOOL_SYNTAX_RE = re.compile(r"<tool_call>|</?think>|<function[=>]|<parameter[=>]", re.IGNORECASE)
+_MEMORY_NEGATION_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:no|none|nothing)\b", re.IGNORECASE)
+
+
+def _clean_memory_facts(facts: str, drop_negations: bool = False) -> str:
+    """Sanitize an LLM-extracted memory entry before it is persisted.
+
+    Drops sentinel/no-op lines, rejects entries containing tool-call syntax,
+    and (for intel entries) drops pure-negation lines ("No critical CVEs
+    detected...") that record the absence of information. Returns the cleaned
+    entry, or "" if nothing durable remains.
+    """
+    if not facts or _MEMORY_TOOL_SYNTAX_RE.search(facts):
+        return ""
+    kept = []
+    for line in facts.splitlines():
+        if _MEMORY_JUNK_LINE_RE.match(line):
+            continue
+        if drop_negations and _MEMORY_NEGATION_RE.match(line):
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    return cleaned if len(cleaned) > 10 else ""
+
+
 def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
     """Pull memorable facts from this exchange and append to memory.md."""
     global _auto_memory_count
@@ -2994,8 +3029,8 @@ def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
             max_tokens=200,
             timeout=AUX_LLM_TIMEOUT,
         )
-        facts = (resp.choices[0].message.content or "").strip()
-        if facts and facts.upper() != "NONE" and len(facts) > 10:
+        facts = _clean_memory_facts((resp.choices[0].message.content or "").strip())
+        if facts:
             with _memory_lock:
                 mem = load_memory()
                 entry = f"\n\n<!-- auto {datetime.now().strftime('%Y-%m-%d')} -->\n{facts}"
@@ -3211,8 +3246,8 @@ def _intel_train_memory(client: object, topic_name: str, summary: str) -> None:
             max_tokens=120,
             timeout=AUX_LLM_TIMEOUT,
         )
-        facts = (resp.choices[0].message.content or "").strip()
-        if facts and facts.upper() != "SKIP" and facts.startswith("-"):
+        facts = _clean_memory_facts((resp.choices[0].message.content or "").strip(), drop_negations=True)
+        if facts and facts.startswith("-"):
             with _memory_lock:
                 mem = load_memory()
                 tag = f"\n\n<!-- intel {today} -->\n{facts}"
@@ -5098,7 +5133,8 @@ def main() -> None:
         _watch_thread, \
         _cli_client, \
         _real_ctx_tokens, \
-        _session_start
+        _session_start, \
+        _auto_approve
 
     _session_start = time.monotonic()
 
@@ -5163,6 +5199,10 @@ def main() -> None:
         return
 
     if _auto_task:
+        # Spawned agents (--task, see team_spawn_agent) run in consoles nobody
+        # is watching — cmd_agent's "Auto-approve file edits?" prompt would
+        # block them at startup forever. They are autonomous by definition.
+        _auto_approve = True
         base_system = BASE_SYSTEM
         history: list[dict] = []
         _auto_task = expand_at_refs(_auto_task)

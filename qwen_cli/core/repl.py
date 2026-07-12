@@ -186,7 +186,19 @@ def read_input() -> str:
         asyncio.get_running_loop()
         return _read_input_in_thread()
     except RuntimeError:
+        pass
+    try:
         return _read_input_inline()
+    except RuntimeError as e:
+        # prompt_toolkit's prompt() calls asyncio.run(), which raises if a
+        # background thread's loop state landed on this thread between the
+        # get_running_loop() check above and here. Observed killing a live
+        # session (fatal REPL crash) — a fresh thread has no running loop,
+        # so the thread path always works. Fall back instead of dying.
+        if "running event loop" not in str(e).lower():
+            raise
+        _logger.warning("prompt blocked by a loitering event loop — retrying input in a thread")
+        return _read_input_in_thread()
 
 
 def _watch_worker(mtimes: dict[str, float]) -> None:
