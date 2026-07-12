@@ -123,7 +123,7 @@ INTEL_FEED = INTEL_DIR / "feed.md"
 INTEL_QUEUE = INTEL_DIR / "queue.json"
 INTEL_TOPICS = INTEL_DIR / "topics.json"
 PT_HISTORY_FILE = DATA_DIR / "pt_history.txt"
-CONTEXT_SNAPSHOTS_DIR = DATA_DIR / "context_snapshots"
+COMMANDS_DIR = DATA_DIR / "commands"  # user-defined slash commands: <name>.md -> /name
 AUDIT_LOG_FILE = DATA_DIR / "audit.log"  # append-only record of every run_command/run_script execution
 
 TOOL_RESULT_LIMIT = 16_000
@@ -134,7 +134,7 @@ AUTO_SEARCH_MODE = _cfg("auto_search", "QWEN_AUTO_SEARCH", "smart").lower()
 if AUTO_SEARCH_MODE not in ("off", "smart", "aggressive"):
     AUTO_SEARCH_MODE = "aggressive"
 
-for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR, CONTEXT_SNAPSHOTS_DIR):
+for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR, COMMANDS_DIR):
     _d.mkdir(exist_ok=True)
 
 _LONG_OUTPUT = 81920

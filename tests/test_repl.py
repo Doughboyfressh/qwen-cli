@@ -555,7 +555,6 @@ def test_main_crash_path_writes_handoff(qwen_cli):
         patch.object(qwen_cli, "_silent_autosave") as mock_autosave,
         patch.object(qwen_cli, "_save_exit_handoff") as mock_handoff,
         patch("threading.Thread"),
-        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
         # Hermetic: a real qwen-cli session on the dev box holds qwen-cli.lock
         # and the guard would prompt for input mid-test.
         patch.object(qwen_cli, "_acquire_repl_lock", return_value=True),
@@ -580,7 +579,6 @@ def test_main_skips_lsp_prewarm_for_task_mode(qwen_cli):
         patch.object(qwen_cli, "expand_at_refs", side_effect=lambda t: t),
         patch.object(qwen_cli, "cmd_agent"),
         patch("threading.Thread") as mock_thread,
-        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
     ):
         mock_stdin.isatty.return_value = True
         qwen_cli.main()
@@ -597,7 +595,6 @@ def test_main_starts_lsp_prewarm_for_interactive_mode(qwen_cli):
         patch.object(qwen_cli, "_repl_setup", return_value=("system", [], "fake_ctx")),
         patch.object(qwen_cli, "_repl_loop"),
         patch("threading.Thread") as mock_thread,
-        patch("qwen_cli.core.context.clean_old_snapshots", return_value=0),
         # Hermetic: without this, a REAL qwen-cli session running on the dev
         # box holds qwen-cli.lock and the guard prompts for input mid-test.
         patch.object(qwen_cli, "_acquire_repl_lock", return_value=True),

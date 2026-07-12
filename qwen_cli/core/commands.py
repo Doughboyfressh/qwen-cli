@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -970,6 +971,44 @@ def _cmd_auto(ctx: _ReplContext, arg: str) -> None:
         f"  auto-approve: {state}  [dim](file edits apply without y/N prompts; "
         f"dangerous shell commands still ask)[/dim]"
     )
+
+
+def _run_custom_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
+    """Run a user-defined slash command from ~/.qwen-cli/commands/<name>.md.
+
+    The file body becomes the prompt for a normal turn; `$ARGUMENTS` is replaced
+    with whatever followed the command (or, absent the placeholder, the argument
+    is appended). Returns False if no matching command file exists.
+    """
+    import qwen_cli.main as _main
+    from qwen_cli.core.config import COMMANDS_DIR
+
+    name = directive[1:]
+    # Command names come from the user's own prompt, but never let one escape
+    # the commands dir ("/../evil") or collide with odd filesystem names.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        return False
+    path = COMMANDS_DIR / f"{name}.md"
+    if not path.is_file():
+        return False
+    try:
+        template = path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        _main.console.print(f"[red][error reading {path.name}: {e}][/red]")
+        return True
+    if not template:
+        _main.console.print(f"[yellow][{path.name} is empty — add a prompt to it][/yellow]")
+        return True
+    if "$ARGUMENTS" in template:
+        prompt = template.replace("$ARGUMENTS", arg)
+    else:
+        prompt = f"{template}\n\n{arg}" if arg else template
+    _main.console.print(f"[dim]  [custom command: {path.name}][/dim]")
+
+    from qwen_cli.core.repl import _run_turn_and_handle_reply
+
+    _run_turn_and_handle_reply(ctx, _main.expand_at_refs(prompt))
+    return True
 
 
 def _cmd_unknown(ctx: _ReplContext, directive: str) -> None:

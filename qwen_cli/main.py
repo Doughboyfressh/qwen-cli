@@ -83,6 +83,7 @@ from qwen_cli.core.config import (  # noqa: E402
     BACKUPS_DIR,
     BASE_URL,
     BRAVE_API_KEY,
+    COMMANDS_DIR,
     CONFIG_FILE,
     CT_DIR,  # noqa: F401 — accessed via _main. in commands.py
     DATA_DIR,
@@ -690,8 +691,11 @@ Team data lives in `~/.clawteam/` and is compatible with the ClawTeam CLI if ins
 - After a response containing code, press `r` to run the block or `c` to copy it to the clipboard
 - Tab completes `/commands` and `@file` paths
 - Create `.qwen-system.md` in a project for project-specific instructions
+- Define custom slash commands: `~/.qwen-cli/commands/<name>.md` becomes `/name` — the file body is
+  sent as the prompt, with `$ARGUMENTS` replaced by whatever you type after the command
 - Edit `~/.qwen-cli/config.toml` for persistent settings
 - Pipe input: `echo "explain this" | qwen` or `cat file.py | qwen "what does this do?"`
+- Resume sessions from the shell: `qwen -c` continues the last autosave, `qwen -r <name>` fuzzy-loads a saved session
 """
 
 # ---------------------------------------------------------------------------
@@ -1046,6 +1050,20 @@ _COMMANDS = [
     "/board",
     "/intel",
 ]
+
+
+def _all_commands() -> list[str]:
+    """Built-in commands plus user-defined ones (~/.qwen-cli/commands/*.md).
+
+    Re-globbed on each call so a command file created mid-session is picked up
+    by tab completion without a restart.
+    """
+    cmds = list(_COMMANDS)
+    try:
+        cmds += sorted(f"/{p.stem}" for p in COMMANDS_DIR.glob("*.md") if f"/{p.stem}" not in _COMMANDS)
+    except OSError:
+        pass
+    return cmds
 
 
 # ---------------------------------------------------------------------------
@@ -2304,6 +2322,9 @@ def do_run_script(language: str, code: str, cwd: str = "", timeout: int = 30) ->
         Path(tmp).unlink(missing_ok=True)
 
 
+_READ_PREVIEW_LINES = 40  # console preview cap for full-file reads (model gets everything)
+
+
 def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
     """Handle read file operation."""
     try:
@@ -2341,16 +2362,30 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
 
         lang = LANG_MAP.get(p.suffix.lower(), "")
         console.print(f"[dim cyan]  {header}[/dim cyan]")
+        # Console shows a capped preview; the model still receives the full
+        # snippet in the return value. Rendering a several-thousand-line file
+        # through Rich syntax highlighting floods the terminal and is slow,
+        # and agent sessions read whole files constantly. Explicit
+        # offset/limit reads are shown in full — the model asked for exactly
+        # that range, so the user probably wants to see it.
+        display_lines = snippet.splitlines()
+        hidden = 0
+        if not (offset or limit) and len(display_lines) > _READ_PREVIEW_LINES + 10:
+            hidden = len(display_lines) - _READ_PREVIEW_LINES
+            display_lines = display_lines[:_READ_PREVIEW_LINES]
+        display = "\n".join(display_lines)
         if lang:
             try:
                 console.print(
-                    Syntax(snippet, lang, line_numbers=True, start_line=start_line, theme="monokai", word_wrap=False)
+                    Syntax(display, lang, line_numbers=True, start_line=start_line, theme="monokai", word_wrap=False)
                 )
             except Exception:
-                console.print(snippet)
+                console.print(display)
         else:
-            for i, ln in enumerate(snippet.splitlines(), start=start_line):
+            for i, ln in enumerate(display_lines, start=start_line):
                 console.print(f"[dim]{i:>4}[/dim]  {ln}")
+        if hidden:
+            console.print(f"[dim]  ... {hidden} more lines (full content sent to the model)[/dim]")
 
         return f"{header}\n\n{snippet}"
     except Exception as e:
@@ -3375,6 +3410,7 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
 
     pending_verify = False
     verify_rejections = 0
+    agent_replies: list[str] = []
     try:
         for iteration in range(1, max_iter + 1):
             console.print(Rule(f"[dim]Agent {iteration}/{max_iter}[/dim]", style="dim"))
@@ -3393,8 +3429,7 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
                 break
 
             working.append({"role": "assistant", "content": reply})
-            history.append({"role": "user", "content": f"[Agent task] {goal}" if iteration == 1 else "[continue]"})
-            history.append({"role": "assistant", "content": reply})
+            agent_replies.append(reply)
 
             pending_verify = _verification_pending(list(_last_turn_tool_names), pending_verify)
 
@@ -3432,6 +3467,12 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
     finally:
         # Auto-approve granted for this run must not leak into the interactive session.
         _auto_approve = restore_auto
+        # Record ONE consolidated turn instead of a "[continue]"/reply pair per
+        # iteration — saved sessions used to replay agent scaffolding as real
+        # conversation. All iteration replies are preserved, joined in order.
+        if agent_replies:
+            history.append({"role": "user", "content": f"[Agent task] {goal}"})
+            history.append({"role": "assistant", "content": "\n\n---\n\n".join(agent_replies)})
 
 
 def cmd_git_commit(client: object, msg: str = "") -> None:
@@ -5067,7 +5108,25 @@ def main() -> None:
         _idx = _cli_args.index("--task")
         if _idx + 1 < len(_cli_args):
             _auto_task = _cli_args[_idx + 1]
-            sys.argv = [sys.argv[0], *_cli_args[:_idx], *_cli_args[_idx + 2 :]]
+            _cli_args = [*_cli_args[:_idx], *_cli_args[_idx + 2 :]]
+            sys.argv = [sys.argv[0], *_cli_args]
+
+    # Session resume: -c/--continue reloads the autosave, -r/--resume <name>
+    # fuzzy-loads a named session (same matching as /load). None = fresh start.
+    _resume_arg: str | None = None
+    if "-c" in _cli_args or "--continue" in _cli_args:
+        _cli_args = [a for a in _cli_args if a not in ("-c", "--continue")]
+        _resume_arg = ""
+    for _flag in ("-r", "--resume"):
+        if _flag in _cli_args:
+            _idx = _cli_args.index(_flag)
+            if _idx + 1 < len(_cli_args):
+                _resume_arg = _cli_args[_idx + 1]
+                _cli_args = [*_cli_args[:_idx], *_cli_args[_idx + 2 :]]
+            else:
+                print(f"[usage: qwen {_flag} <session name>]", file=sys.stderr)
+                _cli_args.remove(_flag)
+    sys.argv = [sys.argv[0], *_cli_args]
 
     # --task (spawned agents — see team_spawn_agent) and piped mode essentially
     # never touch /lsp diagnostics, so the prewarm below is pure overhead for
@@ -5090,12 +5149,6 @@ def main() -> None:
         # Run off the main thread: even with _create_server()'s internal timeout,
         # nothing should ever block the user from reaching the prompt at startup.
         threading.Thread(target=_lsp_prewarm, daemon=True, name="lsp-prewarm").start()
-
-    from qwen_cli.core.context import clean_old_snapshots as _clean_snaps
-
-    _removed = _clean_snaps(keep=5)
-    if _removed:
-        _logger.debug("Cleaned %d old context snapshots", _removed)
 
     client = make_client()
     _cli_client = client
@@ -5120,6 +5173,25 @@ def main() -> None:
         return
 
     base_system, history, ctx = _repl_setup(client)
+
+    if _resume_arg is not None:
+        if _resume_arg == "":
+            try:
+                h, s = load_session("autosave")
+            except Exception as _load_err:  # corrupt autosave must not block startup
+                console.print(f"[yellow][could not read autosave: {_load_err}][/yellow]")
+                h, s = None, None
+            if h is not None:
+                turns = sum(1 for m in h if m.get("role") == "assistant")
+                console.print(f"[green][continuing previous session — {turns} turns][/green]")
+                history, base_system = h, (s or base_system)
+            else:
+                console.print("[yellow][no autosaved session to continue][/yellow]")
+        else:
+            history, base_system = cmd_load_session(_resume_arg, history, base_system)
+        ctx.history, ctx.base_system = history, base_system
+        _real_ctx_tokens = 0  # token count from any prior context no longer applies
+
     try:
         _repl_loop(ctx, history, base_system)
     except Exception as _fatal:

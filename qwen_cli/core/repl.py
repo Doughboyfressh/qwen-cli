@@ -32,7 +32,7 @@ def _setup_tab_completion() -> None:
 
         def completer(text: str, state: int) -> str | None:
             if text.startswith("/"):
-                options = [c + " " for c in _main._COMMANDS if c.startswith(text)]
+                options = [c + " " for c in _main._all_commands() if c.startswith(text)]
             elif text.startswith("@") or "/" in text or "\\" in text:
                 raw = text.lstrip("@")
                 pre = "@" if text.startswith("@") else ""
@@ -78,7 +78,7 @@ def _make_pt_session() -> None:
             text = document.text_before_cursor
             word = text.split()[-1] if text.split() else text
             if text.lstrip().startswith("/"):
-                for cmd in _main._COMMANDS:
+                for cmd in _main._all_commands():
                     if cmd.startswith(word):
                         yield _PtCompletion(cmd[len(word) :], start_position=0, display=cmd)
                 return
@@ -317,23 +317,23 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
 
 
 def _dispatch_command(ctx: _ReplContext, directive: str, arg: str) -> bool:
-    from qwen_cli.core.commands import _REPL_COMMANDS, _cmd_unknown
+    from qwen_cli.core.commands import _REPL_COMMANDS, _cmd_unknown, _run_custom_command
 
     handler = _REPL_COMMANDS.get(directive)
-    if handler:
-        try:
+    try:
+        if handler:
             handler(ctx, arg)
-        except StopIteration:
-            return True
-        except KeyboardInterrupt:
-            console.print("\n[dim][cancelled][/dim]")
-        except Exception as e:
-            # A bug in any single command must not end the whole session —
-            # mirror the recovery the plain-chat turn path already gets.
-            _logger.exception("Unhandled error in command %s", directive)
-            console.print(Panel(str(e), title=f"[bold red]Error running {directive}[/bold red]", border_style="red"))
-    else:
-        _cmd_unknown(ctx, directive)
+        elif not _run_custom_command(ctx, directive, arg):
+            _cmd_unknown(ctx, directive)
+    except StopIteration:
+        return True
+    except KeyboardInterrupt:
+        console.print("\n[dim][cancelled][/dim]")
+    except Exception as e:
+        # A bug in any single command must not end the whole session —
+        # mirror the recovery the plain-chat turn path already gets.
+        _logger.exception("Unhandled error in command %s", directive)
+        console.print(Panel(str(e), title=f"[bold red]Error running {directive}[/bold red]", border_style="red"))
     return False
 
 

@@ -46,10 +46,3 @@ def lsp_client():
     """The qwen_cli.tools.lsp module."""
     _import_module("qwen_cli.tools.lsp")
     return sys.modules["qwen_cli.tools.lsp"]
-
-
-@pytest.fixture(scope="session")
-def qwen_context():
-    """The qwen_cli.core.context module."""
-    _import_module("qwen_cli.core.context")
-    return sys.modules["qwen_cli.core.context"]
