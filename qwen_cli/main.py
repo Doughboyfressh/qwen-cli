@@ -2166,7 +2166,7 @@ def do_run_command(
             _audit_log(command, work_dir, "declined_by_user")
             return "[command cancelled by user]"
     elif not quiet:
-        console.print(f"[bold yellow]  [run_command][/bold yellow] {command}")
+        pass  # silent by default; output still captured in return value
 
     proc_env = {**os.environ, **env} if env else None
     stdout_buf: list[str] = []
@@ -2221,16 +2221,15 @@ def do_run_command(
             except BrokenPipeError:
                 pass
 
-        def _pipe(stream, buf: list[str], style: str) -> None:
-            """Internal helper: pipe."""
+        def _pipe(stream, buf: list[str]) -> None:
+            """Internal helper: pipe stream into buffer."""
             for line in stream:
                 if cancelled.is_set():
                     break
                 buf.append(line)
-                console.print(f"[{style}]{line.rstrip()}[/{style}]")
 
-        t_out = threading.Thread(target=_pipe, args=(proc.stdout, stdout_buf, "dim"), daemon=True)
-        t_err = threading.Thread(target=_pipe, args=(proc.stderr, stderr_buf, "dim yellow"), daemon=True)
+        t_out = threading.Thread(target=_pipe, args=(proc.stdout, stdout_buf), daemon=True)
+        t_err = threading.Thread(target=_pipe, args=(proc.stderr, stderr_buf), daemon=True)
         t_out.start()
         t_err.start()
 
@@ -2351,31 +2350,18 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
             end = (start + limit) if limit else total
             snippet = "\n".join(lines[start:end])
             header = f"{p}  (lines {start + 1}–{min(end, total)} of {total})"
-            start_line = start + 1
         else:
             if len(raw) > 150_000:
                 text = text[:150_000] + "\n... [truncated at 150 KB]"
                 lines = text.splitlines()
             snippet = "\n".join(lines)
             header = f"{p}  ({total} lines)"
-            start_line = 1
 
         lang = LANG_MAP.get(p.suffix.lower(), "")
-        console.print(f"[dim cyan]  {header}[/dim cyan]")
-        # Console shows a capped preview; the model still receives the full
-        # snippet in the return value. Rendering a several-thousand-line file
-        # through Rich syntax highlighting floods the terminal and is slow,
-        # and agent sessions read whole files constantly. Explicit
-        # offset/limit reads are shown in full — the model asked for exactly
-        # that range, so the user probably wants to see it.
-        display_lines = snippet.splitlines()
-        hidden = 0
-        if not (offset or limit) and len(display_lines) > _READ_PREVIEW_LINES + 10:
-            hidden = len(display_lines) - _READ_PREVIEW_LINES
-            display_lines = display_lines[:_READ_PREVIEW_LINES]
-        display = "\n".join(display_lines)
-        if lang:
-            console.print(f"[dim]read {p} ({total_lines} lines, {p.stat().st_size} bytes)[/dim]")
+        # Console shows a brief summary; the model receives the full snippet.
+        # Rendering large files through Rich syntax highlighting floods the
+        # terminal and is slow. Agent sessions read whole files constantly.
+        console.print(f"[dim]read {p} ({total} lines, {p.stat().st_size} bytes)[/dim]")
 
         return f"{header}\n\n{snippet}"
     except Exception as e:
