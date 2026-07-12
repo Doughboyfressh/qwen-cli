@@ -139,12 +139,13 @@ class TestResumeFlags:
 
 
 # ---------------------------------------------------------------------------
-# read_file console preview cap
+# read_file console output — one dim summary line, never file content
+# (the preview cap was removed in "Reduce console output" — 274949b)
 # ---------------------------------------------------------------------------
 
 
 class TestReadPreview:
-    def test_full_read_returns_everything_but_previews_console(self, qwen_cli, tmp_path, monkeypatch):
+    def test_full_read_returns_everything_but_one_summary_line(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "big.txt"
         content = "\n".join(f"line {i}" for i in range(1, 201))
         p.write_text(content, encoding="utf-8")
@@ -155,9 +156,10 @@ class TestReadPreview:
         result = qwen_cli.do_read_file(str(p))
 
         assert "line 200" in result  # model gets the whole file
-        assert any("more lines (full content sent to the model)" in s for s in printed)
+        assert any("200 lines" in s for s in printed)  # console gets a summary line
+        assert not any("line 1" in s and "line 2" in s for s in printed)  # ...not the content
 
-    def test_small_file_not_capped(self, qwen_cli, tmp_path, monkeypatch):
+    def test_small_file_summary_only(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "small.txt"
         p.write_text("\n".join(f"line {i}" for i in range(1, 11)), encoding="utf-8")
         printed = []
@@ -165,9 +167,9 @@ class TestReadPreview:
         monkeypatch.setattr(qwen_cli, "_turn_read_cache", set())
         result = qwen_cli.do_read_file(str(p))
         assert "line 10" in result
-        assert not any("more lines" in s for s in printed)
+        assert any("10 lines" in s for s in printed)
 
-    def test_explicit_range_shown_in_full(self, qwen_cli, tmp_path, monkeypatch):
+    def test_explicit_range_returned_in_full(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "big.txt"
         p.write_text("\n".join(f"line {i}" for i in range(1, 201)), encoding="utf-8")
         printed = []
@@ -175,7 +177,6 @@ class TestReadPreview:
         monkeypatch.setattr(qwen_cli, "_turn_read_cache", set())
         result = qwen_cli.do_read_file(str(p), offset=1, limit=100)
         assert "line 100" in result
-        assert not any("more lines (full content" in s for s in printed)
 
 
 # ---------------------------------------------------------------------------

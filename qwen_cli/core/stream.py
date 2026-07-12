@@ -22,6 +22,13 @@ _logger = logging.getLogger(__name__)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 _XML_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
 _XML_PARAM_RE = re.compile(r'<parameter\s+name=["\']([^"\']+)["\']>(.*?)</parameter>', re.DOTALL)
+# Format C (Llama-style, Qwen drifts into it on long contexts):
+#   <function=name> <parameter=key> value <parameter=key2> value2 </function>
+_FN_EQ_RE = re.compile(r"<function=([^>\s]+)>", re.IGNORECASE)
+_PARAM_EQ_RE = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*(?=<parameter=|</function|$)",
+    re.DOTALL | re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -668,6 +675,25 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list]:
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(args)},
                 }
+        # Format C: <function=name> <parameter=key> value ...
+        if tc is None:
+            fn_m = _FN_EQ_RE.search(body)
+            if fn_m:
+                args = {}
+                for key, raw_val in _PARAM_EQ_RE.findall(body):
+                    val = raw_val.strip()
+                    try:
+                        # JSON-typed values (arrays, objects, numbers) arrive as
+                        # bare text here — decode so e.g. update_plan's steps
+                        # array isn't passed as a string.
+                        args[key] = json.loads(val)
+                    except (json.JSONDecodeError, ValueError):
+                        args[key] = val
+                tc = {
+                    "id": f"xml_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {"name": fn_m.group(1).strip(), "arguments": json.dumps(args)},
+                }
         if tc:
             tool_calls.append(tc)
             clean = clean.replace(m.group(0), "")
@@ -852,6 +878,18 @@ def stream_once(client: object, messages: list, use_tools: bool, update_fn=None)
         clean_text, xml_calls = _parse_xml_tool_calls(full_text)
         if xml_calls:
             return clean_text, xml_calls, usage
+
+    # Tools disabled (e.g. the forced no-tools synthesis round after the tool
+    # budget is exhausted) but the model emitted tool syntax anyway: strip it
+    # rather than leaking raw <tool_call> markup to the user and into history.
+    if not use_tools and "<tool_call>" in full_text.lower():
+        clean_text, xml_calls = _parse_xml_tool_calls(full_text)
+        if xml_calls:
+            names = ", ".join(tc["function"]["name"] for tc in xml_calls)
+            console.print(
+                f"[dim]  [dropped {len(xml_calls)} tool call(s) ({names}) — tool use unavailable for this reply][/dim]"
+            )
+            full_text = clean_text or f"[ran out of tool rounds before finishing — wanted to call: {names}]"
 
     return full_text, api_calls, usage
 

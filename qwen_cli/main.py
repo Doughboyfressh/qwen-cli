@@ -44,24 +44,43 @@ def _get_openai():
 # from tests that exercise failure paths.
 _LOG_FILE = os.environ.get("QWEN_LOG_FILE") or str(Path.home() / ".qwen-cli" / "qwen.log")
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_logging.basicConfig(
-    filename=_LOG_FILE,
-    level=_logging.INFO,
-    format=_LOG_FORMAT,
-)
+
+
+class _SafeRotatingFileHandler(_logging_handlers.RotatingFileHandler):
+    """Rollover that tolerates Windows file locks.
+
+    If any other handle is open on qwen.log (a second qwen-cli session, a
+    tail, an editor), os.rename fails with WinError 32 and the stock handler
+    dumps a '--- Logging error ---' traceback into the REPL mid-turn. Skip
+    that rollover instead and keep appending; rotation retries next time the
+    size threshold trips.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream is None:
+                self.stream = self._open()
+
+
 _logger = _logging.getLogger("qwen")
 try:
-    _h = _logging_handlers.RotatingFileHandler(
+    _h = _SafeRotatingFileHandler(
         _LOG_FILE, maxBytes=1_048_576, backupCount=3, encoding="utf-8"
     )
     _h.setFormatter(_logging.Formatter(_LOG_FORMAT))
-    _logger.handlers = [_h]
-    # Without this, every message is ALSO handled by basicConfig's root
-    # handler on the same file: each line landed twice, once with no
-    # timestamp (this handler had no formatter) and once formatted.
-    _logger.propagate = False
+    # The rotating handler goes on the ROOT logger and is the only handle on
+    # qwen.log. Previously basicConfig(filename=...) opened a second handle on
+    # the same file in this very process, so doRollover's rename always failed
+    # on Windows (WinError 32) — rotation could never succeed. Library logs
+    # still reach the file via root, and "qwen" propagates to it (no duplicate
+    # lines, since "qwen" itself has no handler).
+    _root_logger = _logging.getLogger()
+    _root_logger.setLevel(_logging.INFO)
+    _root_logger.handlers = [_h]
 except Exception:
-    _logger.handlers = []  # logging unavailable, fall back to root's handler
+    _logging.getLogger().addHandler(_logging.NullHandler())  # logging unavailable
 
 # ---------------------------------------------------------------------------
 # Config — constants from config.toml / env vars (qwen_cli/core/config.py)
@@ -4742,6 +4761,16 @@ def cmd_trim(history: list, client: object) -> list:
         if _session_changes:
             modified = ", ".join(Path(p).name for p in _session_changes)
             rolling_summary = f"[Files modified this session: {modified}]\n\n{rolling_summary}"
+        # Carry the visible plan across compaction deterministically — the LLM
+        # summary alone loses it, and the model then re-plans from scratch and
+        # redoes already-completed steps after every trim.
+        if _current_plan:
+            icon = {"completed": "x", "in_progress": "~", "pending": " "}
+            plan_txt = "\n".join(f"  [{icon[s['status']]}] {s['text']}" for s in _current_plan)
+            rolling_summary += (
+                "\n\nPlan state (already agreed with the user — do NOT re-plan or redo "
+                "completed steps; continue from the first unfinished step):\n" + plan_txt
+            )
         summary_msg = {
             "role": "system",
             "content": (
