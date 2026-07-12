@@ -102,9 +102,19 @@ REM --- Aux LLM Server (fast MoE for background work + /model switch) ---
 REM Started AFTER the main model has claimed its VRAM. All MoE expert layers
 REM live in system RAM (--n-cpu-moe 999, mmap'd); only attention/shared layers
 REM and the KV cache use the ~4 GB of VRAM the 27B leaves free. No mmproj:
-REM vision stays on the main model. Thinking is disabled at the template level:
-REM background calls use small max_tokens (15-250) and a thinking model burns
-REM them all on reasoning, returning empty content (verified live).
+REM vision stays on the main model.
+REM
+REM The server warns "tensor overrides to CPU are used with mmap enabled -
+REM consider using --no-mmap": do NOT. The model file is ~25 GB and this box
+REM has 32 GB RAM; --no-mmap would COMMIT all expert weights and starve the
+REM OS into pagefile thrashing. mmap keeps them as evictable file-backed
+REM pages, which is the only reason this fits.
+REM
+REM Thinking is disabled (--reasoning off; replaces the deprecated
+REM --chat-template-kwargs enable_thinking): background calls use small
+REM max_tokens (15-250) and a thinking model burns them all on reasoning,
+REM returning empty content. --reasoning off verified live 2026-07-11 on
+REM build 2.24.0: direct non-empty content, no <think>, no deprecation warning.
 REM If this server fails to start (e.g. OOM), the CLI runs fine without it -
 REM aux is strictly optional.
 set "AUX_MODEL_PATH=%USERPROFILE%\.lmstudio\models\unsloth\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf"
@@ -126,7 +136,7 @@ start "Qwen Aux LLM Server" "%LLAMA_PATH%" ^
   -np 1 ^
   -t 16 ^
   --flash-attn on ^
-  --chat-template-kwargs "{\"enable_thinking\":false}" ^
+  --reasoning off ^
   --log-file "%USERPROFILE%\.qwen-cli\llama-aux.log"
 set "_WAIT=0"
 :wait_aux
