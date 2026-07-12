@@ -228,7 +228,7 @@ _PLAN_STATUS_ICON = {"completed": "[green]x[/green]", "in_progress": "[cyan]~[/c
 # --- Enforced verification (agent mode) -------------------------------------
 # Tools that mutate files; after any of these, /agent will not accept AGENT_DONE
 # until at least one verifying tool has run.
-_MUTATING_FILE_TOOLS = frozenset({"patch_file", "write_file", "move_file", "delete_file"})
+_MUTATING_FILE_TOOLS = frozenset({"edit_file", "patch_file", "write_file", "move_file", "delete_file"})
 # Tools that count as verification (checking real state after a change).
 _VERIFYING_TOOLS = frozenset(
     {"read_file", "run_command", "run_script", "lsp_query", "search_files", "find_files", "list_directory"}
@@ -237,6 +237,11 @@ _last_turn_tool_names: list[str] = []  # tool names executed during the current 
 _turn_read_cache: set[tuple] = set()  # (path, offset, limit, mtime) already served this turn
 
 _model_params: dict = {}  # runtime overrides — layered on top of active preset
+
+# Auto-approve mode (/auto, /agent): file-edit confirmations are auto-accepted.
+# Dangerous shell commands still always prompt — parity with the "accept edits"
+# permission mode in other agent CLIs, where edits flow but rm -rf does not.
+_auto_approve = False
 
 _active_preset: str = _CFG.get("preset", "thinking") if _CFG.get("preset") in SAMPLING_PRESETS else "thinking"
 
@@ -314,6 +319,7 @@ _STATEFUL_TOOLS = frozenset(
         "run_command",
         "run_script",
         "write_file",
+        "edit_file",
         "patch_file",
         "move_file",
         "delete_file",
@@ -394,7 +400,7 @@ _HEDGE_RE = re.compile(
 )
 
 _MODE_PROMPTS: dict[str, str] = {
-    "code": "Mode: code — write minimal, correct, idiomatic code; no explanations unless asked; prefer patch_file over write_file; show diffs.",
+    "code": "Mode: code — write minimal, correct, idiomatic code; no explanations unless asked; prefer edit_file over write_file; show diffs.",
     "debug": "Mode: debug — trace root causes systematically; use run_command to check live state; read error output before suggesting fixes.",
     "explain": "Mode: explain — explain clearly with concrete examples; break complex ideas into steps; match depth to the question.",
     "creative": "Mode: creative — explore unusual approaches; don't be constrained by convention; think expansively before converging.",
@@ -471,8 +477,10 @@ BASE_SYSTEM = (
     "anti-bot sites or heavy JS (say so, fall back to fetch_url); your context window is finite and "
     "very long sessions may summarize or drop old history.\n\n"
     "# Tools\n\n"
-    "File & code: read_file, patch_file (prefer over write_file — smaller, safer diffs; only use "
-    "write_file for new files or full rewrites), move_file, delete_file, list_directory, find_files, "
+    "File & code: read_file, edit_file (PREFERRED for edits — exact-string replacement: copy the "
+    "text to change verbatim from the file, no line numbers or diff syntax), patch_file (unified "
+    "diff — only for one edit spanning many locations), write_file (new files or full rewrites "
+    "only), move_file, delete_file, list_directory, find_files, "
     "search_files, run_command (check real state, don't assume it), run_script, update_plan "
     "(visible progress checklist — see Working Discipline).\n"
     "Web & media: web_search, search_news (recent/breaking news specifically), fetch_url (fastest, "
@@ -592,6 +600,7 @@ HELP_TEXT = """
 | `/branch restore <name>` | Restore a branch |
 | `/search <query>` | Manual web search |
 | `/autosearch [mode]` | Auto web-search before answering: `off` · `smart` (default) · `aggressive` |
+| `/auto [on/off]` | Auto-approve mode: file edits apply without y/N prompts (dangerous commands still ask) |
 | `/save [name]` | Save session to JSON |
 | `/load [name]` | Load a session (fuzzy matches name or topic) |
 | `/sessions` | List saved sessions with topic and turn count |
@@ -665,7 +674,7 @@ HELP_TEXT = """
 
 ## Autonomous tools (Qwen calls these itself)
 
-`web_search` · `fetch_url` · `browser_action` · `run_command` · `run_script` · `read_file` · **`patch_file`** · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan`
+`web_search` · `fetch_url` · `browser_action` · `run_command` · `run_script` · `read_file` · **`edit_file`** · `patch_file` · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan`
 
 **Team tools:** `team_list` · `team_board` · `team_task_add` · `team_task_list` · `team_task_update` · `team_inbox_send` · `team_inbox_receive` · `team_spawn_agent`
 
@@ -868,6 +877,26 @@ def load_project_system(cwd: Path) -> str:
     return f.read_text(encoding="utf-8").strip() if f.exists() else ""
 
 
+# --- Prefix-stable system prompt --------------------------------------------
+# llama-server reuses its prompt cache only while the prompt PREFIX stays
+# byte-identical across turns. memory.md is rewritten by background
+# auto-extraction after nearly every turn and the intel feed by crawlers every
+# few minutes — injecting either live into the system prompt invalidated the
+# cache almost every turn, forcing a full ~20k-token prompt re-eval. They are
+# snapshotted here instead, refreshed only at natural full-reprocess points:
+# session start, /remember, /forget, /clear, and compaction (which rewrites
+# history anyway). Git state moved out of the prompt entirely — it changes on
+# every file edit — and is appended to the outgoing user message per turn
+# (see _inject_volatile_tail), where a change only costs the cache tail.
+_sysprompt_snapshot: dict = {}
+
+
+def refresh_system_snapshot() -> None:
+    """Re-read memory + intel into the system prompt. Each call is a prefix-cache invalidation point."""
+    _sysprompt_snapshot["memory"] = load_memory()
+    _sysprompt_snapshot["intel"] = intel_get_recent()
+
+
 def build_system_prompt(base: str) -> str:
     """Build System Prompt."""
     cwd = Path.cwd()
@@ -883,9 +912,6 @@ def build_system_prompt(base: str) -> str:
     proj_sys = load_project_system(cwd)
     if proj_sys:
         parts += ["", "=== Project Instructions ===", proj_sys, "=== End Project Instructions ==="]
-    git_ctx = get_git_context()
-    if git_ctx:
-        parts += ["", "=== Git State ===", git_ctx, "=== End Git State ==="]
     idx = _get_index(cwd)
     if idx:
         # ~5% of the window (tokens ≈ chars/4): uncapped this section alone
@@ -894,10 +920,12 @@ def build_system_prompt(base: str) -> str:
         idx_text = _format_symbol_index(idx, max_chars=TOKEN_LIMIT // 5)
         if idx_text:
             parts += ["", "=== Symbol Index ===", idx_text, "=== End Symbol Index ==="]
-    mem = load_memory()
+    if not _sysprompt_snapshot:
+        refresh_system_snapshot()
+    mem = _sysprompt_snapshot.get("memory", "")
     if mem:
         parts += ["", "=== Persistent Memory ===", mem, "=== End Memory ==="]
-    intel = intel_get_recent()
+    intel = _sysprompt_snapshot.get("intel", "")
     if intel:
         parts += ["", "=== Live Intelligence (background web feed) ===", intel, "=== End Live Intelligence ==="]
     pins = load_pins()
@@ -995,6 +1023,7 @@ _COMMANDS = [
     "/params",
     "/long",
     "/autosearch",
+    "/auto",
     "/agent",
     "/task",
     "/plan",
@@ -1792,8 +1821,8 @@ def show_context_breakdown(base_system: str, history: list) -> None:
     """Show Context Breakdown."""
     sys_text = build_system_prompt(base_system)
     sys_tok = len(sys_text) // 4
-    mem_tok = len(load_memory()) // 4
-    git_tok = len(get_git_context()) // 4
+    mem_tok = len(_sysprompt_snapshot.get("memory", "")) // 4
+    git_tok = len(get_git_context()) // 4  # injected per-turn at the tail, not in the system prompt
     pin_tok = sum(len(p) for p in load_pins()) // 4
 
     proj_msgs = [m for m in history if (m.get("content") or "").startswith("# Project Context")]
@@ -1809,10 +1838,10 @@ def show_context_breakdown(base_system: str, history: list) -> None:
     t.add_row("System prompt", f"{sys_tok:,} tok")
     if mem_tok:
         t.add_row("  └ memory", f"{mem_tok:,} tok")
-    if git_tok:
-        t.add_row("  └ git", f"{git_tok:,} tok")
     if pin_tok:
         t.add_row("  └ pins", f"{pin_tok:,} tok")
+    if git_tok:
+        t.add_row("Git state (per-turn)", f"{git_tok:,} tok")
     if proj_tok:
         t.add_row("Project ctx", f"{proj_tok:,} tok")
     chat_turns = sum(1 for m in history if m.get("role") == "assistant")
@@ -2043,6 +2072,17 @@ def _is_dangerous(command: str) -> bool:
         return True
     # Detect: pipe to shell/interpreter (curl/wget/echo ... | bash/sh/python/powershell/iex)
     return bool(re.search(r"\|\s*(bash|sh|zsh|fish|python\d*|perl|ruby|pwsh|powershell|iex|cmd)\b", command))
+
+
+def _confirm_action(prompt: str) -> bool:
+    """y/N gate for file mutations. Returns True without asking when /auto is on."""
+    if _auto_approve:
+        console.print(f"[dim]  {prompt} — auto-approved (/auto on)[/dim]")
+        return True
+    try:
+        return console.input(f"[bold yellow]  {prompt} [y/N]:[/bold yellow] ").strip().lower() == "y"
+    except (KeyboardInterrupt, EOFError):
+        return False
 
 
 _MAX_CMD_OUTPUT = 25_000
@@ -2317,6 +2357,80 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
         return f"[error: {e}]"
 
 
+def _lsp_post_edit_report(p: Path) -> None:
+    """Print post-edit diagnostics trend + broken-import report for a just-written file."""
+    try:
+        _lsp = _get_lsp()
+        if _lsp._is_code_file(str(p)):
+            post = _lsp.lsp_post_edit_check(str(p))
+            if post["new_errors"] > 0:
+                console.print(f"[dim red]  Post-edit: {post['new_errors']} new error(s) introduced[/dim red]")
+            if post["fixed_errors"] > 0:
+                console.print(f"[dim green]  Post-edit: {post['fixed_errors']} error(s) fixed[/dim green]")
+            imports = _lsp.lsp_check_imports(str(p))
+            if imports["broken"]:
+                console.print(f"[dim red]  Imports: {len(imports['broken'])} broken import(s)[/dim red]")
+    except Exception:
+        _logger.debug("LSP post-edit check failed for %s (non-critical)", p)
+
+
+def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Replace an exact string in a file — the model-friendly alternative to unified diffs."""
+    try:
+        p = _resolve(path)
+        if not p.exists():
+            return f"[file not found: {p}]"
+        if not old_string:
+            return "[edit_file error: old_string is empty — use write_file to create content]"
+        if old_string == new_string:
+            return "[edit_file error: old_string and new_string are identical — nothing to change]"
+        original = p.read_text(encoding="utf-8", errors="replace")
+        count = original.count(old_string)
+        if count == 0:
+            return (
+                "[edit_file error: old_string not found in the file. Re-read the file and copy the "
+                "text EXACTLY as it appears, including all whitespace and indentation.]"
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"[edit_file error: old_string occurs {count} times. Include more surrounding lines "
+                f"to make it unique, or pass replace_all=true to change every occurrence.]"
+            )
+        patched = original.replace(old_string, new_string)
+        if str(p) not in _session_changes:
+            _session_changes[str(p)] = original
+
+        preview_lines = list(
+            difflib.unified_diff(
+                original.splitlines(keepends=True),
+                patched.splitlines(keepends=True),
+                fromfile=f"a/{p.name}",
+                tofile=f"b/{p.name}",
+                lineterm="",
+            )
+        )
+        preview = "".join(preview_lines[:60])
+        if len(preview_lines) > 60:
+            preview += f"\n... ({len(preview_lines) - 60} more lines)"
+        console.print(Syntax(preview, "diff", theme="monokai"))
+        if not _confirm_action("Apply edit?"):
+            return "[edit cancelled by user]"
+
+        _backup_file(p)
+        p.write_text(patched, encoding="utf-8")
+        lines_changed = sum(
+            1 for ln in preview_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
+        )
+        console.print(
+            f"[bold yellow]  [edit_file][/bold yellow] {p}  "
+            f"({count if replace_all else 1} replacement(s), {lines_changed} lines changed)"
+        )
+        _lsp_post_edit_report(p)
+        return f"[edited: {p}  ({count if replace_all else 1} replacement(s), {lines_changed} lines changed)]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
 def do_patch_file(path: str, diff: str) -> str:
     """Handle patch file operation."""
     try:
@@ -2339,21 +2453,6 @@ def do_patch_file(path: str, diff: str) -> str:
                     )
         except Exception:
             _logger.debug("LSP pre-edit check failed for %s (non-critical)", p)
-
-        # Feature 6+10: Post-edit trend tracking + import check
-        try:
-            _lsp = _get_lsp()
-            if _lsp._is_code_file(str(p)):
-                post = _lsp.lsp_post_edit_check(str(p))
-                if post["new_errors"] > 0:
-                    console.print(f"[dim red]  Post-edit: {post['new_errors']} new error(s) introduced[/dim red]")
-                if post["fixed_errors"] > 0:
-                    console.print(f"[dim green]  Post-edit: {post['fixed_errors']} error(s) fixed[/dim green]")
-                imports = _lsp.lsp_check_imports(str(p))
-                if imports["broken"]:
-                    console.print(f"[dim red]  Imports: {len(imports['broken'])} broken import(s)[/dim red]")
-        except Exception:
-            _logger.debug("LSP post-edit check failed for %s (non-critical)", p)
 
         if not p.exists():
             return f"[file not found: {p}]"
@@ -2382,8 +2481,7 @@ def do_patch_file(path: str, diff: str) -> str:
         if len(preview_lines) > 60:
             preview += f"\n... ({len(preview_lines) - 60} more lines)"
         console.print(Syntax(preview, "diff", theme="monokai"))
-        answer = console.input("[bold yellow]  Apply patch? [y/N]:[/bold yellow] ").strip().lower()
-        if answer != "y":
+        if not _confirm_action("Apply patch?"):
             return "[patch cancelled by user]"
 
         # Backup and write. Uses the shared _backup_file() helper (same one
@@ -2401,6 +2499,9 @@ def do_patch_file(path: str, diff: str) -> str:
             1 for ln in preview_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
         console.print(f"[bold yellow]  [patch_file][/bold yellow] applied to {p}  ({lines_changed} lines changed)")
+        # Post-edit trend + import check — must run AFTER the write (it used to run
+        # before the patch was applied, so it was reporting on the pre-edit file).
+        _lsp_post_edit_report(p)
         return f"[patched: {p}  ({lines_changed} lines changed)]"
     except Exception as e:
         return f"[error: {e}]"
@@ -2638,28 +2739,12 @@ def do_write_file(path: str, content: str) -> str:
             if len(diff) > 80:
                 preview += f"\n... ({len(diff) - 80} more diff lines)"
             console.print(Syntax(preview, "diff", theme="monokai"))
-            answer = console.input("[bold yellow]  Overwrite? [y/N]:[/bold yellow] ").strip().lower()
-            if answer != "y":
+            if not _confirm_action("Overwrite?"):
                 return "[write cancelled by user]"
         p.write_text(content, encoding="utf-8")
         action = "updated" if existed else "created"
         console.print(f"[bold yellow]  [write_file][/bold yellow] {action}: {p}")
-
-        # Feature 6+10: Post-edit trend tracking + import check
-        try:
-            _lsp = _get_lsp()
-            if _lsp._is_code_file(str(p)):
-                post = _lsp.lsp_post_edit_check(str(p))
-                if post["new_errors"] > 0:
-                    console.print(f"[dim red]  Post-edit: {post['new_errors']} new error(s) introduced[/dim red]")
-                if post["fixed_errors"] > 0:
-                    console.print(f"[dim green]  Post-edit: {post['fixed_errors']} error(s) fixed[/dim green]")
-                imports = _lsp.lsp_check_imports(str(p))
-                if imports["broken"]:
-                    console.print(f"[dim red]  Imports: {len(imports['broken'])} broken import(s)[/dim red]")
-        except Exception:
-            _logger.debug("LSP post-edit/imports check failed for %s (non-critical)", p)
-
+        _lsp_post_edit_report(p)
         return f"[{action}: {p}  ({len(content):,} chars)]"
     except Exception as e:
         return f"[error: {e}]"
@@ -2675,14 +2760,7 @@ def do_move_file(src: str, dst: str) -> str:
         if d.is_dir():
             d = d / s.name
         if d.exists():
-            answer = (
-                console.input(
-                    f"[bold yellow]  {d} already exists. Overwrite? [y/N]:[/bold yellow] ",
-                )
-                .strip()
-                .lower()
-            )
-            if answer != "y":
+            if not _confirm_action(f"{d} already exists. Overwrite?"):
                 return "[move cancelled by user]"
             _backup_file(d)
         d.parent.mkdir(parents=True, exist_ok=True)
@@ -2704,8 +2782,7 @@ def do_delete_file(path: str) -> str:
         console.print(
             f"[bold red]  [delete_file][/bold red] {p}  ({_fmt_size(p.stat().st_size)})",
         )
-        answer = console.input("[bold yellow]  Permanently delete? [y/N]:[/bold yellow] ").strip().lower()
-        if answer != "y":
+        if not _confirm_action("Permanently delete?"):
             return "[delete cancelled by user]"
         _backup_file(p)
         p.unlink()
@@ -3277,67 +3354,84 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
         "Subagents have full access to all the same tools. You coordinate, they execute in parallel. "
         "When the goal is fully achieved and you have confirmed the result, end your response with exactly: AGENT_DONE"
     )
-    global _current_plan
+    global _current_plan, _auto_approve
     _current_plan = []
     console.print(f"[bold cyan]  Agent goal:[/bold cyan] {goal}")
     console.print(f"[dim]  (max {max_iter} iterations — Ctrl+C to stop)[/dim]")
+
+    # An "autonomous" loop that blocks on y/N for every file edit isn't autonomous —
+    # offer to auto-approve edits up front for the duration of this run only.
+    restore_auto = _auto_approve
+    if not _auto_approve:
+        try:
+            ans = console.input("[bold yellow]  Auto-approve file edits for this run? [Y/n]: [/bold yellow]").strip().lower()
+            if ans in ("", "y", "yes"):
+                _auto_approve = True
+        except (KeyboardInterrupt, EOFError):
+            pass
 
     working = list(history)
     working.append({"role": "user", "content": f"[Agent task] {goal}"})
 
     pending_verify = False
     verify_rejections = 0
-    for iteration in range(1, max_iter + 1):
-        console.print(Rule(f"[dim]Agent {iteration}/{max_iter}[/dim]", style="dim"))
-        # Keep the agent going across many iterations — summarize+preserve the task
-        # if the accumulated working set is nearing the context limit.
-        working = _maybe_autocompact(working, base_system, client)
-        msgs = [{"role": "system", "content": build_system_prompt(base_system) + agent_suffix}, *working]
-        try:
-            reply = run_turn(client, msgs, allow_tools=True)
-        except KeyboardInterrupt:
-            console.print("\n[dim]  \\[agent stopped][/dim]")
-            break
+    try:
+        for iteration in range(1, max_iter + 1):
+            console.print(Rule(f"[dim]Agent {iteration}/{max_iter}[/dim]", style="dim"))
+            # Keep the agent going across many iterations — summarize+preserve the task
+            # if the accumulated working set is nearing the context limit.
+            working = _maybe_autocompact(working, base_system, client)
+            msgs = [{"role": "system", "content": build_system_prompt(base_system) + agent_suffix}, *working]
+            try:
+                reply = run_turn(client, msgs, allow_tools=True)
+            except KeyboardInterrupt:
+                console.print("\n[dim]  \\[agent stopped][/dim]")
+                break
 
-        if not reply:
-            console.print("[red]  \\[agent error or cancelled — stopping][/red]")
-            break
+            if not reply:
+                console.print("[red]  \\[agent error or cancelled — stopping][/red]")
+                break
 
-        working.append({"role": "assistant", "content": reply})
-        history.append({"role": "user", "content": f"[Agent task] {goal}" if iteration == 1 else "[continue]"})
-        history.append({"role": "assistant", "content": reply})
+            working.append({"role": "assistant", "content": reply})
+            history.append({"role": "user", "content": f"[Agent task] {goal}" if iteration == 1 else "[continue]"})
+            history.append({"role": "assistant", "content": reply})
 
-        pending_verify = _verification_pending(list(_last_turn_tool_names), pending_verify)
+            pending_verify = _verification_pending(list(_last_turn_tool_names), pending_verify)
 
-        if re.search(r"\bAGENT_DONE\b", reply):
-            if pending_verify and verify_rejections < 3:
-                verify_rejections += 1
+            if re.search(r"\bAGENT_DONE\b", reply):
+                if pending_verify and verify_rejections < 3:
+                    verify_rejections += 1
+                    console.print(
+                        f"[yellow]  \\[AGENT_DONE rejected ({verify_rejections}/3) — "
+                        f"files were modified but never verified][/yellow]"
+                    )
+                    working.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "STOP — your AGENT_DONE was REJECTED. You modified files but never verified "
+                                "the changes. Verify now: run the tests, execute the code, or re-read the "
+                                "modified file(s) and confirm they are correct. State the evidence you found, "
+                                "then emit AGENT_DONE again."
+                            ),
+                        }
+                    )
+                    continue
+                if pending_verify:
+                    console.print(
+                        "[yellow]  \\[agent finished WITHOUT verification after 3 rejections — review changes manually][/yellow]"
+                    )
                 console.print(
-                    f"[yellow]  \\[AGENT_DONE rejected ({verify_rejections}/3) — "
-                    f"files were modified but never verified][/yellow]"
+                    f"[green]  \\[agent done in {iteration} iteration{'s' if iteration != 1 else ''}][/green]"
                 )
-                working.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "STOP — your AGENT_DONE was REJECTED. You modified files but never verified "
-                            "the changes. Verify now: run the tests, execute the code, or re-read the "
-                            "modified file(s) and confirm they are correct. State the evidence you found, "
-                            "then emit AGENT_DONE again."
-                        ),
-                    }
-                )
-                continue
-            if pending_verify:
-                console.print(
-                    "[yellow]  \\[agent finished WITHOUT verification after 3 rejections — review changes manually][/yellow]"
-                )
-            console.print(f"[green]  \\[agent done in {iteration} iteration{'s' if iteration != 1 else ''}][/green]")
-            break
+                break
 
-        working.append({"role": "user", "content": "Continue working toward the goal."})
-    else:
-        console.print(f"[yellow]  \\[agent reached max iterations ({max_iter}) — goal may be unfinished][/yellow]")
+            working.append({"role": "user", "content": "Continue working toward the goal."})
+        else:
+            console.print(f"[yellow]  \\[agent reached max iterations ({max_iter}) — goal may be unfinished][/yellow]")
+    finally:
+        # Auto-approve granted for this run must not leak into the interactive session.
+        _auto_approve = restore_auto
 
 
 def cmd_git_commit(client: object, msg: str = "") -> None:
@@ -4055,6 +4149,9 @@ _TOOL_HANDLERS_INTERACTIVE: dict[str, Callable[[dict], str]] = {
     "run_script": lambda a: do_run_script(
         a.get("language", ""), a.get("code", ""), cwd=a.get("cwd", ""), timeout=a.get("timeout", 30),
     ),
+    "edit_file": lambda a: do_edit_file(
+        a.get("path", ""), a.get("old_string", ""), a.get("new_string", ""), a.get("replace_all", False),
+    ),
     "patch_file": lambda a: do_patch_file(a.get("path", ""), a.get("diff", "")),
     "write_file": lambda a: do_write_file(a.get("path", ""), a.get("content", "")),
     "move_file": lambda a: do_move_file(a.get("src", ""), a.get("dst", "")),
@@ -4114,6 +4211,29 @@ def _auto_presearch(working: list) -> list:
     return new_working
 
 
+def _inject_volatile_tail(working: list) -> list:
+    """Append per-turn volatile context (git state) to the outgoing user message.
+
+    Lives at the tail of the conversation, not in the system prompt: git status
+    changes after every file edit, and a changed system prompt costs a full
+    prefix re-eval, while a changed tail costs only the last few hundred tokens.
+    Only the messages copy sent to the API is modified — the raw user input is
+    what lands in the saved history, so old turns stay byte-stable too.
+    """
+    git_ctx = get_git_context()
+    if not git_ctx:
+        return working
+    suffix = f"\n\n[Current git state — for reference]\n{git_ctx}"
+    new_working = list(working)
+    for i in range(len(new_working) - 1, -1, -1):
+        if new_working[i].get("role") == "user":
+            msg = dict(new_working[i])
+            msg["content"] = (msg.get("content") or "") + suffix
+            new_working[i] = msg
+            break
+    return new_working
+
+
 def _compact_tool_loop(working: list, keep_recent_tools: int = 4, head_chars: int = 240) -> list:
     """Shrink older tool results during an in-progress tool loop so a long agentic
     run doesn't overflow the context window before it finishes.
@@ -4155,6 +4275,8 @@ def run_turn(client: object, messages: list, allow_tools: bool = True, presearch
     del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
     _turn_read_cache.clear()  # fresh read-dedup window for this turn
     working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
+    if allow_tools:
+        working = _inject_volatile_tail(working)
     # Feature 10: Surface unresolved errors from prior turn
     try:
         trend = _get_lsp().lsp_trend_report()
@@ -4641,6 +4763,10 @@ def _maybe_autocompact(history: list, base_system: str, client) -> list:
         if len(history) >= before and pct >= 90:
             history = truncate_middle(history)
         _real_ctx_tokens = 0
+        # Compaction rewrites history, so the prefix cache is lost anyway — the
+        # one cheap moment to fold in memory/intel updates accumulated since the
+        # last snapshot (see refresh_system_snapshot).
+        refresh_system_snapshot()
         after_tok = approx_tokens([{"role": "system", "content": build_system_prompt(base_system)}, *history])
         console.print(
             f"[green]  [{label} done] freed context to {after_tok * 100 // TOKEN_LIMIT}% ({after_tok:,} tokens)[/green]",
@@ -4671,6 +4797,13 @@ def run_piped(client: object) -> None:
     prompt = f"{prefix}\n\n{piped}".strip() if prefix else piped
     if not prompt:
         sys.exit(0)
+
+    # stdin is exhausted, so y/N confirmations can never be answered in pipe
+    # mode — they now cancel cleanly via _confirm_action's EOF handling. Set
+    # QWEN_AUTO_APPROVE=1 to let piped runs apply file edits unattended.
+    global _auto_approve
+    if os.environ.get("QWEN_AUTO_APPROVE", "") == "1":
+        _auto_approve = True
 
     global console
     # Redirect Rich console to stderr so tool-activity lines don't pollute stdout

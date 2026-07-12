@@ -288,11 +288,39 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace an exact string in a file. PREFER this over patch_file and write_file for "
+                "targeted edits — no line numbers or diff syntax needed. Read the file first, then "
+                "pass the text to change EXACTLY as it appears (same whitespace and indentation). "
+                "old_string must occur exactly once in the file; include enough surrounding lines to "
+                "make it unique, or set replace_all=true to change every occurrence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path of the file to edit"},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact existing text to replace, copied verbatim from the file",
+                    },
+                    "new_string": {"type": "string", "description": "The replacement text"},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_string (default false)",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "patch_file",
             "description": (
-                "Apply a unified diff patch to a file. "
-                "PREFER this over write_file for targeted edits — only the changed lines are needed, "
-                "so it uses far less context and is safer. "
+                "Apply a unified diff patch to a file. Use edit_file for simple text replacements; "
+                "use this when a single edit spans many separate locations (multi-hunk). "
                 "Generate a standard unified diff (--- a/... +++ b/... @@ ... @@) and pass it here."
             ),
             "parameters": {
@@ -310,7 +338,7 @@ TOOLS = [
         "function": {
             "name": "write_file",
             "description": (
-                "Write the FULL content of a file. Use patch_file instead for targeted edits. "
+                "Write the FULL content of a file. Use edit_file instead for targeted edits. "
                 "Creates file if new; shows diff and asks confirmation before overwriting."
             ),
             "parameters": {
@@ -549,7 +577,7 @@ TOOLS = [
                 "USE THIS PROACTIVELY — whenever a task has 3+ independent parts, a subtask would take you "
                 "5+ tool calls, or you're iterating over a list, spawn an agent instead of doing it yourself. "
                 "Spawned agents have full access to ALL tools: web_search, fetch_url, fetch_rendered, "
-                "browser_action, run_command, run_script, read_file, patch_file, write_file, move_file, "
+                "browser_action, run_command, run_script, read_file, edit_file, patch_file, write_file, move_file, "
                 "delete_file, list_directory, find_files, search_files, ask_user, and all team tools. "
                 "After spawning, use team_board to track progress and team_inbox_receive to collect results."
             ),
@@ -834,7 +862,7 @@ def _short_args(name: str, args: dict) -> str:
         return repr(args.get("query", "")[:40])
     if name == "fetch_url":
         return repr(args.get("url", "")[:50])
-    if name in ("read_file", "write_file", "patch_file"):
+    if name in ("read_file", "write_file", "patch_file", "edit_file"):
         return repr(args.get("path", "")[:40])
     if name == "run_command":
         return repr(args.get("command", "")[:40])

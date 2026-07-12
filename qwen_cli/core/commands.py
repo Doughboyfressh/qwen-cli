@@ -72,6 +72,8 @@ def _cmd_clear(ctx: _ReplContext, arg: str) -> None:
     # History is about to shrink either way — the cached real prompt-token count
     # from the last API response no longer describes it (see _maybe_autocompact).
     _main._real_ctx_tokens = 0
+    # The prefix cache is lost with the history — fold in fresh memory/intel now.
+    _main.refresh_system_snapshot()
     if arg.isdigit():
         n = int(arg)
         drop = min(n * 2, len(ctx.history))
@@ -234,6 +236,7 @@ def _cmd_remember(ctx: _ReplContext, arg: str) -> None:
             # remembered facts rather than lumping them into one block that's
             # either kept or dropped wholesale.
             _main.save_memory((mem + f"\n\n- {arg}").strip())
+        _main.refresh_system_snapshot()  # explicit /remember should be visible immediately
         _main.console.print("[green][remembered — persists across sessions][/green]")
 
 
@@ -256,6 +259,7 @@ def _cmd_forget(ctx: _ReplContext, arg: str) -> None:
     if confirm == "y":
         with _main._memory_lock:
             _main.save_memory("")
+        _main.refresh_system_snapshot()
         _main.console.print("[dim][persistent memory cleared][/dim]")
     else:
         _main.console.print("[dim][cancelled][/dim]")
@@ -949,6 +953,25 @@ def _cmd_cd(ctx: _ReplContext, arg: str) -> None:
             _main.console.print(f"[red][error: {e}][/red]")
 
 
+def _cmd_auto(ctx: _ReplContext, arg: str) -> None:
+    """Toggle auto-approve mode: file-edit confirmations are accepted automatically."""
+    import qwen_cli.main as _main
+
+    arg = arg.strip().lower()
+    if arg == "on":
+        _main._auto_approve = True
+    elif arg == "off":
+        _main._auto_approve = False
+    elif arg:
+        _main.console.print("[yellow][usage: /auto on|off][/yellow]")
+        return
+    state = "[green]on[/green]" if _main._auto_approve else "[dim]off[/dim]"
+    _main.console.print(
+        f"  auto-approve: {state}  [dim](file edits apply without y/N prompts; "
+        f"dangerous shell commands still ask)[/dim]"
+    )
+
+
 def _cmd_unknown(ctx: _ReplContext, directive: str) -> None:
     """Handle unknown commands by printing an error and suggesting /help."""
     import qwen_cli.main as _main
@@ -1004,6 +1027,7 @@ _REPL_COMMANDS: dict[str, callable] = {
     "/params": _cmd_params,
     "/long": _cmd_long,
     "/autosearch": _cmd_autosearch,
+    "/auto": _cmd_auto,
     "/rollback": _cmd_rollback,
     "/review": _cmd_review,
     "/error": _cmd_error,
