@@ -2375,17 +2375,7 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
             display_lines = display_lines[:_READ_PREVIEW_LINES]
         display = "\n".join(display_lines)
         if lang:
-            try:
-                console.print(
-                    Syntax(display, lang, line_numbers=True, start_line=start_line, theme="monokai", word_wrap=False)
-                )
-            except Exception:
-                console.print(display)
-        else:
-            for i, ln in enumerate(display_lines, start=start_line):
-                console.print(f"[dim]{i:>4}[/dim]  {ln}")
-        if hidden:
-            console.print(f"[dim]  ... {hidden} more lines (full content sent to the model)[/dim]")
+            console.print(f"[dim]read {p} ({total_lines} lines, {p.stat().st_size} bytes)[/dim]")
 
         return f"{header}\n\n{snippet}"
     except Exception as e:
@@ -2435,7 +2425,12 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
         if str(p) not in _session_changes:
             _session_changes[str(p)] = original
 
-        preview_lines = list(
+        if not _confirm_action("Apply edit?"):
+            return "[edit cancelled by user]"
+
+        _backup_file(p)
+        p.write_text(patched, encoding="utf-8")
+        changed_lines = list(
             difflib.unified_diff(
                 original.splitlines(keepends=True),
                 patched.splitlines(keepends=True),
@@ -2444,17 +2439,8 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
                 lineterm="",
             )
         )
-        preview = "".join(preview_lines[:60])
-        if len(preview_lines) > 60:
-            preview += f"\n... ({len(preview_lines) - 60} more lines)"
-        console.print(Syntax(preview, "diff", theme="monokai"))
-        if not _confirm_action("Apply edit?"):
-            return "[edit cancelled by user]"
-
-        _backup_file(p)
-        p.write_text(patched, encoding="utf-8")
         lines_changed = sum(
-            1 for ln in preview_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
+            1 for ln in changed_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
         console.print(
             f"[bold yellow]  [edit_file][/bold yellow] {p}  "
