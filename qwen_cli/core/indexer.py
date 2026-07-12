@@ -242,11 +242,35 @@ def _load_symbol_index(root: Path, max_age_hours: int = 24) -> dict | None:
         return None
 
 
-def _format_symbol_index(index: dict) -> str:
+def _format_symbol_index(index: dict, max_chars: int | None = None) -> str:
+    """Render the index as one line per file, optionally capped at max_chars.
+
+    Uncapped, a mid-size project renders to ~20k+ chars (~5k tokens) — too
+    much to inject into every system prompt (measured at ~20% of a 28k-token
+    budget). The cap keeps whole lines in sorted order (deterministic, so the
+    prompt prefix stays byte-stable across turns for llama-server's prefix
+    cache) and names the spillover so the model knows to use lsp_query /
+    search_files for the rest.
+    """
     lines = []
     for rel, syms in sorted(index.items()):
         parts = [f"class {c['name']}" if isinstance(c, dict) else f"class {c}" for c in syms.get("classes", [])]
         parts += [f"{f}()" for f in syms.get("functions", [])]
         if parts:
             lines.append(f"{rel}: {', '.join(parts)}")
-    return "\n".join(lines)
+    if max_chars is None:
+        return "\n".join(lines)
+    kept: list[str] = []
+    used = 0
+    for i, ln in enumerate(lines):
+        if used + len(ln) + 1 > max_chars:
+            skipped = [line.split(":", 1)[0] for line in lines[i:]]
+            kept.append(
+                f"(index capped — {len(skipped)} more file(s) not listed: "
+                + ", ".join(skipped)
+                + ". Use lsp_query or search_files to inspect them.)"
+            )
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return "\n".join(kept)

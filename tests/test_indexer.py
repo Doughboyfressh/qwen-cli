@@ -248,3 +248,51 @@ def test_format_symbol_index_handles_both_class_shapes():
     out = idx._format_symbol_index(index)
     assert "a.py: class C, f()" in out
     assert "b.go: class Server, Run()" in out
+
+
+class TestFormatSymbolIndexCap:
+    """Uncapped, the symbol index injected ~5.4k tokens (~20% of the budget)
+    into every system prompt. The cap must be deterministic — the prompt
+    prefix has to stay byte-stable across turns for llama-server's cache."""
+
+    def _index(self, n_files=10, syms_per_file=8):
+        return {
+            f"pkg/mod{i:02d}.py": {
+                "classes": [f"Class{i}_{j}" for j in range(2)],
+                "functions": [f"func{i}_{j}" for j in range(syms_per_file)],
+            }
+            for i in range(n_files)
+        }
+
+    def test_no_cap_returns_everything(self, qwen_cli):
+        from qwen_cli.core.indexer import _format_symbol_index
+
+        text = _format_symbol_index(self._index())
+        assert text.count("\n") == 9
+        assert "capped" not in text
+
+    def test_under_cap_is_unchanged(self, qwen_cli):
+        from qwen_cli.core.indexer import _format_symbol_index
+
+        idx = self._index(n_files=2)
+        assert _format_symbol_index(idx, max_chars=10_000) == _format_symbol_index(idx)
+
+    def test_over_cap_keeps_whole_lines_and_names_spillover(self, qwen_cli):
+        from qwen_cli.core.indexer import _format_symbol_index
+
+        full = _format_symbol_index(self._index())
+        capped = _format_symbol_index(self._index(), max_chars=len(full) // 2)
+        assert len(capped) < len(full)
+        assert "capped" in capped
+        # every kept line is intact (present verbatim in the full render)
+        kept_lines = capped.splitlines()[:-1]
+        assert all(ln in full for ln in kept_lines)
+        # the summary line names files that were dropped
+        assert "mod09" in capped.splitlines()[-1]
+
+    def test_cap_is_deterministic(self, qwen_cli):
+        from qwen_cli.core.indexer import _format_symbol_index
+
+        a = _format_symbol_index(self._index(), max_chars=300)
+        b = _format_symbol_index(self._index(), max_chars=300)
+        assert a == b

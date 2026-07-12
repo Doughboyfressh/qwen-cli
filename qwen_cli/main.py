@@ -888,7 +888,10 @@ def build_system_prompt(base: str) -> str:
         parts += ["", "=== Git State ===", git_ctx, "=== End Git State ==="]
     idx = _get_index(cwd)
     if idx:
-        idx_text = _format_symbol_index(idx)
+        # ~5% of the window (tokens ≈ chars/4): uncapped this section alone
+        # measured ~5.4k tokens (~20% of the budget) on a mid-size project,
+        # every turn. The model has lsp_query/search_files for the rest.
+        idx_text = _format_symbol_index(idx, max_chars=TOKEN_LIMIT // 5)
         if idx_text:
             parts += ["", "=== Symbol Index ===", idx_text, "=== End Symbol Index ==="]
     mem = load_memory()
