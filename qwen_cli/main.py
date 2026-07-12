@@ -134,6 +134,7 @@ from qwen_cli.core.config import (  # noqa: E402
 _CFG = _config._load_config()
 ACTIVE_BACKEND = "llama.cpp"  # updated at startup if fallback activates
 AUTO_SEARCH_MODE = _config.AUTO_SEARCH_MODE
+TOOL_GROUPS_MODE = _config.TOOL_GROUPS_MODE
 
 from qwen_cli.core.indexer import (  # noqa: E402
     IGNORE_DIRS,
@@ -243,6 +244,42 @@ _focus_set: list[str] = []  # files loaded via /focus this session
 _session_changes: dict[str, str] = {}  # path → original content before first edit
 _tool_call_retry_log: dict[int, list] = {}  # depth → list of (tool, error) for retry context
 
+# --- On-demand tool groups (enable_tools; see stream.py header) --------------
+# Sticky for the session: once a group is enabled its schemas stay in every
+# later call, so the prompt prefix remains cache-stable.
+_enabled_tool_groups: set[str] = set()
+
+
+def active_tools() -> list:
+    """The tool schemas to send: core + session-enabled groups (or everything
+    in 'all' mode). Sorted group order keeps the serialized prompt stable."""
+    from qwen_cli.core.stream import CORE_TOOLS, TOOL_GROUPS
+
+    if TOOL_GROUPS_MODE == "all":
+        return TOOLS
+    tools = list(CORE_TOOLS)
+    for group in sorted(_enabled_tool_groups):
+        tools.extend(TOOL_GROUPS[group])
+    return tools
+
+
+def do_enable_tools(group: str) -> str:
+    """Tool handler: enable an optional tool group for the rest of the session."""
+    from qwen_cli.core.stream import TOOL_GROUPS
+
+    g = (group or "").strip().lower()
+    targets = list(TOOL_GROUPS) if g == "all" else [g]
+    if g != "all" and g not in TOOL_GROUPS:
+        return f"[enable_tools error: unknown group '{group}' — available: {', '.join(TOOL_GROUPS)}, all]"
+    new = [t for t in targets if t not in _enabled_tool_groups]
+    if not new:
+        return f"[tool group(s) already enabled: {', '.join(targets)} — call the tools directly]"
+    _enabled_tool_groups.update(new)
+    names = ", ".join(t["function"]["name"] for grp in new for t in TOOL_GROUPS[grp])
+    console.print(f"[dim]  [tools] enabled group(s): {', '.join(new)}[/dim]")
+    return f"[enabled tool group(s) {', '.join(new)} for this session — now available: {names}]"
+
+
 # --- Visible plan / progress tracking (/agent, /task, update_plan tool) -----
 _current_plan: list[dict] = []  # [{"text": str, "status": "pending"|"in_progress"|"completed"}, ...]
 _PLAN_STATUS_ICON = {"completed": "[green]x[/green]", "in_progress": "[cyan]~[/cyan]", "pending": " "}
@@ -327,6 +364,7 @@ MEMORY_MAX_CHARS = 8000
 
 _PARALLEL_TOOLS = frozenset(
     {
+        "enable_tools",
         "update_plan",
         "web_search",
         "search_news",
@@ -497,10 +535,10 @@ BASE_SYSTEM = (
     "- Math/logic: use run_script for reliable computation instead of claiming you're unreliable at "
     "arithmetic.\n"
     "- Files, shell, browser: full local filesystem access, arbitrary shell commands, and real "
-    "browser automation (navigate, click, fill forms, screenshot) — these aren't hypothetical, use "
-    "them.\n"
-    "- Videos/images: get_video_transcript and describe_image work on any URL — never say you can't "
-    "watch a video or see an image.\n"
+    "browser automation (navigate, click, fill forms, screenshot; enable_tools('browser')) — these "
+    "aren't hypothetical, use them.\n"
+    "- Videos/images: get_video_transcript and describe_image (enable_tools('media')) work on any "
+    "URL — never say you can't watch a video or see an image.\n"
     "Real limitations, worth being honest about: no independent phone calls or emails; no account/"
     "service access without credentials the user provides; browser automation can fail on strong "
     "anti-bot sites or heavy JS (say so, fall back to fetch_url); your context window is finite and "
@@ -512,20 +550,18 @@ BASE_SYSTEM = (
     "only), move_file, delete_file, list_directory, find_files, "
     "search_files, run_command (check real state, don't assume it), run_script, update_plan "
     "(visible progress checklist — see Working Discipline).\n"
-    "Web & media: web_search, search_news (recent/breaking news specifically), fetch_url (fastest, "
-    "no JS) -> fetch_rendered (Playwright, JS-rendered, read-only) -> browser_action (slowest — "
-    "forms/clicks/interaction only), describe_image, get_video_transcript.\n"
-    "Other: ask_user for genuine ambiguity (not simple yes/no confirmations — just proceed), plus "
-    "full team coordination below.\n\n"
-    "# Team Coordination\n\n"
-    "team_list, team_board, team_task_add/list/update, team_inbox_send/receive, team_spawn_agent. "
-    "Spawn subagents proactively — you're the coordinator, not obligated to do everything yourself:\n"
-    "- 3+ independent subtasks -> one agent per subtask\n"
-    "- research and implementation can run in parallel -> spawn a researcher and a coder\n"
-    "- processing a list (N files, N pages, N endpoints) -> spawn N agents\n"
-    "- a subtask alone would take 5+ tool calls -> delegate it\n"
-    "Subagents get every tool you have. Track progress via team_board, collect results via "
-    "team_inbox_receive.\n\n"
+    "Web: web_search, search_news (recent/breaking news specifically), fetch_url (fastest, no JS).\n"
+    "On-demand groups — call enable_tools(group) once, then use them for the rest of the session: "
+    "'browser' (fetch_rendered — JS-rendered read-only fetch; browser_action — forms/clicks/"
+    "interaction), 'media' (describe_image, get_video_transcript), 'team' (subagents — see below).\n"
+    "Other: ask_user for genuine ambiguity (not simple yes/no confirmations — just proceed).\n\n"
+    "# Subagents\n\n"
+    "enable_tools('team') gives task boards, inboxes, and team_spawn_agent. All agents share ONE "
+    "inference slot on the local server: they run serially, not in parallel, and every switch "
+    "between agent contexts re-processes a full prompt. Spawn an agent only for a substantial "
+    "independent subtask (10+ tool calls) that can proceed unattended while you keep working — "
+    "never for small chores, per-file processing, or anything you can do inline in a few calls. "
+    "Track progress via team_board, collect results via team_inbox_receive.\n\n"
     "# Accuracy\n\n"
     "Web search results are usually injected automatically before you reply, under '[Auto web "
     "search results...]' — read and use them; call web_search again with a sharper query if they're "
@@ -703,9 +739,9 @@ HELP_TEXT = """
 
 ## Autonomous tools (Qwen calls these itself)
 
-`web_search` · `fetch_url` · `browser_action` · `run_command` · `run_script` · `read_file` · **`edit_file`** · `patch_file` · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan`
+`web_search` · `fetch_url` · `run_command` · `run_script` · `read_file` · **`edit_file`** · `patch_file` · `write_file` · `move_file` · `delete_file` · `list_directory` · `find_files` · `search_files` · `ask_user` · `update_plan` · `enable_tools`
 
-**Team tools:** `team_list` · `team_board` · `team_task_add` · `team_task_list` · `team_task_update` · `team_inbox_send` · `team_inbox_receive` · `team_spawn_agent`
+**On-demand groups** (model enables via `enable_tools`, or set `tool_groups = "all"` in config.toml): `browser` (`browser_action`, `fetch_rendered`) · `media` (`describe_image`, `get_video_transcript`) · `team` (`team_list`, `team_board`, `team_task_add/list/update`, `team_inbox_send/receive`, `team_spawn_agent`)
 
 Team data lives in `~/.clawteam/` and is compatible with the ClawTeam CLI if installed.
 
@@ -4166,6 +4202,7 @@ def do_update_plan(steps: list) -> str:
 
 
 _TOOL_HANDLERS_SAFE: dict[str, Callable[[dict], str]] = {
+    "enable_tools": lambda a: do_enable_tools(a.get("group", "")),
     "update_plan": lambda a: do_update_plan(a.get("steps", [])),
     "web_search": lambda a: _call_with_timeout(
         "web_search", do_web_search, a.get("query", ""), timeout=_TOOL_TIMEOUT_SLOW,
@@ -5042,7 +5079,7 @@ def run_piped(client: object) -> None:
                 model=MODEL,
                 messages=messages,
                 stream=True,
-                tools=TOOLS,
+                tools=active_tools(),
                 tool_choice="auto",
             )
             tc_buf: dict[int, dict] = {}

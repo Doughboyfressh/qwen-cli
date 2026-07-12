@@ -634,6 +634,9 @@ def _cmd_team(ctx: _ReplContext, arg: str) -> None:
     """Manage teams: create, list, show board, or join a team."""
     import qwen_cli.main as _main
 
+    # The user is doing team work — make the team tool group available to the
+    # model without it having to call enable_tools first.
+    _main._enabled_tool_groups.add("team")
     sub_parts = arg.split(None, 2)
     sub = sub_parts[0].lower() if sub_parts else "list"
     sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
@@ -673,6 +676,7 @@ def _cmd_spawn(ctx: _ReplContext, arg: str) -> None:
     """Spawn a sub-agent on a team to execute a task autonomously."""
     import qwen_cli.main as _main
 
+    _main._enabled_tool_groups.add("team")
     spawn_parts = arg.split(None, 2)
     if len(spawn_parts) < 3:
         _main.console.print("[yellow][usage: /spawn <team> <agent_name> <task>][/yellow]")
@@ -686,6 +690,7 @@ def _cmd_inbox(ctx: _ReplContext, arg: str) -> None:
     """Read or send messages in a team inbox."""
     import qwen_cli.main as _main
 
+    _main._enabled_tool_groups.add("team")
     inbox_parts = arg.split(None, 3)
     sub = inbox_parts[0].lower() if inbox_parts else ""
     if sub == "send":
@@ -718,6 +723,7 @@ def _cmd_board(ctx: _ReplContext, arg: str) -> None:
     """Display the task board for a team (or all teams)."""
     import qwen_cli.main as _main
 
+    _main._enabled_tool_groups.add("team")
     if not arg:
         teams = _main._ct_team_list()
         if not teams:

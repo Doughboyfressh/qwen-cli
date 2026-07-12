@@ -137,6 +137,14 @@ AUTO_SEARCH_MODE = _cfg("auto_search", "QWEN_AUTO_SEARCH", "smart").lower()
 if AUTO_SEARCH_MODE not in ("off", "smart", "aggressive"):
     AUTO_SEARCH_MODE = "aggressive"
 
+# "auto": optional tool groups (browser/media/team) are sent only after the
+# model enables them via enable_tools — their schemas are context the 28k
+# window can't spare on turns that never use them. "all": always send every
+# tool (pre-gating behavior; also set for spawned team agents via env).
+TOOL_GROUPS_MODE = _cfg("tool_groups", "QWEN_TOOL_GROUPS", "auto").lower()
+if TOOL_GROUPS_MODE not in ("auto", "all"):
+    TOOL_GROUPS_MODE = "auto"
+
 for _d in (SESSIONS_DIR, EXPORTS_DIR, BACKUPS_DIR, INDEX_DIR, CT_DIR, INTEL_DIR, COMMANDS_DIR):
     _d.mkdir(exist_ok=True)
 

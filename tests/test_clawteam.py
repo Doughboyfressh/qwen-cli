@@ -367,6 +367,23 @@ class TestSpawn:
         assert args[2] == "--task"
         assert "creationflags" in captured["kwargs"]
 
+    def test_ct_spawn_child_gets_all_tool_groups(self, ct, monkeypatch):
+        # The agent brief references browser and team tools directly, so the
+        # child session must bypass tool-group gating from the start.
+        captured = {}
+
+        def fake_popen(args, **kwargs):
+            captured["kwargs"] = kwargs
+
+            class _P:
+                pid = 1234
+
+            return _P()
+
+        monkeypatch.setattr("qwen_cli.tools.team.subprocess.Popen", fake_popen)
+        ct._ct_spawn("envteam", "worker1", "do the thing")
+        assert captured["kwargs"]["env"]["QWEN_TOOL_GROUPS"] == "all"
+
     def test_ct_spawn_records_pid_in_task_metadata(self, ct, monkeypatch):
         class _FakeProc:
             pid = 5678

@@ -32,19 +32,23 @@ _PARAM_EQ_RE = re.compile(
 
 # ---------------------------------------------------------------------------
 # Tools
+#
+# CORE_TOOLS is always sent. TOOL_GROUPS ("browser", "media", "team") are only
+# sent after the model enables them via enable_tools — their schemas cost real
+# context (the full set is ~4k tokens of a 28k window) and most turns never
+# touch them. Enabling is sticky for the session so the prompt prefix stays
+# cache-stable. QWEN_TOOL_GROUPS=all (or config tool_groups="all") restores
+# the old always-on behavior; spawned team agents run with it set.
 # ---------------------------------------------------------------------------
 
-TOOLS = [
+_ALL_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web. Use this FIRST before answering any factual question, "
-                "how-to question, or request for information — even if you think you know "
-                "the answer. Current events, prices, docs, tutorials, software releases, "
-                "troubleshooting, and general knowledge all benefit from a fresh search. "
-                "Prefer searching over relying on training data."
+                "Search the web. Use FIRST for anything factual — current events, prices, docs, "
+                "versions, troubleshooting — rather than trusting training data."
             ),
             "parameters": {
                 "type": "object",
@@ -58,10 +62,8 @@ TOOLS = [
         "function": {
             "name": "search_news",
             "description": (
-                "Search specifically for recent news articles. "
-                "Use this instead of web_search when the question is about current events, "
-                "recent releases, breaking news, or anything time-sensitive. "
-                "Results are pulled from DDG news, Brave news, and Google, merged and ranked."
+                "Search recent news articles. Use instead of web_search for current events, "
+                "recent releases, and anything time-sensitive."
             ),
             "parameters": {
                 "type": "object",
@@ -584,13 +586,11 @@ TOOLS = [
         "function": {
             "name": "team_spawn_agent",
             "description": (
-                "Spawn a new qwen agent in a new terminal to handle a subtask autonomously in parallel. "
-                "USE THIS PROACTIVELY — whenever a task has 3+ independent parts, a subtask would take you "
-                "5+ tool calls, or you're iterating over a list, spawn an agent instead of doing it yourself. "
-                "Spawned agents have full access to ALL tools: web_search, fetch_url, fetch_rendered, "
-                "browser_action, run_command, run_script, read_file, edit_file, patch_file, write_file, move_file, "
-                "delete_file, list_directory, find_files, search_files, ask_user, and all team tools. "
-                "After spawning, use team_board to track progress and team_inbox_receive to collect results."
+                "Spawn a qwen agent in a new terminal for a LARGE independent subtask. All agents "
+                "share one inference slot on the local server, so they run serially, not in "
+                "parallel — spawn only when a subtask is substantial (10+ tool calls) and can "
+                "proceed unattended; do small work inline yourself. Spawned agents get every tool. "
+                "Track progress with team_board; collect results with team_inbox_receive."
             ),
             "parameters": {
                 "type": "object",
@@ -609,12 +609,10 @@ TOOLS = [
         "function": {
             "name": "update_plan",
             "description": (
-                "Create or update your visible step-by-step plan for the current task. "
-                "Call this FIRST for any non-trivial multi-step task, listing every step with "
-                "status 'pending'. Call it again whenever a step's status changes — mark a step "
-                "'in_progress' right before you start it, and 'completed' only after you've verified "
-                "it actually worked. Always pass the FULL list of steps (not just the one that "
-                "changed) — each call replaces the whole plan. Keep steps short (one line each)."
+                "Create or update your visible step plan. Call FIRST for any multi-step task; "
+                "call again as statuses change (in_progress before starting a step, completed "
+                "only once verified). Each call replaces the whole plan — always pass the FULL "
+                "step list, one short line per step."
             ),
             "parameters": {
                 "type": "object",
@@ -639,7 +637,56 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "enable_tools",
+            "description": (
+                "Enable an optional tool group for the rest of this session, then call its tools "
+                "directly. Groups: 'browser' (browser_action — clicks/forms/screenshots; "
+                "fetch_rendered — JS-rendered read-only page fetch), 'media' (describe_image, "
+                "get_video_transcript), 'team' (multi-agent task boards, inboxes, spawning "
+                "subagents). Call this as soon as a task needs one of those capabilities."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group": {
+                        "type": "string",
+                        "enum": ["browser", "media", "team", "all"],
+                        "description": "Tool group to enable ('all' for every group)",
+                    },
+                },
+                "required": ["group"],
+            },
+        },
+    },
 ]
+
+# Partition into the always-sent core and on-demand groups (see header comment).
+_GROUP_MEMBERS: dict[str, tuple[str, ...]] = {
+    "browser": ("fetch_rendered", "browser_action"),
+    "media": ("describe_image", "get_video_transcript"),
+    "team": (
+        "team_task_list",
+        "team_task_add",
+        "team_task_update",
+        "team_inbox_send",
+        "team_inbox_receive",
+        "team_board",
+        "team_list",
+        "team_spawn_agent",
+    ),
+}
+_GATED_NAMES = {name for members in _GROUP_MEMBERS.values() for name in members}
+CORE_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] not in _GATED_NAMES]
+TOOL_GROUPS: dict[str, list] = {
+    group: [t for t in _ALL_TOOLS if t["function"]["name"] in members]
+    for group, members in _GROUP_MEMBERS.items()
+}
+# Full flat list — used by "all" mode, spawned agents, and anything that needs
+# every schema regardless of gating.
+TOOLS = _ALL_TOOLS
 
 _HEARTBEAT_SEC = 30  # print "still waiting" after this many seconds with no token
 _LIVE_PREVIEW_LINES = 18
@@ -793,7 +840,7 @@ def stream_once(client: object, messages: list, use_tools: bool, update_fn=None)
     if _main._stream_usage_supported:
         kwargs["stream_options"] = {"include_usage": True}
     if use_tools:
-        kwargs["tools"] = TOOLS
+        kwargs["tools"] = _main.active_tools()
         kwargs["tool_choice"] = "auto"
 
     interrupted = False

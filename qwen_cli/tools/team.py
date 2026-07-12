@@ -391,6 +391,9 @@ def _ct_spawn(team: str, agent_name: str, task: str, cwd: str = "") -> str:
             cmd,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             cwd=work_dir,
+            # The agent brief references browser and team tools directly, so the
+            # child session must have every tool group active from the start.
+            env={**os.environ, "QWEN_TOOL_GROUPS": "all"},
         )
         _ct_record_spawn_pid(team, task_id, proc.pid)
         return f"Spawned agent '{agent_name}' for team '{team}'.\nTask ID: {task_id[:6]}\nBrief: {task_file}"

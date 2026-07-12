@@ -326,3 +326,57 @@ class TestEditDiffPreview:
         assert result.startswith("[edited:")
         assert not syntaxes  # /auto stays quiet
         assert "a = 100" in p.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# #2/#4 tool-group gating — core always sent, browser/media/team on demand
+# ---------------------------------------------------------------------------
+
+
+class TestToolGating:
+    def _fresh(self, qwen_cli, monkeypatch, mode="auto"):
+        monkeypatch.setattr(qwen_cli, "TOOL_GROUPS_MODE", mode)
+        monkeypatch.setattr(qwen_cli, "_enabled_tool_groups", set())
+        monkeypatch.setattr(qwen_cli.console, "print", lambda *a, **k: None)
+
+    def test_partition_is_complete_and_disjoint(self):
+        from qwen_cli.core.stream import CORE_TOOLS, TOOL_GROUPS, TOOLS
+
+        core = {t["function"]["name"] for t in CORE_TOOLS}
+        gated = {t["function"]["name"] for grp in TOOL_GROUPS.values() for t in grp}
+        assert "enable_tools" in core
+        assert core.isdisjoint(gated)
+        assert {t["function"]["name"] for t in TOOL_GROUPS["browser"]} == {"browser_action", "fetch_rendered"}
+        assert "team_spawn_agent" in gated
+        assert len(TOOLS) == len(CORE_TOOLS) + sum(len(v) for v in TOOL_GROUPS.values())
+
+    def test_default_sends_core_only(self, qwen_cli, monkeypatch):
+        self._fresh(qwen_cli, monkeypatch)
+        names = {t["function"]["name"] for t in qwen_cli.active_tools()}
+        assert {"read_file", "edit_file", "run_command", "enable_tools"} <= names
+        assert "browser_action" not in names and "team_spawn_agent" not in names
+
+    def test_enable_group_is_sticky_and_scoped(self, qwen_cli, monkeypatch):
+        self._fresh(qwen_cli, monkeypatch)
+        result = qwen_cli.do_enable_tools("team")
+        assert "team_spawn_agent" in result
+        names = {t["function"]["name"] for t in qwen_cli.active_tools()}
+        assert "team_board" in names
+        assert "browser_action" not in names  # other groups stay off
+        assert "already enabled" in qwen_cli.do_enable_tools("team")
+
+    def test_enable_all_and_unknown_group(self, qwen_cli, monkeypatch):
+        from qwen_cli.core.stream import TOOLS
+
+        self._fresh(qwen_cli, monkeypatch)
+        assert "unknown group" in qwen_cli.do_enable_tools("telepathy")
+        qwen_cli.do_enable_tools("all")
+        assert {t["function"]["name"] for t in qwen_cli.active_tools()} == {
+            t["function"]["name"] for t in TOOLS
+        }
+
+    def test_all_mode_bypasses_gating(self, qwen_cli, monkeypatch):
+        from qwen_cli.core.stream import TOOLS
+
+        self._fresh(qwen_cli, monkeypatch, mode="all")
+        assert qwen_cli.active_tools() == TOOLS
