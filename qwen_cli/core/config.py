@@ -160,12 +160,18 @@ _TOOL_RETRYABLE_TOOLS = frozenset(
     }
 )
 
+# max_tokens=16384 pairs with the server's -c 49152 (start-qwen.bat): the
+# input ceiling is 49152 - 16384 = 32768, so TOKEN_LIMIT=28000 keeps the same
+# ~4.7k tokenizer-drift headroom as the old 65536/32768 split. The context was
+# traded down to afford --cache-type-k q8_0 (q4_0 K cache measurably hurts
+# long-context quality) in the same VRAM. /long mode still raises output to
+# 81,920 on servers with a bigger -c.
 SAMPLING_PRESETS: dict[str, dict] = {
     "thinking": {
         "temperature": 1.0,
         "top_p": 0.95,
         "presence_penalty": 0.0,
-        "max_tokens": 32768,
+        "max_tokens": 16384,
         "extra_body": {
             "top_k": 20,
             "min_p": 0.0,
@@ -177,7 +183,7 @@ SAMPLING_PRESETS: dict[str, dict] = {
         "temperature": 0.6,
         "top_p": 0.95,
         "presence_penalty": 0.0,
-        "max_tokens": 32768,
+        "max_tokens": 16384,
         "extra_body": {
             "top_k": 20,
             "min_p": 0.0,
@@ -189,7 +195,7 @@ SAMPLING_PRESETS: dict[str, dict] = {
         "temperature": 0.7,
         "top_p": 0.80,
         "presence_penalty": 1.5,
-        "max_tokens": 32768,
+        "max_tokens": 16384,
         "extra_body": {"top_k": 20, "min_p": 0.0, "repeat_penalty": 1.0},
     },
 }

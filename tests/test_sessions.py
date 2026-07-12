@@ -109,3 +109,47 @@ class TestFuzzyFind:
         qwen_cli.save_session([{"role": "user", "content": "something else"}], "SYS", name="unrelated")
         matches = qwen_cli._fuzzy_find_session("xyzzy_not_here")
         assert matches == []
+
+
+class TestReplLock:
+    """_other_repl_pid backs the single-instance REPL guard: two live REPLs
+    share one server slot and the same autosave.json (last writer wins) —
+    observed live as two qwen-cli.py processes clobbering each other."""
+
+    def test_no_lock_file(self, qwen_cli, tmp_path):
+        assert qwen_cli._other_repl_pid(tmp_path / "nope.lock") is None
+
+    def test_garbage_content(self, qwen_cli, tmp_path):
+        lock = tmp_path / "qwen-cli.lock"
+        lock.write_text("not-a-pid", encoding="utf-8")
+        assert qwen_cli._other_repl_pid(lock) is None
+
+    def test_own_pid_is_ignored(self, qwen_cli, tmp_path):
+        import os
+
+        lock = tmp_path / "qwen-cli.lock"
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+        assert qwen_cli._other_repl_pid(lock) is None
+
+    def test_dead_pid_is_stale(self, qwen_cli, tmp_path):
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        lock = tmp_path / "qwen-cli.lock"
+        lock.write_text(str(proc.pid), encoding="utf-8")
+        assert qwen_cli._other_repl_pid(lock) is None
+
+    def test_live_python_process_is_detected(self, qwen_cli, tmp_path):
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            lock = tmp_path / "qwen-cli.lock"
+            lock.write_text(str(proc.pid), encoding="utf-8")
+            assert qwen_cli._other_repl_pid(lock) == proc.pid
+        finally:
+            proc.kill()
+            proc.wait()

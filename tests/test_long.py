@@ -30,5 +30,6 @@ def test_long_mode_toggle(qwen_cli):
 def test_long_output_is_qwen_recommendation(qwen_cli):
     # 81,920 is the documented ceiling for competition-style math/coding.
     assert qwen_cli._LONG_OUTPUT == 81920
-    # General-use default stays at the recommended 32,768.
-    assert all(p["max_tokens"] == 32768 for p in qwen_cli.SAMPLING_PRESETS.values())
+    # Default output reservation pairs with the server's -c 49152
+    # (49152 - 16384 = 32768 input ceiling); see core/config.py.
+    assert all(p["max_tokens"] == 16384 for p in qwen_cli.SAMPLING_PRESETS.values())

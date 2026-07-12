@@ -15,6 +15,7 @@ memory.md
 input_history.txt
 pt_history.txt
 handoff.json
+qwen-cli.lock
 qwen.log
 qwen.log.*
 audit.log

@@ -3,10 +3,13 @@ set PYTHONUTF8=1
 set PYDANTIC_DISABLE_ANNOTATIONLIB=1
 
 REM CLI input-token budget. Keep well under (server -c below) minus the preset
-REM max_tokens output reservation (32768 for thinking/code) -- 65536 - 32768 =
-REM 32768 ceiling, so 28000 leaves ~4.7k headroom for tokenizer-estimate drift
-REM and tool schemas. This is the committed fallback for a fresh clone with no
-REM config.toml (gitignored, personal); a config.toml token_limit still wins.
+REM max_tokens output reservation (16384, see core/config.py) -- 49152 - 16384
+REM = 32768 ceiling, so 28000 leaves ~4.7k headroom for tokenizer-estimate
+REM drift and tool schemas. -c was traded from 65536 down to 49152 to afford
+REM --cache-type-k q8_0 in the same VRAM (q4_0 K cache measurably hurts
+REM long-context quality; V stays q4_0, which is nearly free). This is the
+REM committed fallback for a fresh clone with no config.toml (gitignored,
+REM personal); a config.toml token_limit still wins.
 set QWEN_TOKEN_LIMIT=28000
 
 REM CUDA 12 runtime DLLs
@@ -30,10 +33,11 @@ if defined _AUX_PID (
     taskkill /F /PID %_AUX_PID% >nul 2>&1
 )
 
-REM Wait for port free
+REM Wait for both ports free (8081 too — the aux server can otherwise race
+REM its own dying predecessor and fail to bind)
 set "_WAIT=0"
 :wait_free
-netstat -ano | findstr ":8080 " | findstr "LISTENING" >nul 2>&1
+netstat -ano | findstr /C:":8080 " /C:":8081 " | findstr "LISTENING" >nul 2>&1
 if errorlevel 1 goto port_free
 set /a _WAIT+=1
 if %_WAIT% geq 25 goto port_free
@@ -61,8 +65,8 @@ start "Qwen LLM Server" "%LLAMA_PATH%" ^
   --port 8080 ^
   --host 127.0.0.1 ^
   -ngl 64 ^
-  -c 65536 ^
-  --cache-type-k q4_0 ^
+  -c 49152 ^
+  --cache-type-k q8_0 ^
   --cache-type-v q4_0 ^
   -np 1 ^
   -t 16 ^

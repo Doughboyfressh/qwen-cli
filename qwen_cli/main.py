@@ -4843,6 +4843,71 @@ def make_client():  # returns OpenAI instance
 # ==============================================================================
 
 
+def _other_repl_pid(lock_path: Path) -> int | None:
+    """Return the PID of another live interactive qwen-cli REPL, or None.
+
+    Reads a PID from lock_path and reports it only if it is a different,
+    still-running python process. Stale locks (dead PID, PID reused by a
+    non-python process, garbage content) all return None.
+    """
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if pid == os.getpid():
+        return None
+    try:
+        import psutil
+
+        if not psutil.pid_exists(pid):
+            return None
+        if "python" not in psutil.Process(pid).name().lower():
+            return None  # PID was reused by an unrelated process
+    except Exception:
+        return None
+    return pid
+
+
+def _acquire_repl_lock() -> bool:
+    """Single-instance guard for the interactive REPL. Returns False to exit.
+
+    Two REPLs share one llama-server slot (requests queue behind each other
+    and every swap evicts the other's prompt cache) and the same
+    autosave.json / history files (last writer wins) — observed live as two
+    qwen-cli.py processes silently clobbering each other's sessions. Spawned
+    --task agents and piped mode are exempt: those are designed to run
+    alongside a REPL.
+    """
+    lock = DATA_DIR / "qwen-cli.lock"
+    other = _other_repl_pid(lock)
+    if other is not None:
+        console.print(
+            f"[bold yellow]Another qwen-cli session appears to be running (PID {other}).[/bold yellow]\n"
+            "[yellow]Two sessions share one server slot (slow, cache-thrashing) and the same\n"
+            "autosave/history files (they overwrite each other's sessions).[/yellow]"
+        )
+        try:
+            ans = console.input("[dim]Continue anyway? [y/N]: [/dim]").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if ans != "y":
+            return False
+    try:
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+
+        def _release() -> None:
+            try:
+                if lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    lock.unlink()
+            except OSError:
+                pass
+
+        atexit.register(_release)
+    except OSError:
+        _logger.warning("Could not write REPL lock file %s", lock)
+    return True
+
+
 def main() -> None:
     """Main entry point for qwen-cli."""
     global \
@@ -4913,6 +4978,9 @@ def main() -> None:
         history: list[dict] = []
         _auto_task = expand_at_refs(_auto_task)
         cmd_agent(_auto_task, history, base_system, client)
+        return
+
+    if not _acquire_repl_lock():
         return
 
     base_system, history, ctx = _repl_setup(client)
