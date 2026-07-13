@@ -1162,7 +1162,10 @@ def cmd_focus(arg: str, history: list) -> None:
         console.print("[dim][focus tracking cleared (files remain in context)][/dim]")
         return
     try:
-        tokens = shlex.split(arg)
+        # posix=False keeps Windows path backslashes intact (posix mode treats
+        # them as escapes and silently mangles C:\Users\... into C:Users...);
+        # it leaves surrounding quotes on the token, stripped below.
+        tokens = [t.strip("\"'") for t in shlex.split(arg, posix=False)]
     except Exception:
         tokens = arg.split()
     loaded = 0
