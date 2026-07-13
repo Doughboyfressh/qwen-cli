@@ -1043,6 +1043,12 @@ def build_system_prompt(base: str) -> str:
 # ---------------------------------------------------------------------------
 
 _AT_REF_RE = re.compile(r"@([\S]+)")
+# Sentence punctuation that can sit flush against an @path and is never part of
+# a real filename. '?' and '!' were missing, so the most natural way anyone asks
+# about a file — "what does @main.py do?" with the token written as "@main.py?" —
+# resolved to a path ending in '?', silently matched nothing, and injected
+# nothing. The model then answered about a file it had never been shown.
+_AT_REF_TRAILING = ".,;:)\"'?!"
 
 
 def expand_at_refs(text: str) -> str:
@@ -1053,10 +1059,10 @@ def expand_at_refs(text: str) -> str:
         symbol: str | None = None
         if "::" in raw:
             file_part, sym_raw = raw.split("::", 1)
-            raw = file_part.rstrip(".,;:)\"'")
-            symbol = sym_raw.rstrip(".,;:)\"'") or None
+            raw = file_part.rstrip(_AT_REF_TRAILING)
+            symbol = sym_raw.rstrip(_AT_REF_TRAILING) or None
         else:
-            raw = raw.rstrip(".,;:)\"'")
+            raw = raw.rstrip(_AT_REF_TRAILING)
         p = _resolve(raw)
         if not p.exists() or not p.is_file():
             continue
