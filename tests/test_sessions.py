@@ -8,12 +8,14 @@ import pytest
 
 
 @pytest.fixture()
-def sessions_dir(qwen_cli, tmp_path, monkeypatch):
+def sessions_dir(tmp_path, monkeypatch):
     """Redirect SESSIONS_DIR to a temp location for each test."""
+    import qwen_cli.core.sessions as sessions
+
     d = tmp_path / "sessions"
     d.mkdir()
-    monkeypatch.setattr(qwen_cli, "SESSIONS_DIR", d)
-    monkeypatch.setattr(qwen_cli, "AUTOSAVE_FILE", d / "autosave.json")
+    monkeypatch.setattr(sessions, "SESSIONS_DIR", d)
+    monkeypatch.setattr(sessions, "AUTOSAVE_FILE", d / "autosave.json")
     return d
 
 
@@ -83,7 +85,9 @@ class TestAutosave:
         assert data["history"] == history
 
     def test_never_raises_on_bad_path(self, qwen_cli, tmp_path, monkeypatch):
-        monkeypatch.setattr(qwen_cli, "AUTOSAVE_FILE", tmp_path / "no_dir" / "autosave.json")
+        import qwen_cli.core.sessions as sessions
+
+        monkeypatch.setattr(sessions, "AUTOSAVE_FILE", tmp_path / "no_dir" / "autosave.json")
         qwen_cli._silent_autosave([{"role": "user", "content": "x"}], "SYS")
 
 

@@ -26,7 +26,6 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
@@ -90,14 +89,10 @@ except Exception:
 
 import qwen_cli.core.config as _config  # noqa: E402
 from qwen_cli.core.config import (  # noqa: E402
-    _TOOL_RETRY_BASE,
-    _TOOL_RETRY_MAX,
-    _TOOL_RETRYABLE_TOOLS,
     _TOOL_TIMEOUT_FAST,
     _TOOL_TIMEOUT_NET,
     _TOOL_TIMEOUT_SLOW,
     AUDIT_LOG_FILE,
-    AUTOSAVE_FILE,
     AUX_BASE_URL,
     AUX_LLM_TIMEOUT,
     AUX_MODEL,
@@ -109,26 +104,18 @@ from qwen_cli.core.config import (  # noqa: E402
     CT_DIR,  # noqa: F401 — accessed via _main. in commands.py
     DATA_DIR,
     DEFAULT_EDITOR,
-    EXPORTS_DIR,
     FALLBACK_MODEL,
     GOOGLE_API_KEY,
     GOOGLE_CSE_ID,
-    HANDOFF_FILE,
     HISTORY_FILE,
-    INTEL_DIR,
-    INTEL_FEED,
-    INTEL_QUEUE,
-    INTEL_TOPICS,
-    MAX_AUTO_CONTINUE,
+    MAX_AUTO_CONTINUE,  # noqa: F401 — turn.py reads it via _main (runtime-patchable)
     MAX_TOOL_DEPTH,
-    MEMORY_FILE,
     MODEL,
     OPENAI_API_KEY,
-    PINS_FILE,
     SAMPLING_PRESETS,
     SESSIONS_DIR,
     TOKEN_LIMIT,
-    TOOL_RESULT_LIMIT,
+    TOOL_RESULT_LIMIT,  # noqa: F401 — read via _main by tests
 )
 
 _CFG = _config._load_config()
@@ -146,6 +133,86 @@ from qwen_cli.core.indexer import (  # noqa: E402
     _save_symbol_index,
     build_symbol_index,
     load_qwenignore,
+)
+
+# Live Intelligence subsystem (extracted from this module). Names that look
+# unused here are re-exports: commands.py, repl.py, and tests reach them via
+# the _main namespace.
+from qwen_cli.core.intel import (  # noqa: E402
+    _INTEL_CRAWLERS,  # noqa: F401
+    _INTEL_INTERVAL,  # noqa: F401
+    _intel_enabled,  # noqa: F401
+    _intel_extract_topics,
+    _intel_load_topics,  # noqa: F401
+    _intel_lock,  # noqa: F401
+    _intel_process_queue,
+    _intel_save_topics,  # noqa: F401
+    _intel_train_memory,  # noqa: F401
+    intel_get_recent,
+    start_intel_crawlers,  # noqa: F401
+)
+
+# Persistent memory / pins subsystem (extracted from this module). Names that
+# look unused here are re-exports: commands.py, repl.py, intel.py, and tests
+# reach them via the _main namespace.
+from qwen_cli.core.memory import (  # noqa: E402
+    MEMORY_CURATE_INTERVAL,  # noqa: F401
+    MEMORY_MAX_CHARS,  # noqa: F401
+    _auto_extract_memory,
+    _clean_memory_facts,  # noqa: F401
+    _curate_memory,  # noqa: F401
+    _enforce_memory_cap,  # noqa: F401
+    _memory_lock,  # noqa: F401
+    load_memory,
+    load_pins,
+    record_session_changes_memory,  # noqa: F401
+    save_memory,  # noqa: F401
+    save_pins,  # noqa: F401
+)
+
+# Session persistence subsystem (extracted from this module). Names that look
+# unused here are re-exports: commands.py, repl.py, and tests reach them via
+# the _main namespace.
+from qwen_cli.core.sessions import (  # noqa: E402
+    _consume_handoff,  # noqa: F401
+    _fuzzy_find_session,
+    _generate_handoff,  # noqa: F401 — context.py reaches it via _main
+    _save_exit_handoff,  # noqa: F401
+    _session_meta,
+    _silent_autosave,  # noqa: F401
+    _write_handoff,  # noqa: F401 — context.py reaches it via _main
+    export_session,  # noqa: F401
+    list_sessions,  # noqa: F401
+    load_session,
+    save_session,  # noqa: F401
+)
+
+# Context-window management (extracted from this module). run_turn and the
+# agent loops call these; commands.py, repl.py, context.py itself, and tests
+# reach them via the _main namespace.
+from qwen_cli.core.context import (  # noqa: E402
+    _TASK_ANCHOR_PREFIX,  # noqa: F401
+    _compact_tool_loop,  # noqa: F401 — tests reach it via _main
+    _maybe_autocompact,
+    _refresh_task_anchor,  # noqa: F401 — tests reach it via _main
+    approx_tokens,
+    cmd_trim,  # noqa: F401
+    truncate_middle,  # noqa: F401
+)
+
+# The core tool loop (extracted from this module). Turn state stays owned by
+# main; commands.py, repl.py, and tests reach these via the _main namespace.
+from qwen_cli.core.turn import (  # noqa: E402
+    _auto_presearch,  # noqa: F401
+    _call_with_retry,  # noqa: F401
+    _cap_result,  # noqa: F401
+    _classify_tool_batch,  # noqa: F401
+    _extract_domain,  # noqa: F401
+    _format_turn_ledger,  # noqa: F401
+    _inject_volatile_tail,  # noqa: F401
+    _ledger_entry,  # noqa: F401
+    _smart_cap,  # noqa: F401
+    run_turn,
 )
 
 # Shared tool implementations — configured once after paths are defined
@@ -170,12 +237,14 @@ from qwen_cli.core.repl import (  # noqa: E402
     _run_turn_and_handle_reply,  # noqa: F401 — accessed via _main. in commands.py
     _watch_worker,  # noqa: F401 — accessed via _main. in commands.py
 )
+# turn.py and context.py reach the streaming layer via _main so tests can
+# monkeypatch stream_once/_live_updater on this module.
 from qwen_cli.core.stream import (  # noqa: E402
     TOOLS,
-    _live_updater,
-    _short_args,
+    _live_updater,  # noqa: F401
+    _short_args,  # noqa: F401
     _strip_think,
-    stream_once,
+    stream_once,  # noqa: F401
 )
 from qwen_cli.tools.browser import do_browser_action, do_fetch_rendered  # noqa: E402
 
@@ -229,10 +298,8 @@ _turn_count: int = 0
 _session_start: float = 0.0
 _current_mode: str = ""
 _session_title: str = ""
-_auto_memory_count: int = 0
 _BG_LLM_SEM = threading.Semaphore(2)  # at most 2 background LLM calls at a time
 _main_llm_busy = False  # True while run_turn() holds the LLM slot
-_intel_memory_written: dict[str, str] = {}  # topic_name → date; prevents duplicate entries
 _cached_index: dict | None = None
 _main_llm_busy_lock = threading.Lock()  # Protects reads/writes of _main_llm_busy
 _cached_index_root: Path | None = None
@@ -349,13 +416,6 @@ _active_preset: str = _CFG.get("preset", "thinking") if _CFG.get("preset") in SA
 _LONG_OUTPUT = 81920
 _long_mode = False
 _TOKEN_LIMIT_BASE = TOKEN_LIMIT  # input budget to restore when /long is turned off
-_memory_lock = threading.Lock()  # serializes all memory.md read-modify-write
-_intel_stop = threading.Event()
-_intel_lock = threading.Lock()
-_intel_enabled = threading.Event()  # thread-safe flag for intel crawlers
-_INTEL_INTERVAL = 240  # seconds between each crawler's crawl cycles
-_INTEL_INJECT_N = 6  # recent feed entries injected into system prompt
-_INTEL_CRAWLERS = 3  # number of parallel background browser threads
 
 # Module-level thread pool for parallel tool execution — avoids per-turn pool creation
 _POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="qwen-tool")
@@ -366,33 +426,6 @@ def _get_pool() -> concurrent.futures.ThreadPoolExecutor:
 
 
 atexit.register(lambda: _POOL.shutdown(wait=False))
-
-
-def _intel_default_topics() -> list[dict]:
-    """Return the default set of topics for the Live Intelligence background crawlers."""
-    year = datetime.now().year
-    return [
-        {"name": "AI & LLM news", "query": "latest AI LLM model releases news today", "last_checked": 0},
-        {"name": "Python ecosystem", "query": f"Python new libraries tools releases {year}", "last_checked": 0},
-        {
-            "name": "Security vulnerabilities",
-            "query": "critical security vulnerabilities CVE this week",
-            "last_checked": 0,
-        },
-        {"name": "Tech industry news", "query": "technology industry news today", "last_checked": 0},
-        {"name": "Open source trending", "query": "trending open source projects GitHub today", "last_checked": 0},
-        {"name": "Developer APIs", "query": f"new developer APIs web services released {year}", "last_checked": 0},
-    ]
-
-
-_INTEL_DEFAULT_TOPICS: list[dict] = _intel_default_topics()
-
-MEMORY_CURATE_INTERVAL = 10  # consolidate memory.md every N auto-extractions
-# _curate_memory()'s periodic LLM-based consolidation is a *soft* mechanism —
-# it depends on the model actually compressing well, and only runs every
-# MEMORY_CURATE_INTERVAL auto-extractions, not on /remember at all. This is
-# the deterministic backstop so memory.md can never grow unbounded regardless.
-MEMORY_MAX_CHARS = 8000
 
 
 _PARALLEL_TOOLS = frozenset(
@@ -432,57 +465,6 @@ _STATEFUL_TOOLS = frozenset(
 _SERIAL_BY_DOMAIN = frozenset({"fetch_url", "fetch_rendered", "describe_image", "get_video_transcript"})
 
 
-def _extract_domain(url: str) -> str:
-    """Extract domain from a URL for contention detection."""
-    m = re.search(r"https?://([^/:\d]+)", url)
-    return m.group(1) if m else ""
-
-
-def _classify_tool_batch(tool_calls: list, parsed_args: list) -> list[list[int]]:
-    """Group tool calls into batches respecting:
-    1. Stateful tools run alone (never parallelized)
-    2. Fetches to the same domain are serialized (rate-limit safety)
-    3. All other parallel-safe tools can run together.
-
-    Returns a list of batches (each batch is a list of indices).
-    """
-    n = len(tool_calls)
-    if n <= 1:
-        return [[i] for i in range(n)]
-
-    batches = []
-    assigned = [False] * n
-    domain_groups: dict[str, list[int]] = {}
-
-    for i in range(n):
-        name = tool_calls[i]["function"]["name"]
-        args = parsed_args[i] or {}
-        if name in _STATEFUL_TOOLS:
-            batches.append([i])
-            assigned[i] = True
-        elif name in _SERIAL_BY_DOMAIN:
-            url = args.get("url", "")
-            domain = _extract_domain(url)
-            if domain:
-                domain_groups.setdefault(domain, []).append(i)
-                assigned[i] = True
-
-    # Domain groups: each domain gets its own batch
-    for indices in domain_groups.values():
-        batches.append(indices)
-
-    # Remaining unassigned (parallel-safe, no domain contention)
-    remaining = [i for i in range(n) if not assigned[i]]
-    if remaining:
-        batches.append(remaining)
-
-    return batches
-
-
-# Tool-set constants used by the dispatch engine
-_SUMMARIZE_TOOLS = frozenset(
-    {"web_search", "search_news", "fetch_url", "fetch_rendered", "describe_image", "get_video_transcript"}
-)
 _RUNNABLE_LANGS = {"bash", "sh", "shell", "powershell", "ps1", "python", "py", "cmd", "batch", "bat"}
 
 _PLAN_RE = re.compile(r"^\s*\d+[\.\)]\s+[^\n]+", re.MULTILINE)
@@ -795,67 +777,6 @@ Team data lives in `~/.clawteam/` and is compatible with the ClawTeam CLI if ins
 - Pipe input: `echo "explain this" | qwen` or `cat file.py | qwen "what does this do?"`
 - Resume sessions from the shell: `qwen -c` continues the last autosave, `qwen -r <name>` fuzzy-loads a saved session
 """
-
-# ---------------------------------------------------------------------------
-# Pins (persistent per-session reminders injected into every system prompt)
-# ---------------------------------------------------------------------------
-
-
-def load_pins() -> list[str]:
-    """Load Pins."""
-    if not PINS_FILE.exists():
-        return []
-    try:
-        return json.loads(PINS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def save_pins(pins: list[str]) -> None:
-    """Save Pins."""
-    PINS_FILE.write_text(json.dumps(pins, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Memory & system prompt
-# ---------------------------------------------------------------------------
-
-
-def load_memory() -> str:
-    """Load Memory."""
-    return MEMORY_FILE.read_text(encoding="utf-8").strip() if MEMORY_FILE.exists() else ""
-
-
-def _enforce_memory_cap(text: str, max_chars: int = MEMORY_MAX_CHARS) -> str:
-    """Hard cap on memory.md size — drops the OLDEST entries first (they're
-    also the most likely to be superseded), preserving whole entries rather
-    than truncating mid-fact. Entries are blank-line-separated blocks; always
-    keeps at least one even if it alone exceeds the cap, so a single large
-    fact can't wipe out memory entirely.
-    """
-    if len(text) <= max_chars:
-        return text
-    blocks = [b for b in text.split("\n\n") if b.strip()]
-    kept: list[str] = []
-    total = 0
-    for block in reversed(blocks):  # walk newest-first, drop oldest once over cap
-        block_len = len(block) + 2  # +2 for the "\n\n" separator
-        if total + block_len > max_chars and kept:
-            break
-        kept.append(block)
-        total += block_len
-    kept.reverse()
-    return "\n\n".join(kept)
-
-
-def save_memory(text: str) -> None:
-    """Save Memory."""
-    # max_chars passed explicitly (not relying on _enforce_memory_cap's own
-    # default) so this always reads the current MEMORY_MAX_CHARS at call
-    # time — a default parameter value is bound once at def-time and would
-    # never see a later change to the module-level constant.
-    MEMORY_FILE.write_text(_enforce_memory_cap(text, max_chars=MEMORY_MAX_CHARS), encoding="utf-8")
-
 
 # ---------------------------------------------------------------------------
 # Symbol index helpers
@@ -1184,213 +1105,8 @@ def do_describe_image(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sessions
+# Session-related command handlers (storage itself lives in core/sessions.py)
 # ---------------------------------------------------------------------------
-
-
-def _session_meta(path: Path) -> dict:
-    """Internal helper: session meta."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        meta = data.get("meta", {})
-        if not meta:
-            history = data.get("history", [])
-            user_msgs = [
-                m
-                for m in history
-                if m.get("role") == "user" and not (m.get("content") or "").startswith("# Project Context")
-            ]
-            topic = (user_msgs[0].get("content") or "")[:60].replace("\n", " ") if user_msgs else ""
-            turns = sum(1 for m in history if m.get("role") == "assistant")
-            meta = {"topic": topic, "turns": turns, "saved_at": ""}
-        return meta
-    except Exception:
-        return {"topic": "", "turns": 0, "saved_at": ""}
-
-
-def save_session(history: list, system_prompt: str, name: str | None = None) -> None:
-    """Save Session."""
-    user_msgs = [
-        m for m in history if m.get("role") == "user" and not (m.get("content") or "").startswith("# Project Context")
-    ]
-    topic = (user_msgs[0].get("content") or "")[:80].replace("\n", " ") if user_msgs else ""
-    turns = sum(1 for m in history if m.get("role") == "assistant")
-    fname = (name or datetime.now().strftime("%Y%m%d_%H%M%S")) + ".json"
-    path = SESSIONS_DIR / fname
-    data = {
-        "meta": {"topic": topic, "turns": turns, "saved_at": datetime.now().isoformat()},
-        "system_prompt": system_prompt,
-        "history": history,
-    }
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    console.print(f"[dim][saved: {path.name}  ({turns} turn{'s' if turns != 1 else ''})][/dim]")
-
-
-def _silent_autosave(history: list, system_prompt: str) -> None:
-    """Rolling checkpoint to autosave.json — no console output, never raises."""
-    try:
-        user_msgs = [
-            m
-            for m in history
-            if m.get("role") == "user" and not (m.get("content") or "").startswith("# Project Context")
-        ]
-        raw_topic = (user_msgs[0].get("content") or "")[:80].replace("\n", " ") if user_msgs else ""
-        topic = _session_title or raw_topic
-        turns = sum(1 for m in history if m.get("role") == "assistant")
-        data = {
-            "meta": {"topic": topic, "turns": turns, "saved_at": datetime.now().isoformat()},
-            "system_prompt": system_prompt,
-            "history": history,
-        }
-        AUTOSAVE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        _logger.exception("Autosave failed — session data may be lost on crash")
-
-
-HANDOFF_PROMPT_TEMPLATE = """You are resuming a previous session (it ended via context overflow, a normal exit, \
-or a crash). Here is what happened:
-
-{summary}
-
-Use this context to pick up where you left off. Do NOT ask the user to repeat themselves. Check memory.md for additional persistent facts."""
-
-
-def _generate_handoff(client, history, base_system) -> str:
-    """Generate a compact handoff summary for session resumption."""
-    try:
-        chat = [m for m in history if m.get("role") in ("user", "assistant")]
-        recent = chat[-16:]
-        recent_text = "\n".join(f"{m['role'].upper()}: {(m.get('content') or '')[:800]}" for m in recent)
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a session summarizer. Produce a handoff document for an AI assistant "
-                    "resuming this conversation. Include: (1) what the session goal is, "
-                    "(2) what has been accomplished, (3) what files were created/modified, "
-                    "(4) the exact task being worked on and the immediate next step, "
-                    "(5) any open questions or blockers. Be precise. Keep it under 800 words."
-                ),
-            },
-            {"role": "user", "content": f"Summarize this session for handoff:\n\n{recent_text}"},
-        ]
-        summary, _, _ = stream_once(client, prompt, use_tools=False)
-        return summary or "(summarization failed - see autosave for raw history)"
-    except Exception as e:
-        return f"(handoff summary failed: {e})"
-
-
-def _write_handoff(summary, history) -> None:
-    """Write a handoff file for the next session to pick up."""
-    try:
-        chat = [m for m in history if m.get("role") in ("user", "assistant")]
-        last_user = ""
-        for m in reversed(chat):
-            if m.get("role") == "user":
-                last_user = m.get("content", "")[:400]
-                break
-        data = {
-            "summary": summary,
-            "last_user_message": last_user,
-            "turns": sum(1 for m in history if m.get("role") == "assistant"),
-            "timestamp": datetime.now().isoformat(),
-        }
-        HANDOFF_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        _logger.exception("Overflow handoff write failed — session resumption may be degraded")
-
-
-def _save_exit_handoff(history) -> None:
-    """Save a lightweight handoff on normal exit so next session has context."""
-    try:
-        chat = [m for m in history if m.get("role") in ("user", "assistant")]
-        last_user = ""
-        for m in reversed(chat):
-            if m.get("role") == "user":
-                last_user = m.get("content", "")[:400]
-                break
-        last_assistant = ""
-        for m in reversed(chat):
-            if m.get("role") == "assistant":
-                last_assistant = m.get("content", "")[:600]
-                break
-        data = {
-            "summary": (
-                f"Session had {sum(1 for m in history if m.get('role') == 'assistant')} turns. "
-                f"Last user: {last_user[:200]}. Last assistant: {last_assistant[:200]}"
-            ),
-            "last_user_message": last_user,
-            "last_assistant_message": last_assistant,
-            "turns": sum(1 for m in history if m.get("role") == "assistant"),
-            "timestamp": datetime.now().isoformat(),
-        }
-        HANDOFF_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        _logger.exception("Exit handoff write failed — next session will lack context")
-
-
-def _consume_handoff() -> dict | None:
-    """Read and remove the handoff file. Returns dict or None."""
-    try:
-        if not HANDOFF_FILE.exists():
-            return None
-        data = json.loads(HANDOFF_FILE.read_text(encoding="utf-8"))
-        summary = data.get("summary", "")
-        last_user = data.get("last_user_message", "")
-        turns = data.get("turns", 0)
-        # Also carry forward any explicit next_step from overflow handoffs
-        next_step = data.get("next_step", "")
-        HANDOFF_FILE.unlink(missing_ok=True)
-        if not summary:
-            return None
-        prompt = HANDOFF_PROMPT_TEMPLATE.format(summary=summary)
-        if next_step:
-            prompt += f"\n\nThe immediate next step was: {next_step}"
-        return {"prompt": prompt, "last_user": last_user, "turns": turns, "next_step": next_step}
-    except Exception:
-        return None
-
-
-def load_session(name: str) -> tuple[list | None, str | None]:
-    """Load Session."""
-    if not name.endswith(".json"):
-        name += ".json"
-    path = SESSIONS_DIR / name
-    if not path.exists():
-        return None, None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("history", []), data.get("system_prompt", "")
-
-
-def _fuzzy_find_session(query: str) -> list[Path]:
-    """Internal helper: fuzzy find session."""
-    q = query.lower().removesuffix(".json")
-    matches: list[Path] = []
-    for f in sorted(SESSIONS_DIR.glob("*.json"), reverse=True):
-        if q in f.stem.lower():
-            matches.append(f)
-            continue
-        if q in _session_meta(f).get("topic", "").lower():
-            matches.append(f)
-    return matches
-
-
-def list_sessions() -> None:
-    """List Sessions."""
-    files = sorted(SESSIONS_DIR.glob("*.json"), reverse=True)
-    if not files:
-        console.print("[dim][no saved sessions][/dim]")
-        return
-    t = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
-    t.add_column("Name", style="cyan", no_wrap=True)
-    t.add_column("Turns", justify="right", style="dim")
-    t.add_column("Topic", style="white")
-    t.add_column("Saved", style="dim", no_wrap=True)
-    for f in files:
-        meta = _session_meta(f)
-        saved = meta.get("saved_at", "")[:16].replace("T", " ") if meta.get("saved_at") else ""
-        t.add_row(f.stem, str(meta.get("turns", "?")), meta.get("topic", "")[:60], saved)
-    console.print(t)
 
 
 def cmd_focus(arg: str, history: list) -> None:
@@ -1912,34 +1628,9 @@ def cmd_load_session(arg: str, history: list, base_system: str) -> tuple[list, s
     return history, base_system
 
 
-def export_session(history: list, name: str = "") -> None:
-    """Export Session."""
-    fname = (name or datetime.now().strftime("%Y%m%d_%H%M%S")) + ".md"
-    path = EXPORTS_DIR / fname
-    lines = [
-        "# Qwen Chat Export\n",
-        f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n",
-        f"**Model:** {MODEL}\n\n---\n",
-    ]
-    for msg in history:
-        role = msg.get("role", "")
-        content = (msg.get("content") or "").strip()
-        if role == "user" and not content.startswith("# Project Context"):
-            lines.append(f"\n**You:** {content}\n")
-        elif role == "assistant":
-            lines.append(f"\n**Qwen:**\n\n{content}\n")
-    path.write_text("\n".join(lines), encoding="utf-8")
-    console.print(f"[green][exported: {path}][/green]")
-
-
 # ---------------------------------------------------------------------------
 # Token estimate & context breakdown
 # ---------------------------------------------------------------------------
-
-
-def approx_tokens(messages: list) -> int:
-    """Approx Tokens."""
-    return sum(len(m.get("content") or "") for m in messages) // 4
 
 
 def show_context_breakdown(base_system: str, history: list) -> None:
@@ -3066,477 +2757,6 @@ def _run_background_tasks(client, user_msg: str, reply: str, history_snapshot: l
     _intel_extract_topics(client, user_msg, reply)
 
 
-def record_session_changes_memory(client: object | None = None) -> None:
-    """Session-end hook: if files were modified this session, log a dated entry to memory.md.
-
-    Always writes a deterministic entry (file list). If the model is reachable, the
-    entry is upgraded to a one-line summary of what actually changed, built from the
-    real diffs (original content is kept in _session_changes).
-    """
-    if not _session_changes:
-        return
-    names = sorted({Path(p).name for p in _session_changes})
-    shown = ", ".join(names[:12]) + (f" (+{len(names) - 12} more)" if len(names) > 12 else "")
-    date = datetime.now().strftime("%Y-%m-%d")
-    line = f"- {date}: modified {shown}"
-
-    if client is not None:
-        try:
-            import difflib
-
-            chunks = []
-            for path_str, original in list(_session_changes.items())[:8]:
-                try:
-                    current = Path(path_str).read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                diff = "\n".join(
-                    difflib.unified_diff(
-                        original.splitlines(),
-                        current.splitlines(),
-                        fromfile=Path(path_str).name,
-                        tofile=Path(path_str).name,
-                        lineterm="",
-                        n=1,
-                    )
-                )
-                if diff:
-                    chunks.append(diff[:1200])
-            if chunks:
-                prompt = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize these code diffs in ONE line under 120 characters: "
-                            "what changed, past tense, no filler. Reply with only the line."
-                        ),
-                    },
-                    {"role": "user", "content": "\n\n".join(chunks)[:6000]},
-                ]
-                bg_client, bg_model = _bg_llm(client)
-                resp = bg_client.chat.completions.create(
-                    model=bg_model, messages=prompt, stream=False, max_tokens=80, timeout=AUX_LLM_TIMEOUT
-                )
-                summary = (resp.choices[0].message.content or "").strip().splitlines()[0].strip()
-                if 10 < len(summary) <= 200:
-                    line = f"- {date}: {summary} (files: {shown})"
-        except Exception:
-            _logger.debug("Session-change summary via model failed; using file list")
-
-    marker = "# Recent Changes"
-    with _memory_lock:
-        mem = load_memory()
-        # Dedup: skip if an entry for the same date and file set is already logged
-        # (prevents repeated identical entries from tool-test or short sessions).
-        prefix = f"- {date}:"
-        for existing in mem.splitlines():
-            if existing.startswith(prefix) and shown in existing:
-                return
-        if marker in mem:
-            idx = mem.index(marker) + len(marker)
-            mem = mem[:idx] + "\n\n" + line + mem[idx:]
-        else:
-            mem = (mem + f"\n\n{marker}\n\n{line}").strip()
-        save_memory(mem.strip())
-    console.print(f"[dim][memory: logged session changes — {shown}][/dim]")
-
-
-# Lines that are just the extractor saying "nothing here" — observed written into
-# memory.md as '- SKIP', 'SKIP', '- No', bulleted/bolded variants, etc. The old
-# check (facts.upper() != "SKIP") only caught the bare, unbulleted form.
-_MEMORY_JUNK_LINE_RE = re.compile(
-    r"^\s*(?:[-*•]\s*)?(?:\*\*)?(?:skip|none|n/?a|no|nothing)(?:\*\*)?\s*[.!]?\s*$",
-    re.IGNORECASE,
-)
-# A memory "fact" containing tool-call or thinking syntax is a malformed model
-# reply captured wholesale, not a fact — a live memory.md had a full
-# <tool_call><function=browser_action>... block saved as memory.
-_MEMORY_TOOL_SYNTAX_RE = re.compile(r"<tool_call>|</?think>|<function[=>]|<parameter[=>]", re.IGNORECASE)
-_MEMORY_NEGATION_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:no|none|nothing)\b", re.IGNORECASE)
-
-
-def _clean_memory_facts(facts: str, drop_negations: bool = False) -> str:
-    """Sanitize an LLM-extracted memory entry before it is persisted.
-
-    Drops sentinel/no-op lines, rejects entries containing tool-call syntax,
-    and (for intel entries) drops pure-negation lines ("No critical CVEs
-    detected...") that record the absence of information. Returns the cleaned
-    entry, or "" if nothing durable remains.
-    """
-    if not facts or _MEMORY_TOOL_SYNTAX_RE.search(facts):
-        return ""
-    kept = []
-    for line in facts.splitlines():
-        if _MEMORY_JUNK_LINE_RE.match(line):
-            continue
-        if drop_negations and _MEMORY_NEGATION_RE.match(line):
-            continue
-        kept.append(line)
-    cleaned = "\n".join(kept).strip()
-    return cleaned if len(cleaned) > 10 else ""
-
-
-def _auto_extract_memory(client, user_msg: str, assistant_msg: str) -> None:
-    """Pull memorable facts from this exchange and append to memory.md."""
-    global _auto_memory_count
-    with _main_llm_busy_lock:
-        # With an aux backend this work doesn't touch the main model's slot,
-        # so there's no reason to skip it while the main model is busy.
-        if _main_llm_busy and _aux_client is None:
-            return
-    try:
-        excerpt = f"User: {user_msg[:600]}\n\nAssistant: {assistant_msg[:1000]}"
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Extract facts worth remembering long-term from this exchange: "
-                    "concrete preferences, decisions, names, configs, or constraints. "
-                    "Skip pleasantries and transient state. "
-                    "Format as short bullet points. "
-                    "If nothing is notable, reply with exactly: NONE"
-                ),
-            },
-            {"role": "user", "content": excerpt},
-        ]
-        bg_client, bg_model = _bg_llm(client)
-        resp = bg_client.chat.completions.create(
-            model=bg_model,
-            messages=prompt,
-            stream=False,
-            max_tokens=200,
-            timeout=AUX_LLM_TIMEOUT,
-        )
-        facts = _clean_memory_facts((resp.choices[0].message.content or "").strip())
-        if facts:
-            with _memory_lock:
-                mem = load_memory()
-                entry = f"\n\n<!-- auto {datetime.now().strftime('%Y-%m-%d')} -->\n{facts}"
-                save_memory((mem + entry).strip())
-                _auto_memory_count += 1
-                if _auto_memory_count % MEMORY_CURATE_INTERVAL == 0:
-                    _curate_memory(client, locked=True)
-    except Exception:
-        _logger.debug("Auto-memory extraction failed")
-
-
-def _curate_memory(client: object, locked: bool = False) -> None:
-    """Background: deduplicate and consolidate memory.md when it grows noisy."""
-    if not locked:
-        lock_ctx = _memory_lock
-    else:
-        import contextlib
-
-        lock_ctx = contextlib.nullcontext()
-    with lock_ctx:
-        mem = load_memory()
-        if not mem or len(mem) < 400:
-            return
-        try:
-            prompt = [
-                {
-                    "role": "system",
-                    "content": "Consolidate this memory into clean, non-redundant bullet points. Remove duplicates. Preserve all unique facts. Be concise.",
-                },
-                {"role": "user", "content": mem},
-            ]
-            bg_client, bg_model = _bg_llm(client)
-            resp = bg_client.chat.completions.create(
-                model=bg_model,
-                messages=prompt,
-                stream=False,
-                max_tokens=600,
-                timeout=AUX_LLM_TIMEOUT,
-            )
-            consolidated = (resp.choices[0].message.content or "").strip()
-            if consolidated and len(consolidated) > 20:
-                save_memory(consolidated)
-        except Exception:
-            _logger.debug("Memory curation failed")
-
-
-# ---------------------------------------------------------------------------
-# Background intelligence crawlers — web browsing + memory training
-# ---------------------------------------------------------------------------
-
-
-def _intel_load_topics() -> list[dict]:
-    """Internal helper: intel load topics."""
-    if INTEL_TOPICS.exists():
-        try:
-            return json.loads(INTEL_TOPICS.read_text(encoding="utf-8"))
-        except Exception:
-            _logger.debug("Failed to load intel topics from %s", INTEL_TOPICS)
-    return [dict(t) for t in _INTEL_DEFAULT_TOPICS]
-
-
-def _intel_save_topics(topics: list[dict]) -> None:
-    """Internal helper: intel save topics."""
-    INTEL_DIR.mkdir(exist_ok=True)
-    INTEL_TOPICS.write_text(json.dumps(topics, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _intel_enqueue(topic_name: str, query: str, raw: str) -> None:
-    """Internal helper: intel enqueue."""
-    with _intel_lock:
-        INTEL_DIR.mkdir(exist_ok=True)
-        try:
-            items = json.loads(INTEL_QUEUE.read_text(encoding="utf-8")) if INTEL_QUEUE.exists() else []
-        except Exception:
-            items = []
-        items.append({"topic": topic_name, "query": query, "raw": raw[:3000], "ts": time.time()})
-        INTEL_QUEUE.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
-
-
-def _intel_dequeue_all() -> list[dict]:
-    """Internal helper: intel dequeue all."""
-    with _intel_lock:
-        if not INTEL_QUEUE.exists():
-            return []
-        try:
-            items = json.loads(INTEL_QUEUE.read_text(encoding="utf-8"))
-            INTEL_QUEUE.write_text("[]", encoding="utf-8")
-            return items
-        except Exception:
-            return []
-
-
-def _intel_load_feed() -> str:
-    """Internal helper: intel load feed."""
-    if INTEL_FEED.exists():
-        try:
-            return INTEL_FEED.read_text(encoding="utf-8").strip()
-        except Exception:
-            _logger.debug("Failed to load intel feed from %s", INTEL_FEED)
-    return ""
-
-
-def _intel_prepend_entry(topic_name: str, summary: str) -> None:
-    """Internal helper: intel prepend entry."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = f"<!-- {ts} | {topic_name} -->\n{summary.strip()}"
-    with _intel_lock:
-        existing = _intel_load_feed()
-        chunks = [c.strip() for c in existing.split("\n\n") if c.strip()] if existing else []
-        chunks.insert(0, entry)
-        chunks = chunks[:40]  # cap at 40 entries
-        INTEL_FEED.write_text("\n\n".join(chunks), encoding="utf-8")
-
-
-def intel_get_recent(n: int = _INTEL_INJECT_N) -> str:
-    """Return the N most recent intel entries for injection into system prompt."""
-    feed = _intel_load_feed()
-    if not feed:
-        return ""
-    chunks = [c.strip() for c in feed.split("\n\n") if c.strip()]
-    return "\n\n".join(chunks[:n])
-
-
-def _intel_crawl_once() -> None:
-    """Pick the least-recently-crawled topic, do a web search, enqueue the raw result."""
-    if not _intel_enabled.is_set():
-        return
-    topic: dict | None = None
-    try:
-        # _INTEL_CRAWLERS runs multiple copies of this function concurrently.
-        # Claim the topic (mark last_checked, save) under the lock *before*
-        # doing the slow web search, so two threads never pick the same
-        # least-recently-crawled topic and _intel_extract_topics()'s topic
-        # additions can't be lost to an overlapping read-modify-write.
-        with _intel_lock:
-            topics = _intel_load_topics()
-            if not topics:
-                return
-            topic = min(topics, key=lambda t: t.get("last_checked", 0))
-            for t in topics:
-                if t["name"] == topic["name"]:
-                    t["last_checked"] = time.time()
-                    break
-            _intel_save_topics(topics)
-        raw = do_web_search(topic["query"], max_results=5)
-        if raw and "error" not in raw.lower()[:40]:
-            _intel_enqueue(topic["name"], topic["query"], raw)
-    except Exception:
-        _logger.debug("Intel background crawl failed for topic '%s'", topic.get("name", "?") if topic else "?")
-
-
-def _intel_process_queue(client) -> None:
-    """Post-turn: LLM-summarize queued raw results, update feed, train memory."""
-    items = _intel_dequeue_all()
-    if not items:
-        return
-    with _main_llm_busy_lock:
-        if _main_llm_busy and _aux_client is None:
-            return
-    for item in items:
-        try:
-            prompt = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Summarize these web search results into 3-5 concise bullet points "
-                        "(max 90 chars each). Focus on concrete facts, releases, and updates. "
-                        "No preamble, just the bullets."
-                    ),
-                },
-                {"role": "user", "content": f"Topic: {item['topic']}\n\n{item['raw'][:3000]}"},
-            ]
-            bg_client, bg_model = _bg_llm(client)
-            resp = bg_client.chat.completions.create(
-                model=bg_model,
-                messages=prompt,
-                stream=False,
-                max_tokens=250,
-                timeout=AUX_LLM_TIMEOUT,
-            )
-            summary = (resp.choices[0].message.content or "").strip()
-            if not summary or len(summary) < 20:
-                continue
-            _intel_prepend_entry(item["topic"], summary)
-            _intel_train_memory(client, item["topic"], summary)
-        except Exception:
-            _logger.debug("Intel queue item '%s' failed", item.get("topic", "?"))
-
-
-def _intel_train_memory(client: object, topic_name: str, summary: str) -> None:
-    """If the intel summary contains durable facts, add them to persistent memory."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    if _intel_memory_written.get(topic_name) == today:
-        return  # already wrote facts for this topic today
-    try:
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Decide if any of these facts should be saved to a persistent memory file "
-                    "(version numbers, critical releases, security alerts, key API changes). "
-                    "If yes, output 1-2 short bullet lines starting with '- '. "
-                    "If nothing is worth persisting, reply exactly: SKIP"
-                ),
-            },
-            {"role": "user", "content": f"Topic: {topic_name}\n{summary}"},
-        ]
-        bg_client, bg_model = _bg_llm(client)
-        resp = bg_client.chat.completions.create(
-            model=bg_model,
-            messages=prompt,
-            stream=False,
-            max_tokens=120,
-            timeout=AUX_LLM_TIMEOUT,
-        )
-        facts = _clean_memory_facts((resp.choices[0].message.content or "").strip(), drop_negations=True)
-        if facts and facts.startswith("-"):
-            with _memory_lock:
-                mem = load_memory()
-                tag = f"\n\n<!-- intel {today} -->\n{facts}"
-                save_memory((mem + tag).strip())
-            _intel_memory_written[topic_name] = today
-    except Exception:
-        _logger.debug("Intel memory training failed for '%s'", topic_name)
-
-
-def _intel_extract_topics(client, user_msg: str, reply: str) -> None:
-    """Post-turn: extract new search-worthy topics from this exchange and track them."""
-    with _main_llm_busy_lock:
-        if _main_llm_busy and _aux_client is None:
-            return
-    try:
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "Extract up to 2 web-searchable topics from this conversation worth monitoring "
-                    "(new technologies, frameworks, tools, or domains the user cares about). "
-                    "Reply one per line as: NAME|search query\n"
-                    "Example: FastAPI 1.0|FastAPI 1.0 release features changelog\n"
-                    "If nothing new to track, reply: NONE"
-                ),
-            },
-            {"role": "user", "content": f"User: {user_msg[:400]}\nAssistant: {reply[:400]}"},
-        ]
-        bg_client, bg_model = _bg_llm(client)
-        resp = bg_client.chat.completions.create(
-            model=bg_model,
-            messages=prompt,
-            stream=False,
-            max_tokens=80,
-            timeout=AUX_LLM_TIMEOUT,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        if not text or text.upper() == "NONE":
-            return
-        # See _intel_crawl_once(): topics.json is shared with the background
-        # crawler threads, so the read-modify-write must hold _intel_lock too
-        # or a concurrent crawl can silently overwrite these additions.
-        with _intel_lock:
-            topics = _intel_load_topics()
-            existing = {t["name"].lower() for t in topics}
-            for line in text.splitlines():
-                if "|" not in line:
-                    continue
-                name, query = line.split("|", 1)
-                name, query = name.strip(), query.strip()
-                if name and query and name.lower() not in existing:
-                    topics.append({"name": name, "query": query, "last_checked": 0})
-                    existing.add(name.lower())
-            if len(topics) > 25:
-                topics = sorted(topics, key=lambda t: t.get("last_checked", 0), reverse=True)[:25]
-            _intel_save_topics(topics)
-    except Exception:
-        _logger.debug("Intel topic extraction failed")
-
-
-def _intel_crawler_thread(delay_s: int) -> None:
-    """Background daemon: crawl one topic every _INTEL_INTERVAL seconds."""
-    INTEL_DIR.mkdir(exist_ok=True)
-    _intel_stop.wait(timeout=delay_s)  # stagger startup
-    while not _intel_stop.is_set():
-        try:
-            _intel_crawl_once()
-        except Exception:
-            # _intel_crawl_once() already wraps its own body in try/except;
-            # this outer guard exists so a bug there can never silently kill
-            # this thread forever (as `_intel_enabled = False` used to, by
-            # replacing the Event with a plain bool — see _cmd_intel).
-            _logger.exception("Intel crawler thread tick failed")
-        _intel_stop.wait(timeout=_INTEL_INTERVAL)
-
-
-_intel_threads_started = False  # crawler threads spawn at most once per process
-
-
-def start_intel_crawlers(force: bool = False) -> None:
-    """Start _INTEL_CRAWLERS background crawler threads, staggered.
-
-    Opt-in: crawlers cost 3 background browser threads plus system-prompt
-    tokens for the injected feed. They start at launch only with config
-    intel="on" (or QWEN_INTEL=on); /intel on passes force=True to start
-    them mid-session. Idempotent — a second call just re-enables crawling
-    if it was paused with /intel off.
-    """
-    global _intel_threads_started
-    if not force and INTEL_MODE != "on":
-        return
-    if not INTEL_TOPICS.exists():
-        _intel_save_topics([dict(t) for t in _INTEL_DEFAULT_TOPICS])
-    # threading.Event() starts unset; without this, _intel_crawl_once()'s
-    # `if not _intel_enabled.is_set(): return` guard is true forever and no
-    # crawler thread ever does real work.
-    _intel_enabled.set()
-    if _intel_threads_started:
-        return
-    _intel_threads_started = True
-    stagger = max(15, _INTEL_INTERVAL // _INTEL_CRAWLERS)
-    for i in range(_INTEL_CRAWLERS):
-        t = threading.Thread(
-            target=_intel_crawler_thread,
-            args=(15 + i * stagger,),
-            daemon=True,
-            name=f"intel-crawler-{i}",
-        )
-        t.start()
-
-
 _NOT_PLAN_RE = re.compile(
     r"\b(question|clarif|let\s+me\s+know|could\s+you|can\s+you|please\s+(share|tell)|"
     r"what\s+(kind|type|should|do|are|is)|any\s+(preference|design|tech|stack)|"
@@ -4065,159 +3285,6 @@ def _run_code_block(lang: str, code: str) -> None:
     console.print(result)
 
 
-def _smart_cap(client: object, result: str, name: str, context: str = "") -> str:
-    """Cap a tool result. Summarizes web/fetch results via LLM; hard-truncates others."""
-    if name == "read_file":
-        # read_file paginates itself with honest range headers and continuation
-        # hints; a blind head-truncation here would cut the footer and reintroduce
-        # the "model thinks it read the whole file" bug.
-        return result
-    if len(result) <= TOOL_RESULT_LIMIT:
-        return result
-    if name not in _SUMMARIZE_TOOLS:
-        return _cap_result(result, name)
-    try:
-        # Text-based key-fact extraction first (fast, no LLM call)
-        key_lines = []
-        url_re = re.compile(r"https?://\S+")
-        number_re = re.compile(r"\b\d{2,}(?:,\d{0,3})*(?:\.\d+)?\b")
-        seen_urls = set()
-        for _line in result.strip().split("\n"):
-            _line = _line.strip()
-            if not _line:
-                continue
-            urls = url_re.findall(_line)
-            new_urls = [u for u in urls if u not in seen_urls]
-            if new_urls or number_re.search(_line) or len(_line) < 120:
-                seen_urls.update(new_urls)
-                key_lines.append(_line)
-        if len(key_lines) <= 80:
-            return f"[key facts extracted {len(result):,}->{len(key_lines):,} lines]\n\n" + "\n".join(key_lines)
-        ctx_hint = f' relevant to: "{context[:200]}"' if context else ""
-        prompt = [
-            {"role": "system", "content": "Summarize precisely. Preserve all URLs, numbers, and key facts."},
-            {
-                "role": "user",
-                "content": (
-                    f"Summarize the following{ctx_hint} in under 1500 words, "
-                    f"keeping all URLs and critical data:\n\n{result[:40_000]}"
-                ),
-            },
-        ]
-        bg_client, bg_model = _bg_llm(client)
-        resp = bg_client.chat.completions.create(
-            model=bg_model,
-            messages=prompt,
-            stream=False,
-            max_tokens=1500,
-            timeout=AUX_LLM_TIMEOUT,
-        )
-        summary = (resp.choices[0].message.content or "").strip()
-        return f"[summarized {len(result):,}→{len(summary):,} chars]\n\n{summary}"
-    except Exception:
-        return _cap_result(result, name)
-
-
-_context_growth_history: list[int] = []  # token counts per turn for growth tracking
-
-
-def _track_context_growth(token_count: int) -> None:
-    """Track token count after each turn for predictive compaction."""
-    _context_growth_history.append(token_count)
-    if len(_context_growth_history) > 10:
-        _context_growth_history.pop(0)
-
-
-def _estimate_turns_remaining(current_tokens: int, threshold_pct: int = 80) -> int:
-    """Estimate how many turns until context reaches the threshold."""
-    if len(_context_growth_history) < 2:
-        return -1
-    recent = _context_growth_history[-5:] if len(_context_growth_history) >= 5 else _context_growth_history
-    growths = [recent[i] - recent[i - 1] for i in range(1, len(recent)) if recent[i] > recent[i - 1]]
-    if not growths:
-        return -1
-    avg_growth = sum(growths) // len(growths)
-    if avg_growth <= 0:
-        return -1
-    threshold_tokens = TOKEN_LIMIT * threshold_pct // 100
-    remaining = max(0, threshold_tokens - current_tokens)
-    return max(1, remaining // avg_growth)
-
-
-def _detect_session_type(history: list) -> str:
-    """Classify the session as 'chatty', 'heavy', or 'normal' based on message sizes."""
-    if not history:
-        return "normal"
-    sizes = [len(m.get("content", "") or "") for m in history if m.get("role") in ("user", "assistant")]
-    if not sizes:
-        return "normal"
-    avg_size = sum(sizes) / len(sizes)
-    if avg_size > 5000:
-        return "heavy"
-    if len(sizes) > 20 and avg_size < 500:
-        return "chatty"
-    return "normal"
-
-
-def _adaptive_compaction_threshold(session_type: str) -> int:
-    """Return the compaction threshold percentage based on session type."""
-    if session_type == "heavy":
-        return 70
-    if session_type == "chatty":
-        return 85
-    return 80
-
-
-def _cap_result(result: str, name: str = "") -> str:
-    """Internal helper: cap result."""
-    if len(result) <= TOOL_RESULT_LIMIT:
-        return result
-    return (
-        result[:TOOL_RESULT_LIMIT]
-        + f"\n\n... [truncated: result was {len(result):,} chars; showing first {TOOL_RESULT_LIMIT:,}]"
-    )
-
-
-def _call_with_retry(name: str, args: dict, dispatch_fn, max_retries: int = _TOOL_RETRY_MAX) -> str:
-    """Execute a tool call with retry logic and exponential backoff.
-
-    Only retries retryable tools (network/file reads). Write operations and
-    interactive tools are never retried to avoid side effects.
-
-    On each retry the error from the previous attempt is appended to the
-    returned result so the model can see what failed and adapt.
-    """
-    if name not in _TOOL_RETRYABLE_TOOLS:
-        return dispatch_fn(name, args)
-
-    errors: list[str] = []
-    for attempt in range(1 + max_retries):
-        try:
-            return dispatch_fn(name, args)
-        except Exception as e:
-            errors.append(f"[attempt {attempt + 1}/{1 + max_retries}] {type(e).__name__}: {e}")
-            if attempt < max_retries:
-                backoff = _TOOL_RETRY_BASE * (2**attempt)
-                console.print(
-                    f"[dim yellow]  [retry {attempt + 1}/{max_retries}] {name} failed — "
-                    f"retrying in {backoff:.0f}s: {e}[/dim yellow]"
-                )
-                time.sleep(backoff)
-
-    # All retries exhausted — return a structured error so the model can reason about it
-    err_summary = "; ".join(errors)
-    hint_map = {
-        "web_search": "Try a different query or use fetch_url on a specific URL.",
-        "search_news": "Try rewording the query or use web_search instead.",
-        "fetch_url": "Check the URL is correct. Try fetch_rendered for JavaScript pages.",
-        "fetch_rendered": "The page may require interaction. Try browser_action to navigate and fill forms.",
-        "describe_image": "Verify the image URL is publicly accessible.",
-        "get_video_transcript": "The video may not have captions. Try searching for a transcript via web_search.",
-    }
-    hint = hint_map.get(name, "Consider using a different tool to achieve the same goal.")
-    return f"[tool_call_failed: {name} after {1 + max_retries} attempts\nerrors: {err_summary}\nhint: {hint}]"
-
-
 _TIMEOUT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="qwen-timeout")
 atexit.register(lambda: _TIMEOUT_POOL.shutdown(wait=False))
 
@@ -4467,674 +3534,6 @@ def _execute_tool_call(client, name: str, args: dict) -> str:
     if name in _PARALLEL_TOOLS:
         return _call_tool_safe(name, args)
     return _dispatch_interactive(name, args)
-
-
-def _auto_presearch(working: list) -> list:
-    """Before the first LLM call, auto-run web_search on the user's message and
-    inject the results as grounding context. Whether it fires is governed by
-    AUTO_SEARCH_MODE (off | smart | aggressive); see presearch_decision().
-    """
-    last_user = next(
-        (m.get("content", "") for m in reversed(working) if m.get("role") == "user"),
-        "",
-    )
-    do_search, query = presearch_decision(last_user, AUTO_SEARCH_MODE)
-    if not do_search:
-        return working
-
-    console.print(f"[dim cyan]  [auto-search] {query[:70]}[/dim cyan]")
-    results = do_web_search(query, max_results=5)
-    suffix = (
-        f"\n\n[Auto web search results — use these to ground your answer. "
-        f"Search again with web_search if you need more detail.]\n\n{results}"
-    )
-
-    # Append results to the last user message content (avoids mid-conversation system messages)
-    new_working = list(working)
-    for i in range(len(new_working) - 1, -1, -1):
-        if new_working[i].get("role") == "user":
-            msg = dict(new_working[i])
-            msg["content"] = (msg.get("content") or "") + suffix
-            new_working[i] = msg
-            return new_working
-
-    return new_working
-
-
-def _inject_volatile_tail(working: list) -> list:
-    """Append per-turn volatile context (git state) to the outgoing user message.
-
-    Lives at the tail of the conversation, not in the system prompt: git status
-    changes after every file edit, and a changed system prompt costs a full
-    prefix re-eval, while a changed tail costs only the last few hundred tokens.
-    Only the messages copy sent to the API is modified — the raw user input is
-    what lands in the saved history, so old turns stay byte-stable too.
-    """
-    git_ctx = get_git_context()
-    if not git_ctx:
-        return working
-    suffix = f"\n\n[Current git state — for reference]\n{git_ctx}"
-    new_working = list(working)
-    for i in range(len(new_working) - 1, -1, -1):
-        if new_working[i].get("role") == "user":
-            msg = dict(new_working[i])
-            msg["content"] = (msg.get("content") or "") + suffix
-            new_working[i] = msg
-            break
-    return new_working
-
-
-def _ledger_entry(name: str, args: dict, result: str) -> str | None:
-    """One compact line for the turn ledger — only tools whose effects the next
-    turn needs to know about (reads, file mutations, commands)."""
-    first = (result or "").strip().splitlines()[0] if result else ""
-    if name == "read_file":
-        fname = Path(str(args.get("path", ""))).name
-        m = re.search(r"\((\d[\d,]* lines|lines [\d,]+[–-][\d,]+ of [\d,]+)\)", first)
-        return f"read {fname} ({m.group(1)})" if m else f"read {fname}"
-    if name in _MUTATING_FILE_TOOLS:
-        if first.startswith("["):
-            return first[:120]
-        return f"{name} {Path(str(args.get('path', ''))).name}"
-    if name in ("run_command", "run_script"):
-        cmd = str(args.get("command") or args.get("code") or "").replace("\n", " ")[:60]
-        failed = first.lower().startswith(("[error", "[tool_call", "[timeout", "[blocked", "[cancelled"))
-        return f"{name} {cmd!r}" + (f" -> {first[:60]}" if failed else "")
-    return None
-
-
-def _format_turn_ledger() -> str:
-    """Render _turn_ledger as a tag for the stored assistant message ('' if empty)."""
-    if not _turn_ledger:
-        return ""
-    entries = list(_turn_ledger)
-    if len(entries) > 14:
-        entries = entries[:3] + [f"...{len(entries) - 13} more..."] + entries[-10:]
-    return f"\n\n[turn actions: {'; '.join(entries)[:900]}]"
-
-
-def _compact_tool_loop(working: list, keep_recent_tools: int = 4, head_chars: int = 240) -> list:
-    """Shrink older tool results during an in-progress tool loop so a long agentic
-    run doesn't overflow the context window before it finishes.
-
-    Only the *content* of older `tool` messages is truncated to a short preview — no
-    message is removed, so every assistant `tool_calls` keeps its matching `tool`
-    result (the API requires that pairing; dropping messages would orphan a call).
-    The most recent `keep_recent_tools` results, all assistant reasoning, and the
-    task/user messages are left intact, so the model keeps its recent findings and
-    still knows what it is working on.
-    """
-    tool_idxs = [i for i, m in enumerate(working) if m.get("role") == "tool"]
-    if len(tool_idxs) <= keep_recent_tools:
-        return working
-    new = list(working)
-    shrunk = 0
-    for i in tool_idxs[:-keep_recent_tools]:
-        content = new[i].get("content") or ""
-        if len(content) > head_chars + 80:
-            new[i] = {
-                **new[i],
-                "content": content[:head_chars]
-                + f"\n[... {len(content) - head_chars:,} chars condensed to fit context]",
-            }
-            shrunk += 1
-    if shrunk:
-        console.print(f"[dim]  [mid-run compact] condensed {shrunk} older tool result(s) to free context[/dim]")
-    return new
-
-
-def run_turn(client: object, messages: list, allow_tools: bool = True, presearch: bool = True) -> str | None:
-    """Full turn with tool-use loop. Returns reply, '' on cancel, None on error.
-
-    presearch=False skips the auto-web-search grounding pass — used for
-    synthetic follow-up messages (e.g. the hedging re-check) that already
-    instruct the model to search itself.
-    """
-    global _last_turn_tokens, _real_ctx_tokens, _turn_hit_round_cap
-    _turn_hit_round_cap = False  # set when this turn ends via the MAX_TOOL_DEPTH forced synthesis
-    del _last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
-    del _turn_ledger[:]  # fresh action ledger for this turn (read by the REPL history append)
-    _turn_read_cache.clear()  # fresh read-dedup window for this turn
-    working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
-    if allow_tools:
-        working = _inject_volatile_tail(working)
-    # Feature 10: Surface unresolved errors from prior turn
-    try:
-        trend = _get_lsp().lsp_trend_report()
-        if trend.get("unresolved_errors"):
-            console.print("[dim red]  Unresolved errors from prior edit:[/dim red]")
-            for e in trend["unresolved_errors"][:5]:
-                console.print(f"    {e}")
-    except Exception:
-        _logger.debug("LSP trend report unavailable", exc_info=True)
-
-    use_tools = allow_tools
-    first_call = True
-    depth = 0
-    tool_chain: list[str] = []
-    total_prompt = 0
-    total_completion = 0
-    final_segments: list[str] = []  # final-answer pieces, joined across auto-continues
-    auto_continue = 0  # how many times we've resumed a cut-off answer
-    empty_retries = 0  # nudges sent after an empty final reply (no text, no tools)
-
-    while True:
-        # Mid-run compaction: a long tool loop can pile up large tool results and
-        # overflow the context window before the task finishes. When the working set
-        # nears the limit, shrink older tool results in place so the run keeps going.
-        # approx_tokens underestimates when tool results are token-dense, so also
-        # trust the real prompt count the server reported for the previous call.
-        if depth > 0 and max(approx_tokens(working), _real_ctx_tokens) >= TOKEN_LIMIT * 0.85:
-            working = _compact_tool_loop(working)
-
-        if depth >= MAX_TOOL_DEPTH:
-            _turn_hit_round_cap = True  # REPL may auto-continue if the plan is unfinished (global decl at top)
-            console.print(
-                f"[yellow][max tool depth ({MAX_TOOL_DEPTH}) reached — synthesizing with gathered data][/yellow]"
-            )
-            # Force one final no-tools call so the model can answer with what it found
-            synth_msgs = list(working)
-            synth_msgs.append(
-                {
-                    "role": "user",
-                    "content": "Based on all the information gathered above, provide a comprehensive answer now. "
-                    "Do not search for more — synthesize what you have.",
-                }
-            )
-            try:
-                with Live("", console=console, vertical_overflow="crop", refresh_per_second=15, transient=True) as live:
-                    final_text, _, final_usage = stream_once(
-                        client,
-                        synth_msgs,
-                        use_tools=False,
-                        update_fn=_live_updater(live),
-                    )
-                final_text, think_c = _strip_think(final_text)
-                if think_c:
-                    console.print(
-                        Panel(Markdown(think_c), title="[dim]thinking[/dim]", border_style="dim", padding=(0, 1))
-                    )
-                console.print(Markdown(final_text) if final_text else Markdown("*(no synthesis)*"))
-                total_prompt += final_usage.get("prompt", 0)
-                total_completion += final_usage.get("completion", 0)
-            except Exception:
-                final_text = ""
-            if tool_chain:
-                console.print(f"[dim]  ↳ {' → '.join(tool_chain)}[/dim]")
-            _last_turn_tokens = {"prompt": total_prompt, "completion": total_completion}
-            return ("".join(final_segments) + (final_text or "")) or None
-
-        depth_tag = f" [dim][{depth}/{MAX_TOOL_DEPTH}][/dim]" if depth > 0 else ""
-        console.print(Rule(f"[bold green]Qwen[/bold green]{depth_tag}", style="dim green"))
-
-        try:
-            with Live("", console=console, vertical_overflow="crop", refresh_per_second=15, transient=True) as live:
-                text, tool_calls, usage = stream_once(
-                    client,
-                    working,
-                    use_tools,
-                    _live_updater(live),
-                )
-            text, think_content = _strip_think(text)
-            if think_content:
-                console.print(
-                    Panel(
-                        Markdown(think_content),
-                        title="[dim]thinking[/dim]",
-                        border_style="dim",
-                        padding=(0, 1),
-                    )
-                )
-            if text:
-                console.print(Markdown(text))
-            elif not tool_calls:
-                console.print(Markdown("*(no response)*"))
-        except KeyboardInterrupt:
-            console.print("\n[dim][cancelled][/dim]")
-            return ""
-        except Exception as e:
-            if use_tools and first_call:
-                console.print(f"[yellow][retrying without tool use — {e}][/yellow]")
-                use_tools = False
-                first_call = False
-                try:
-                    with Live(
-                        "", console=console, vertical_overflow="crop", refresh_per_second=15, transient=True
-                    ) as live:
-                        text, tool_calls, usage = stream_once(
-                            client,
-                            working,
-                            False,
-                            _live_updater(live),
-                        )
-                    text, think_content = _strip_think(text)
-                    if think_content:
-                        console.print(
-                            Panel(
-                                Markdown(think_content),
-                                title="[dim]thinking[/dim]",
-                                border_style="dim",
-                                padding=(0, 1),
-                            )
-                        )
-                    console.print(Markdown(text) if text else Markdown("*(no response)*"))
-                except KeyboardInterrupt:
-                    console.print("\n[dim][cancelled][/dim]")
-                    return ""
-                except Exception as e2:
-                    console.print(f"[red][error] {e2}[/red]")
-                    return None
-            else:
-                console.print(f"[red][error] {e}[/red]")
-                return None
-
-        total_prompt += usage.get("prompt", 0)
-        total_completion += usage.get("completion", 0)
-        # Keep the most recent real prompt token count so auto-compact uses it
-        if usage.get("prompt", 0):
-            _real_ctx_tokens = usage["prompt"]
-
-        if not tool_calls:
-            # An empty final reply (no text, no tools) burns the whole turn — seen
-            # in practice as "(no response)" iterations. Nudge the model once
-            # before giving up.
-            if not text.strip() and not final_segments and empty_retries < 1:
-                empty_retries += 1
-                console.print("[yellow]  \\[empty response — asking the model to answer][/yellow]")
-                working.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your last response was empty. Answer the request now — if you need "
-                            "information, call a tool; otherwise state your answer directly."
-                        ),
-                    }
-                )
-                continue
-            final_segments.append(text)
-            # The model produced a final answer with no tool calls. If it was cut
-            # off mid-output (token cap hit, or the stream dropped), it hasn't
-            # actually finished the project — resume it instead of stopping.
-            if usage.get("truncated") and text.strip() and auto_continue < MAX_AUTO_CONTINUE:
-                auto_continue += 1
-                fr = usage.get("finish_reason") or "stream ended"
-                console.print(
-                    f"[yellow]  \\[response cut off ({fr}) — continuing {auto_continue}/{MAX_AUTO_CONTINUE}][/yellow]",
-                )
-                working.append({"role": "assistant", "content": text})
-                working.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous message was cut off before you finished. "
-                            "Continue from exactly where you stopped — do not repeat anything "
-                            "you already wrote, and do not start over."
-                        ),
-                    }
-                )
-                continue
-            if usage.get("truncated") and auto_continue >= MAX_AUTO_CONTINUE:
-                console.print(
-                    f"[yellow]  \\[still cut off after {MAX_AUTO_CONTINUE} continuations — stopping][/yellow]",
-                )
-            if tool_chain:
-                console.print(f"[dim]  ↳ {' → '.join(tool_chain)}[/dim]")
-            _last_turn_tokens = {"prompt": total_prompt, "completion": total_completion}
-            return "".join(final_segments)
-
-        working.append(
-            {
-                "role": "assistant",
-                "content": text or None,
-                "tool_calls": [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
-                    }
-                    for tc in tool_calls
-                ],
-            }
-        )
-
-        # Parse args upfront; handle malformed JSON per-call
-        parsed_args: list[dict | None] = []
-        for tc in tool_calls:
-            try:
-                parsed_args.append(json.loads(tc["function"]["arguments"]))
-            except json.JSONDecodeError:
-                parsed_args.append(None)
-
-        # Extract user query for summarization context
-        last_user_msg = next(
-            (m.get("content", "") for m in reversed(working) if m.get("role") == "user"),
-            "",
-        )
-
-        # Collect results indexed by position
-        tool_results: dict[int, tuple[str, str]] = {}  # idx -> (tc_id, result)
-
-        # Classify tools into sequential batches to avoid conflicts
-        batches = _classify_tool_batch(tool_calls, parsed_args)
-
-        try:
-            pool = _get_pool()
-            for batch in batches:
-                safe_futures: dict[int, concurrent.futures.Future] = {}
-
-                for i in batch:
-                    tc, args = tool_calls[i], parsed_args[i]
-                    name = tc["function"]["name"]
-                    if args is None:
-                        err = (
-                            f"[tool_call_error: malformed JSON arguments for '{name}'. "
-                            f"Please retry the call with valid JSON.]"
-                        )
-                        tool_chain.append(f"{name}(!json)")
-                        tool_results[i] = (tc["id"], err)
-                        continue
-                    if name in _PARALLEL_TOOLS:
-                        tool_chain.append(f"{name}({_short_args(name, args)})")
-                        safe_futures[i] = pool.submit(
-                            _call_with_retry,
-                            name,
-                            args,
-                            _call_tool_safe,
-                            max_retries=_TOOL_RETRY_MAX,
-                        )
-                    elif name in _TOOL_RETRYABLE_TOOLS and name not in _PARALLEL_TOOLS:
-                        tool_chain.append(f"{name}({_short_args(name, args)})")
-                        result = _call_with_retry(name, args, _dispatch_interactive)
-                        tool_results[i] = (tc["id"], _smart_cap(client, result, name, last_user_msg))
-                    else:
-                        tool_chain.append(f"{name}({_short_args(name, args)})")
-                        result = _dispatch_interactive(name, args)
-                        tool_results[i] = (tc["id"], _smart_cap(client, result, name, last_user_msg))
-
-                for i, fut in safe_futures.items():
-                    try:
-                        result = fut.result(timeout=60)
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as exc:
-                        idx = i
-                        rname = tool_calls[idx]["function"]["name"]
-                        try:
-                            result = _call_with_retry(rname, parsed_args[idx], _call_tool_safe, max_retries=1)
-                        except Exception as exc2:
-                            result = f"[tool error: {exc}; retry: {exc2}]"
-                    tool_results[i] = (
-                        tool_calls[i]["id"],
-                        _smart_cap(client, result, tool_calls[i]["function"]["name"], last_user_msg),
-                    )
-
-            for i in range(len(tool_calls)):
-                tc_id, result = tool_results[i]
-                working.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-                args_i = parsed_args[i] if isinstance(parsed_args[i], dict) else {}
-                entry = _ledger_entry(tool_calls[i]["function"]["name"], args_i, result)
-                if entry:
-                    _turn_ledger.append(entry)
-
-            first_call = False
-            depth += 1
-        except KeyboardInterrupt:
-            console.print("\n[dim][tools cancelled — returning to prompt][/dim]")
-            for i in range(len(tool_calls)):
-                working.append(
-                    {"role": "tool", "tool_call_id": tool_calls[i]["id"], "content": "[user cancelled tool execution]"}
-                )
-
-
-# ---------------------------------------------------------------------------
-# Truncate-middle — fast, no LLM call, used by auto-compact
-# ---------------------------------------------------------------------------
-
-
-def truncate_middle(history: list, keep_first: int = 6, keep_last: int = 20) -> list:
-    """Drop middle messages to recover context space. Keeps system msgs + first K + last K chat turns."""
-    sys_msgs = [m for m in history if m.get("role") == "system"]
-    chat_msgs = [m for m in history if m.get("role") != "system"]
-
-    if len(chat_msgs) <= keep_first + keep_last:
-        console.print("[dim][truncate-middle: history too short to trim][/dim]")
-        return history
-
-    first = chat_msgs[:keep_first]
-    last = chat_msgs[-keep_last:]
-    dropped = len(chat_msgs) - keep_first - keep_last
-
-    marker = {
-        "role": "system",
-        "content": (
-            f"[{dropped} messages from the middle of this conversation were removed "
-            f"to fit the context window. The first {keep_first} and most recent "
-            f"{keep_last} messages are retained below.]"
-        ),
-    }
-    new_history = sys_msgs + first + [marker] + last
-    console.print(
-        f"[dim][truncate-middle: dropped {dropped} middle messages — "
-        f"kept {keep_first} oldest + {keep_last} most recent][/dim]",
-    )
-    return new_history
-
-
-# ---------------------------------------------------------------------------
-# /trim — sliding-window summarization (manual, LLM-based)
-# ---------------------------------------------------------------------------
-
-
-def cmd_trim(history: list, client: object) -> list:
-    """Command: trim."""
-    # Whatever this function returns, the last real prompt-token count from the
-    # API no longer describes the (possibly shrunk) history — _maybe_autocompact
-    # must recompute rather than reuse a now-stale figure.
-    global _real_ctx_tokens
-    _real_ctx_tokens = 0
-    CHUNK = 8
-    keep_count = 4
-    if len(history) < keep_count + CHUNK:
-        console.print("[dim][history too short to trim (need ≥12 turns)][/dim]")
-        return history
-
-    # Separate "work" turns from pure chat, keyed on the turn-actions ledger the
-    # REPL appends to assistant messages (tool results themselves never enter
-    # history, so markers like "[patched:" only appear if the model happens to
-    # quote them — the ledger tag is the reliable signal). Work turns are kept
-    # in condensed form: trimmed prose + the full ledger line.
-    _work_markers = ("[turn actions:", "[patched:", "[created:", "[updated:", "[write_file]", "[patch_file]")
-    work_pairs: list[tuple[int, dict, dict | None]] = []  # (orig_idx, user_msg, asst_msg)
-    chat_only: list[dict] = []
-
-    to_process_full = history[:-keep_count]
-    keep = history[-keep_count:]
-
-    i = 0
-    while i < len(to_process_full):
-        msg = to_process_full[i]
-        if msg.get("role") == "user":
-            asst = to_process_full[i + 1] if i + 1 < len(to_process_full) else None
-            asst_content = (asst.get("content") or "") if asst else ""
-            if any(m in asst_content for m in _work_markers):
-                work_pairs.append((i, msg, asst))
-                i += 2
-                continue
-        chat_only.append(msg)
-        i += 1
-
-    to_process = chat_only
-    if not to_process:
-        console.print("[dim][nothing to summarize — all turns contain file modifications][/dim]")
-        return history
-
-    console.print(
-        f"[dim]Summarizing {len(to_process)} chat messages"
-        f"{f' (preserving {len(work_pairs)} work turn(s) verbatim)' if work_pairs else ''}"
-        f" in chunks of {CHUNK}...[/dim]",
-    )
-
-    rolling_summary = ""
-    i = 0
-    chunk_num = 0
-    while i < len(to_process):
-        chunk = to_process[i : i + CHUNK]
-        chunk_num += 1
-        chunk_text = "\n".join(
-            f"{m['role'].upper()}: {(m.get('content') or '')[:600]}"
-            for m in chunk
-            if m.get("role") in ("user", "assistant")
-        )
-        user_content = (
-            (
-                f"Previous summary: {rolling_summary}\n\n"
-                f"New exchanges:\n{chunk_text}\n\n"
-                "Write an updated running summary in 3-5 sentences."
-            )
-            if rolling_summary
-            else f"Summarize this conversation in 3-5 sentences:\n\n{chunk_text}"
-        )
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a concise summarizer for an ongoing work session. Preserve key "
-                    "decisions, facts, outcomes, code changes made, files modified, commands run, "
-                    "and their results — note what was changed and why. Then ALWAYS end with a "
-                    "line exactly of the form 'CURRENT TASK: <the objective being actively worked "
-                    "on right now and the immediate next step>' so the work can continue "
-                    "seamlessly after older messages are dropped from context."
-                ),
-            },
-            {"role": "user", "content": user_content},
-        ]
-        console.print(Rule(f"[dim]Chunk {chunk_num}[/dim]", style="dim"))
-        try:
-            with Live("", console=console, vertical_overflow="crop", refresh_per_second=15, transient=True) as live:
-                summary, _, _ = stream_once(client, prompt, use_tools=False, update_fn=_live_updater(live))
-            console.print(Markdown(summary))
-            rolling_summary = summary
-        except KeyboardInterrupt:
-            console.print("[dim][trim cancelled — keeping partial progress][/dim]")
-            break
-        i += CHUNK
-
-    if rolling_summary:
-        # Prepend session-changes note so the model knows what was modified
-        if _session_changes:
-            modified = ", ".join(Path(p).name for p in _session_changes)
-            rolling_summary = f"[Files modified this session: {modified}]\n\n{rolling_summary}"
-        # Carry the visible plan across compaction deterministically — the LLM
-        # summary alone loses it, and the model then re-plans from scratch and
-        # redoes already-completed steps after every trim.
-        if _current_plan:
-            icon = {"completed": "x", "in_progress": "~", "pending": " "}
-            plan_txt = "\n".join(f"  [{icon[s['status']]}] {s['text']}" for s in _current_plan)
-            rolling_summary += (
-                "\n\nPlan state (already agreed with the user — do NOT re-plan or redo "
-                "completed steps; continue from the first unfinished step):\n" + plan_txt
-            )
-        summary_msg = {
-            "role": "system",
-            "content": (
-                "[Earlier messages were compacted to free context. Summary of the work so far "
-                "below — keep going on the CURRENT TASK noted at its end without asking the user "
-                f"to repeat themselves:\n{rolling_summary}]"
-            ),
-        }
-        # Re-insert preserved work turns in their original order, condensed to
-        # trimmed prose + the full turn-actions ledger (verbatim preservation
-        # would defeat the point of trimming).
-        def _condense_work_pair(u: dict, a: dict | None) -> list[dict]:
-            uc = u.get("content") or ""
-            out = [{"role": "user", "content": uc[:200] + ("…" if len(uc) > 200 else "")}]
-            if a is not None:
-                ac = a.get("content") or ""
-                m = re.search(r"\[turn actions:.*\]\s*$", ac, re.DOTALL)
-                ledger = m.group(0) if m else ""
-                prose = (ac[: m.start()] if m else ac).strip()
-                body = prose[:300] + ("…" if len(prose) > 300 else "")
-                out.append({"role": "assistant", "content": body + ("\n\n" + ledger if ledger else "")})
-            return out
-
-        preserved = [
-            msg for _, u, a in sorted(work_pairs, key=lambda x: x[0]) for msg in _condense_work_pair(u, a)
-        ]
-        new_history = [summary_msg, *preserved, *keep]
-        console.print(
-            f"[dim][trimmed → 1 summary + {len(preserved)} preserved work turn(s) + {len(keep)} recent][/dim]",
-        )
-        return new_history
-    return history
-
-
-def _maybe_autocompact(history: list, base_system: str, client) -> list:
-    """Keep the session going when the context window fills up.
-
-    When usage crosses the limit we SUMMARIZE old turns (preserving file-editing
-    turns verbatim and an explicit 'CURRENT TASK' note) so the model remembers
-    what it was working on and continues seamlessly. Blunt truncate-middle is only
-    a last resort if summarization is unavailable or didn't free enough space.
-
-    Called both before and after each turn so a single large exchange can't blow
-    past the window unhandled. Returns the (possibly compacted) history.
-    """
-    global _real_ctx_tokens
-    if _real_ctx_tokens:
-        tok = _real_ctx_tokens
-    else:
-        full_msgs = [{"role": "system", "content": build_system_prompt(base_system)}, *history]
-        tok = approx_tokens(full_msgs)
-    pct = tok * 100 // TOKEN_LIMIT
-    _track_context_growth(tok)
-
-    compaction_threshold = _adaptive_compaction_threshold(_detect_session_type(history))
-    warning_threshold = max(60, compaction_threshold - 15)
-
-    if pct >= compaction_threshold:
-        label = "auto-compact" if pct >= 90 else "auto-trim"
-        console.print(
-            f"[yellow]  [{label}] context at {pct}% ({tok:,} tokens) — "
-            f"summarizing & preserving current task so work continues...[/yellow]",
-        )
-        before = len(history)
-        try:
-            history = cmd_trim(history, client)
-        except Exception as _trim_err:
-            console.print(f"[dim][summarize failed: {_trim_err} — truncating middle as fallback][/dim]")
-            history = truncate_middle(history)
-        # If still over after trim, escalate with progressively smaller keep values
-        after_tok = approx_tokens([{"role": "system", "content": build_system_prompt(base_system)}, *history])
-        if after_tok * 100 // TOKEN_LIMIT >= 85:
-            history = truncate_middle(history, keep_first=4, keep_last=16)
-            after_tok = approx_tokens([{"role": "system", "content": build_system_prompt(base_system)}, *history])
-        # Emergency: if still critically full, aggressive truncation
-        if after_tok * 100 // TOKEN_LIMIT >= 92:
-            console.print("[yellow]  [emergency-trim] still over — aggressive middle truncation[/yellow]")
-            history = truncate_middle(history, keep_first=2, keep_last=12)
-            _real_ctx_tokens = 0
-            return history
-        # If summarization couldn't shrink (too few but huge turns) and we're
-        # critically full, fall back to a hard middle-truncation as a safety net.
-        if len(history) >= before and pct >= 90:
-            history = truncate_middle(history)
-        _real_ctx_tokens = 0
-        # Compaction rewrites history, so the prefix cache is lost anyway — the
-        # one cheap moment to fold in memory/intel updates accumulated since the
-        # last snapshot (see refresh_system_snapshot).
-        refresh_system_snapshot()
-        after_tok = approx_tokens([{"role": "system", "content": build_system_prompt(base_system)}, *history])
-        console.print(
-            f"[green]  [{label} done] freed context to {after_tok * 100 // TOKEN_LIMIT}% ({after_tok:,} tokens)[/green]",
-        )
-    elif pct >= warning_threshold:
-        turns_left = _estimate_turns_remaining(tok, compaction_threshold)
-        turns_hint = f"~{turns_left} turns until auto-trim, " if turns_left > 0 else ""
-        console.print(
-            f"[yellow]  context: ~{tok:,} / {TOKEN_LIMIT:,} tokens ({pct}%) — "
-            f"{turns_hint}auto-trim at {compaction_threshold}%[/yellow]",
-        )
-    return history
 
 
 # ---------------------------------------------------------------------------

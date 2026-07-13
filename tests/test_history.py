@@ -93,6 +93,50 @@ def test_maybe_autocompact_falls_back_to_truncate_on_failure(qwen_cli, monkeypat
     assert any("removed" in (m.get("content") or "") for m in out)
 
 
+def test_maybe_autocompact_writes_an_overflow_handoff(qwen_cli, monkeypatch, tmp_path):
+    """On overflow, a resumable handoff must be written BEFORE history is
+    rewritten — a crash right after compaction otherwise leaves the next
+    session only the lightweight exit note."""
+    import json
+
+    import qwen_cli.core.sessions as sessions
+
+    monkeypatch.setattr(qwen_cli, "TOKEN_LIMIT", 1000)
+    monkeypatch.setattr(qwen_cli, "_real_ctx_tokens", 850)
+    monkeypatch.setattr(qwen_cli, "cmd_trim", lambda h, c: [{"role": "system", "content": "SUMMARY"}])
+    monkeypatch.setattr(qwen_cli, "_generate_handoff", lambda c, h, b: "OVERFLOW SUMMARY")
+    monkeypatch.setattr(
+        qwen_cli,
+        "_current_plan",
+        [
+            {"text": "step one", "status": "completed"},
+            {"text": "step two", "status": "in_progress"},
+        ],
+    )
+    handoff_file = tmp_path / "handoff.json"
+    monkeypatch.setattr(sessions, "HANDOFF_FILE", handoff_file)
+
+    qwen_cli._maybe_autocompact(_chat_history(40), "BASE", client="C")
+
+    data = json.loads(handoff_file.read_text(encoding="utf-8"))
+    assert data["summary"] == "OVERFLOW SUMMARY"
+    assert data["next_step"] == "step two"  # first unfinished plan step
+
+
+def test_handoff_next_step_round_trips_through_consume(qwen_cli, monkeypatch, tmp_path):
+    import qwen_cli.core.sessions as sessions
+
+    monkeypatch.setattr(sessions, "HANDOFF_FILE", tmp_path / "handoff.json")
+    history = [{"role": "user", "content": "fix the bug"}, {"role": "assistant", "content": "on it"}]
+
+    sessions._write_handoff("SUMMARY TEXT", history, next_step="rerun the tests")
+    handoff = sessions._consume_handoff()
+
+    assert handoff["next_step"] == "rerun the tests"
+    assert "The immediate next step was: rerun the tests" in handoff["prompt"]
+    assert not (tmp_path / "handoff.json").exists()  # consumed exactly once
+
+
 def test_cmd_trim_preserves_current_task_and_work_turns(qwen_cli, monkeypatch):
     # A file-editing ("work") turn early, then enough chat to trigger summarizing.
     history = [

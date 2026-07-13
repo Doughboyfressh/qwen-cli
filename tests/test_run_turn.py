@@ -429,6 +429,64 @@ def test_compact_tool_loop_is_a_noop_when_short(qwen_cli):
     assert qwen_cli._compact_tool_loop(working, keep_recent_tools=4) == working
 
 
+def test_task_anchor_is_appended_at_the_tail(qwen_cli):
+    working = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! What can I help you with?"},
+        {"role": "user", "content": "audit yourself"},
+        {"role": "tool", "tool_call_id": "c0", "content": "result"},
+    ]
+    out = qwen_cli._refresh_task_anchor(working, "audit yourself")
+    assert out[-1]["role"] == "user"
+    assert out[-1]["content"].startswith(qwen_cli._TASK_ANCHOR_PREFIX)
+    assert "audit yourself" in out[-1]["content"]
+    assert out[:-1] == working  # nothing else touched
+
+
+def test_task_anchor_is_idempotent_across_repeated_compactions(qwen_cli):
+    working = [{"role": "user", "content": "the task"}]
+    out = qwen_cli._refresh_task_anchor(working, "the task")
+    out.append({"role": "tool", "tool_call_id": "c1", "content": "more results"})
+    out = qwen_cli._refresh_task_anchor(out, "the task")
+
+    anchors = [m for m in out if (m.get("content") or "").startswith(qwen_cli._TASK_ANCHOR_PREFIX)]
+    assert len(anchors) == 1, "repeated compactions must not stack anchors"
+    assert out[-1] is anchors[0], "the anchor must move back to the tail"
+
+
+def test_task_anchor_noop_without_a_task(qwen_cli):
+    working = [{"role": "tool", "tool_call_id": "c0", "content": "r"}]
+    assert qwen_cli._refresh_task_anchor(working, "   ") == working
+
+
+def test_mid_run_compaction_reanchors_the_active_task(loop, monkeypatch, tmp_path):
+    """Regression: with the window nearly full, compaction condensed old tool
+    results but nothing re-stated the request — the model then answered the
+    stale greeting at the top of the window ("Hey! What's up?") instead of
+    finishing the task."""
+    f = tmp_path / "a.txt"
+    f.write_text("x", encoding="utf-8")
+    model = script(
+        loop,
+        monkeypatch,
+        [
+            # Real prompt count at the window limit forces compaction next round.
+            ("", [tool_call("read_file", {"path": str(f)})], usage(prompt=loop.TOKEN_LIMIT)),
+            ("audit finished", [], usage()),
+        ],
+    )
+    msgs = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! What can I help you with?"},
+        {"role": "user", "content": "audit yourself and tell me how we can improve you."},
+    ]
+    assert loop.run_turn(object(), msgs) == "audit finished"
+
+    second = model.rounds[1]["messages"]
+    assert second[-1]["content"].startswith(loop._TASK_ANCHOR_PREFIX)
+    assert "audit yourself" in second[-1]["content"]
+
+
 # ---------------------------------------------------------------------------
 # Presearch
 # ---------------------------------------------------------------------------

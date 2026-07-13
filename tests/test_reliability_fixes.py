@@ -67,14 +67,18 @@ class TestCleanMemoryFacts:
 
     def test_intel_train_skips_bulleted_skip(self, qwen_cli, monkeypatch, tmp_path):
         # The old check only caught bare 'SKIP'; '- SKIP' was written to memory.
+        import qwen_cli.core.intel as intel
+
         fake_resp = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="- SKIP"))]
         )
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **k: fake_resp))
         )
+        # _bg_llm and save_memory still live in main and intel reaches them
+        # lazily via _main — patching main must keep working.
         monkeypatch.setattr(qwen_cli, "_bg_llm", lambda c: (fake_client, "fake-model"))
-        monkeypatch.setattr(qwen_cli, "_intel_memory_written", {})
+        monkeypatch.setattr(intel, "_intel_memory_written", {})
         saved = []
         monkeypatch.setattr(qwen_cli, "save_memory", lambda text: saved.append(text))
         qwen_cli._intel_train_memory(None, "some topic", "irrelevant summary")

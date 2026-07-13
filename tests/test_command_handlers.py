@@ -189,9 +189,11 @@ def test_undo_with_empty_stack(qwen_cli, ctx, monkeypatch):
 
 
 @pytest.fixture()
-def pins_file(qwen_cli, tmp_path, monkeypatch):
+def pins_file(tmp_path, monkeypatch):
+    import qwen_cli.core.memory as memory
+
     p = tmp_path / "pins.json"
-    monkeypatch.setattr(qwen_cli, "PINS_FILE", p)
+    monkeypatch.setattr(memory, "PINS_FILE", p)
     return p
 
 
@@ -408,12 +410,14 @@ def test_cleanup_dry_run_deletes_nothing(qwen_cli, ctx, tmp_path, monkeypatch, i
 
 
 @pytest.fixture()
-def intel_files(qwen_cli, tmp_path, monkeypatch):
+def intel_files(tmp_path, monkeypatch):
+    import qwen_cli.core.intel as intel
+
     d = tmp_path / "intelligence"
     d.mkdir()
-    monkeypatch.setattr(qwen_cli, "INTEL_DIR", d)
-    monkeypatch.setattr(qwen_cli, "INTEL_TOPICS", d / "topics.json")
-    monkeypatch.setattr(qwen_cli, "INTEL_FEED", d / "feed.md")
+    monkeypatch.setattr(intel, "INTEL_DIR", d)
+    monkeypatch.setattr(intel, "INTEL_TOPICS", d / "topics.json")
+    monkeypatch.setattr(intel, "INTEL_FEED", d / "feed.md")
     return d
 
 

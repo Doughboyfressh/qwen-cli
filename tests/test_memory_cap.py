@@ -60,8 +60,10 @@ class TestEnforceMemoryCap:
 
 class TestSaveMemoryEnforcesCapEndToEnd:
     def test_save_memory_applies_the_cap(self, qwen_cli, tmp_path, monkeypatch):
-        monkeypatch.setattr(qwen_cli, "MEMORY_FILE", tmp_path / "memory.md")
-        monkeypatch.setattr(qwen_cli, "MEMORY_MAX_CHARS", 300)
+        import qwen_cli.core.memory as memory
+
+        monkeypatch.setattr(memory, "MEMORY_FILE", tmp_path / "memory.md")
+        monkeypatch.setattr(memory, "MEMORY_MAX_CHARS", 300)
         entries = [_block(f"entry{i}", 200) for i in range(10)]
         text = "\n\n".join(entries)
 
@@ -76,9 +78,10 @@ class TestSaveMemoryEnforcesCapEndToEnd:
         """/remember's blank-line separation (fixed alongside the cap) means
         the cap can drop individual remembered facts instead of lumping every
         /remember call into one block that's either kept or dropped whole."""
+        import qwen_cli.core.memory as memory
         from qwen_cli.core.commands import _cmd_remember
 
-        monkeypatch.setattr(qwen_cli, "MEMORY_FILE", tmp_path / "memory.md")
+        monkeypatch.setattr(memory, "MEMORY_FILE", tmp_path / "memory.md")
         ctx = SimpleNamespace()
 
         with patch.object(qwen_cli.console, "print"):

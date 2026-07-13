@@ -43,8 +43,11 @@ class TestVerificationPending:
 class TestRecordSessionChangesMemory:
     @pytest.fixture(autouse=True)
     def _isolate(self, tmp_path, monkeypatch):
+        import qwen_cli.core.memory as memory
+
         self.mem_file = tmp_path / "memory.md"
-        monkeypatch.setattr(qmain, "MEMORY_FILE", self.mem_file)
+        monkeypatch.setattr(memory, "MEMORY_FILE", self.mem_file)
+        # _session_changes stays main-owned state; memory.py reads it lazily.
         monkeypatch.setattr(qmain, "_session_changes", {})
         self.tmp_path = tmp_path
 

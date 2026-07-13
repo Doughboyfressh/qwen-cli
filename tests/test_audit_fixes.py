@@ -388,8 +388,12 @@ class TestToolGating:
 
 
 class TestIntelOptIn:
-    def _setup(self, qwen_cli, tmp_path, monkeypatch, mode):
+    """State moved to qwen_cli.core.intel — patch/assert there, not on main."""
+
+    def _setup(self, tmp_path, monkeypatch, mode):
         import threading as _threading
+
+        import qwen_cli.core.intel as intel
 
         started = []
 
@@ -400,32 +404,32 @@ class TestIntelOptIn:
             def start(self):
                 pass
 
-        monkeypatch.setattr(qwen_cli.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(intel.threading, "Thread", _FakeThread)
         topics = tmp_path / "topics.json"
         topics.write_text("[]", encoding="utf-8")
-        monkeypatch.setattr(qwen_cli, "INTEL_TOPICS", topics)
-        monkeypatch.setattr(qwen_cli, "INTEL_MODE", mode)
-        monkeypatch.setattr(qwen_cli, "_intel_threads_started", False)
-        monkeypatch.setattr(qwen_cli, "_intel_enabled", _threading.Event())
-        return started
+        monkeypatch.setattr(intel, "INTEL_TOPICS", topics)
+        monkeypatch.setattr(intel, "INTEL_MODE", mode)
+        monkeypatch.setattr(intel, "_intel_threads_started", False)
+        monkeypatch.setattr(intel, "_intel_enabled", _threading.Event())
+        return started, intel
 
-    def test_off_by_default_starts_nothing(self, qwen_cli, tmp_path, monkeypatch):
-        started = self._setup(qwen_cli, tmp_path, monkeypatch, "off")
-        qwen_cli.start_intel_crawlers()
+    def test_off_by_default_starts_nothing(self, tmp_path, monkeypatch):
+        started, intel = self._setup(tmp_path, monkeypatch, "off")
+        intel.start_intel_crawlers()
         assert started == []
-        assert not qwen_cli._intel_enabled.is_set()
+        assert not intel._intel_enabled.is_set()
 
-    def test_on_mode_starts_at_launch(self, qwen_cli, tmp_path, monkeypatch):
-        started = self._setup(qwen_cli, tmp_path, monkeypatch, "on")
-        qwen_cli.start_intel_crawlers()
-        assert len(started) == qwen_cli._INTEL_CRAWLERS
-        assert qwen_cli._intel_enabled.is_set()
+    def test_on_mode_starts_at_launch(self, tmp_path, monkeypatch):
+        started, intel = self._setup(tmp_path, monkeypatch, "on")
+        intel.start_intel_crawlers()
+        assert len(started) == intel._INTEL_CRAWLERS
+        assert intel._intel_enabled.is_set()
 
-    def test_force_starts_once_and_reenables(self, qwen_cli, tmp_path, monkeypatch):
-        started = self._setup(qwen_cli, tmp_path, monkeypatch, "off")
-        qwen_cli.start_intel_crawlers(force=True)  # /intel on
-        assert len(started) == qwen_cli._INTEL_CRAWLERS
-        qwen_cli._intel_enabled.clear()  # /intel off
-        qwen_cli.start_intel_crawlers(force=True)  # /intel on again
-        assert len(started) == qwen_cli._INTEL_CRAWLERS  # no duplicate threads
-        assert qwen_cli._intel_enabled.is_set()  # but crawling resumed
+    def test_force_starts_once_and_reenables(self, tmp_path, monkeypatch):
+        started, intel = self._setup(tmp_path, monkeypatch, "off")
+        intel.start_intel_crawlers(force=True)  # /intel on
+        assert len(started) == intel._INTEL_CRAWLERS
+        intel._intel_enabled.clear()  # /intel off
+        intel.start_intel_crawlers(force=True)  # /intel on again
+        assert len(started) == intel._INTEL_CRAWLERS  # no duplicate threads
+        assert intel._intel_enabled.is_set()  # but crawling resumed
