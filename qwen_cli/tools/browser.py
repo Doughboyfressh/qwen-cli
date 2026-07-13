@@ -3,6 +3,7 @@
 
 import contextlib
 import json
+import logging
 import random as _r
 import time
 import urllib.parse
@@ -16,6 +17,7 @@ from qwen_cli.core.config import DATA_DIR, _load_config
 from qwen_cli.tools.shared import _html_to_text
 
 console = Console(force_terminal=True, legacy_windows=False)
+_logger = logging.getLogger(__name__)
 _CFG = _load_config()
 
 
@@ -413,7 +415,7 @@ def _browser_detect_challenge_iframe(page) -> str:
                 if dom in furl:
                     return dom
     except Exception:
-        pass
+        _logger.debug("challenge-iframe probe failed", exc_info=True)
     return ""
 
 
@@ -432,7 +434,7 @@ def _browser_detect_antibot(page) -> str:
             if pat in content:
                 return pat
     except Exception:
-        pass
+        _logger.debug("anti-bot page probe failed", exc_info=True)
     return ""
 
 
@@ -644,7 +646,9 @@ def _migrate_legacy_cookie_file(ctx) -> None:
         if cookies:
             ctx.add_cookies(cookies)
     except Exception:
-        pass
+        # The whole point of this import is not to lose saved sessions — if it
+        # fails, the user should be able to find out why.
+        _logger.warning("could not import saved cookies from %s", COOKIE_FILE, exc_info=True)
 
 
 def _launch_persistent_chromium(

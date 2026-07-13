@@ -102,7 +102,8 @@ class MCPServer:
             for line in self.proc.stdout:  # type: ignore[union-attr]
                 self._lines.put(line)
         except Exception:
-            pass
+            # A broken pipe here is why a later tool call times out — leave a trace.
+            _logger.debug("MCP stdout reader stopped", exc_info=True)
         self._lines.put(None)  # EOF sentinel
 
     def _send(self, msg: dict) -> None:
@@ -196,7 +197,7 @@ class MCPServer:
             try:
                 self.proc.kill()
             except Exception:
-                pass
+                _logger.debug("MCP server kill failed during shutdown", exc_info=True)
         self.proc = None
 
 

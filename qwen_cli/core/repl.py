@@ -44,7 +44,7 @@ def _setup_tab_completion() -> None:
                         candidate = str(child) + ("/" if child.is_dir() else "")
                         if candidate.startswith(str(p)):
                             options.append(pre + candidate)
-                except Exception:
+                except OSError:  # half-typed path — nothing to complete yet
                     options = []
             else:
                 options = []
@@ -56,7 +56,9 @@ def _setup_tab_completion() -> None:
         _main._rl.set_completer(completer)
         _main._rl.parse_and_bind("tab: complete")
     except Exception:
-        pass
+        # Non-fatal, but the symptom ("tab completion doesn't work") is
+        # undiagnosable without this.
+        _logger.debug("readline completer setup failed", exc_info=True)
 
 
 def _make_pt_session() -> None:
@@ -94,7 +96,7 @@ def _make_pt_session() -> None:
                             name = child.name + ("/" if child.is_dir() else "")
                             if child.name.lower().startswith(stem.lower()):
                                 yield _PtCompletion(name, start_position=-len(stem))
-                    except Exception:
+                    except OSError:  # half-typed path — nothing to complete yet
                         pass
 
     _main._pt_session = _PtSession(
@@ -131,7 +133,7 @@ def _close_loitering_event_loop() -> None:
             warnings.simplefilter("ignore", DeprecationWarning)
             asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     except Exception:
-        pass
+        _logger.debug("event loop policy reset failed", exc_info=True)
 
 
 def _read_input_inline() -> str:
