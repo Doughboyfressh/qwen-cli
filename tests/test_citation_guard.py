@@ -286,3 +286,138 @@ def test_repl_does_not_fire_on_a_verified_citation(qwen_cli, code_file):
         _run_turn_and_handle_reply(ctx, "where is it?", allow_tools=True)
 
     assert len(calls) == 1, "a verified citation must not cost an extra round-trip"
+
+
+# ---------------------------------------------------------------------------
+# Symbol guard: invented function names attributed to real files
+#
+# The citation guard checks file:line. It did not catch what actually did the
+# damage in a live self-audit: cmd_repl, cmd_browser, cmd_fetch, _run_agent_loop
+# and _browser_init were reported with complexity scores and line counts. None of
+# them exist. Two P0 recommendations were built on them.
+#
+# The false-negative bias is deliberate. A name found ANYWHERE in the source is
+# accepted, and a false accusation costs a full round-trip — so most of these
+# tests pin down when the guard must stay silent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "repl.py").write_text(
+        "def read_input():\n    pass\n\ndef _repl_loop(ctx):\n    pass\n", encoding="utf-8"
+    )
+    (tmp_path / "main.py").write_text("import subprocess\n\ndef main():\n    subprocess.run(['git'])\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_invented_symbol_attributed_to_a_real_file_is_caught(qwen_cli, project):
+    """The exact failure: a table row about a function nobody ever wrote."""
+    text = "| 29 | `core/repl.py` | `cmd_repl` | 311 | CRITICAL |"
+    assert qwen_cli._unverified_symbols(text) == ["cmd_repl"]
+
+
+def test_multiple_invented_symbols(qwen_cli, project):
+    text = "In `main.py`, `cmd_browser` and `cmd_fetch` are the worst offenders."
+    assert qwen_cli._unverified_symbols(text) == ["cmd_browser", "cmd_fetch"]
+
+
+def test_real_symbol_is_not_flagged(qwen_cli, project):
+    assert qwen_cli._unverified_symbols("`core/repl.py` defines `_repl_loop`.") == []
+
+
+def test_symbol_that_only_appears_as_a_call_is_not_flagged(qwen_cli, project):
+    """Existence is a raw substring search — a call site is proof enough that the
+    name is real. The index only holds top-level defs; trusting it would accuse
+    every method and every import."""
+    assert qwen_cli._unverified_symbols("`main.py` shells out via `subprocess`.") == []
+
+
+def test_proposals_are_not_flagged(qwen_cli, project):
+    """Code that does not exist YET is the whole point of a suggestion."""
+    for line in [
+        "In `core/repl.py` you should extract a `handle_input` helper.",
+        "Consider adding `_dispatch_command` to `main.py`.",
+        "Split `main.py` and create `parse_args` there.",
+    ]:
+        assert qwen_cli._unverified_symbols(line) == [], line
+
+
+def test_symbol_without_a_file_reference_is_not_flagged(qwen_cli, project):
+    """No file attribution means no claim about THIS project — could be anything."""
+    assert qwen_cli._unverified_symbols("You could use `functools.lru_cache` or `some_helper`.") == []
+
+
+def test_symbols_in_code_blocks_are_not_flagged(qwen_cli, project):
+    text = "Example for `main.py`:\n```python\ndef totally_made_up():\n    pass\n```"
+    assert qwen_cli._unverified_symbols(text) == []
+
+
+def test_short_identifiers_are_ignored(qwen_cli, project):
+    """`ctx`, `p`, `os` — too short to be a confident claim, too common to risk."""
+    assert qwen_cli._unverified_symbols("`core/repl.py` takes `ctx`.") == []
+
+
+def test_symbol_guard_fires_through_reground(qwen_cli, project):
+    demands: list[str] = []
+
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
+        demands.append(messages[-1]["content"])
+        return "Corrected: no such function."
+
+    with patch.object(qwen_cli, "run_turn", side_effect=fake_run_turn):
+        out = qwen_cli.reground_citations(object(), [], "`core/repl.py` defines `cmd_repl` (CC 29).")
+
+    assert out == "Corrected: no such function."
+    assert "cmd_repl" in demands[0]
+    assert "invented" in demands[0].lower()
+
+
+def test_symbol_guard_silent_on_an_honest_reply(qwen_cli, project):
+    calls = []
+    with patch.object(qwen_cli, "run_turn", side_effect=lambda *a, **k: calls.append(1)):
+        out = qwen_cli.reground_citations(object(), [], "`core/repl.py` defines `_repl_loop` and `read_input`.")
+    assert out == "`core/repl.py` defines `_repl_loop` and `read_input`."
+    assert not calls, "an honest reply must not cost an extra round-trip"
+
+
+def test_a_name_only_in_comments_or_strings_does_not_count_as_existing(qwen_cli, tmp_path, monkeypatch):
+    """A hallucinated name must not launder itself into existence by being written down.
+
+    The first cut searched raw text, so the comment in main.py documenting
+    `cmd_repl` as a fabrication — and these very tests asserting it is one — made
+    `cmd_repl` look real, and the guard went silent. Existence is now decided from
+    code with comments and string literals stripped.
+    """
+    (tmp_path / "m.py").write_text(
+        '# cmd_repl was reported by the audit but does not exist\n'
+        'NOTE = "see cmd_repl"\n'
+        '"""cmd_repl appears in this docstring too."""\n'
+        'def real_function():\n    pass\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    qwen_cli._SYMBOL_EXISTS_MEMO.clear()
+    qwen_cli._PROJECT_FILES_MEMO.clear()
+
+    assert not qwen_cli._symbol_exists_in_project("cmd_repl"), "prose must not prove existence"
+    assert qwen_cli._symbol_exists_in_project("real_function")
+    assert qwen_cli._unverified_symbols("`m.py` defines `cmd_repl`.") == ["cmd_repl"]
+
+
+def test_package_relative_paths_are_judgeable(qwen_cli, tmp_path, monkeypatch):
+    """A model describing this codebase writes "core/repl.py", but the file is at
+    qwen_cli/core/repl.py — resolving from the project root finds nothing. Without
+    suffix matching the whole line was unjudgeable and the guard skipped it, which
+    is exactly why it missed every fabrication in the real audit."""
+    (tmp_path / "pkg" / "core").mkdir(parents=True)
+    (tmp_path / "pkg" / "core" / "repl.py").write_text("def _repl_loop():\n    pass\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    qwen_cli._SYMBOL_EXISTS_MEMO.clear()
+    qwen_cli._PROJECT_FILES_MEMO.clear()
+
+    assert qwen_cli._citation_is_judgeable("core/repl.py"), "package-relative path must be placeable"
+    assert qwen_cli._unverified_symbols("`core/repl.py` defines `cmd_repl`.") == ["cmd_repl"]
+    assert qwen_cli._unverified_symbols("`core/repl.py` defines `_repl_loop`.") == []

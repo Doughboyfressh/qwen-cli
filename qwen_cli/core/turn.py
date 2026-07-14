@@ -306,6 +306,8 @@ def _prepare_turn(messages: list, allow_tools: bool, presearch: bool) -> list:
     _main._turn_read_cache.clear()  # fresh read-dedup window for this turn
     _main._turn_seen_lines.clear()  # fresh citation evidence (see main._unverified_citations)
     del _main._turn_written[:]  # fresh record of what this turn wrote (citation guard)
+    _main._SYMBOL_EXISTS_MEMO.clear()  # re-check symbol existence against the tree as it is now
+    _main._PROJECT_FILES_MEMO.clear()
     working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
     if allow_tools:
         working = _inject_volatile_tail(working)
@@ -526,12 +528,27 @@ def reground_citations(client: object, messages: list, reply: str) -> str:
         if wb:
             written_bad.append((path, wb))
 
-    if not bad and not written_bad:
+    # Invented SYMBOLS, not just invented line numbers. The self-audit reported
+    # cmd_repl and cmd_browser — functions nobody ever wrote — with complexity
+    # scores, and built two P0 recommendations on them. See main._unverified_symbols.
+    ghosts = _main._unverified_symbols(reply)
+    for path, content in _main._turn_written:
+        for g in _main._unverified_symbols(content):
+            if g not in ghosts:
+                ghosts.append(g)
+                written_bad.append((path, []))  # so the "fix the file too" clause fires
+
+    if not bad and not written_bad and not ghosts:
         return reply
 
     all_bad = list(bad) + [c for _, cites in written_bad for c in cites]
-    shown = ", ".join(all_bad[:6]) + (f" (+{len(all_bad) - 6} more)" if len(all_bad) > 6 else "")
-    _main.console.print(f"[dim yellow]  [unverified citation(s): {shown} — checking before answering][/dim yellow]")
+    parts = []
+    if all_bad:
+        parts.append(", ".join(all_bad[:6]) + (f" (+{len(all_bad) - 6} more)" if len(all_bad) > 6 else ""))
+    if ghosts:
+        parts.append("symbols that do not exist: " + ", ".join(ghosts[:6]))
+    shown = "; ".join(parts)
+    _main.console.print(f"[dim yellow]  [unverified: {shown} — checking before answering][/dim yellow]")
 
     # The correction is a whole extra turn, and _prepare_turn resets the per-turn
     # record of what happened. That record is not bookkeeping: /agent refuses
@@ -542,12 +559,23 @@ def reground_citations(client: object, messages: list, reply: str) -> str:
     prior_tools = list(_main._last_turn_tool_names)
     prior_ledger = list(_main._turn_ledger)
 
-    demand = (
-        f"You cited {shown}, but nothing you read this turn actually showed you "
-        f"{'those lines' if len(all_bad) > 1 else 'that line'}. Do not guess at line numbers, and do "
-        "not invent function or symbol names. Use read_file (or search_files) to look at the real "
-        "content now, then give your answer again with citations you have actually verified — "
-        "correcting or dropping any that were wrong."
+    demand_parts = []
+    if all_bad:
+        demand_parts.append(
+            f"You cited {', '.join(all_bad[:6])}, but nothing you read this turn actually showed you "
+            f"{'those lines' if len(all_bad) > 1 else 'that line'}."
+        )
+    if ghosts:
+        demand_parts.append(
+            f"You referred to {', '.join(ghosts[:6])} as if {'they exist' if len(ghosts) > 1 else 'it exists'} "
+            "in this project, but the name appears nowhere in the source. You invented "
+            f"{'them' if len(ghosts) > 1 else 'it'}."
+        )
+    demand = " ".join(demand_parts) + (
+        " Do not guess at line numbers and do not invent function or symbol names. Use search_files "
+        "and read_file to check the real code now, then answer again using only what you actually "
+        "found — correct or drop everything you could not verify. If a claim turns out to have no "
+        "basis, say so plainly rather than substituting another guess."
     )
     if written_bad:
         files = ", ".join(path for path, _ in written_bad)

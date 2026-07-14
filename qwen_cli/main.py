@@ -216,6 +216,7 @@ from qwen_cli.tools.files import (  # noqa: E402
     _read_raw,
     _recover_old_string,  # noqa: F401
     _resolve,
+    _walk_matching_files,
     _write_raw,
     do_delete_file,  # noqa: F401
     do_edit_file,
@@ -488,21 +489,163 @@ def _citation_supported(fname: str, lineno: int) -> bool:
     return any(_cite_matches(fname, path) and lineno in lines for path, lines in _turn_seen_lines.items())
 
 
+def _project_file_paths() -> list[str]:
+    """Source files in the project, as absolute paths. Cached per turn."""
+    key = "\x00files:" + str(Path.cwd())
+    hit = _PROJECT_FILES_MEMO.get(key)
+    if hit is not None:
+        return hit
+    files: list[str] = []
+    try:
+        for path in _walk_matching_files(Path.cwd(), "*"):
+            if path.suffix.lower() in _SOURCE_EXTS or path.suffix.lower() in {".toml", ".md", ".json"}:
+                files.append(str(path))
+            if len(files) >= _SYMBOL_SCAN_MAX_FILES:
+                break
+    except Exception:
+        _logger.debug("project file scan failed", exc_info=True)
+    _PROJECT_FILES_MEMO[key] = files
+    return files
+
+
+_PROJECT_FILES_MEMO: dict[str, list[str]] = {}  # cleared per turn alongside _SYMBOL_EXISTS_MEMO
+
+
 def _citation_is_judgeable(fname: str) -> bool:
     """True if we can tell whether this citation is real.
 
-    Either the file is one we demonstrably touched this turn (so a citation into
-    an unread line of it is a fabrication), or it exists relative to the cwd. A
-    name we can place neither way — a library path in a traceback, a file from
-    the user's example — is left alone: a false accusation costs a full
+    The file must be one we can actually place: one we touched this turn, one
+    that exists relative to the cwd, or one whose path matches a real file in the
+    project. That last case is not academic — a model describing this codebase
+    writes "core/repl.py", which resolves from the project root to a path that
+    does not exist (the file is at qwen_cli/core/repl.py). Without suffix
+    matching, every such reference was silently unjudgeable and the guard skipped
+    the line entirely.
+
+    A name we can place none of those ways — a library path in a traceback, a
+    file from the user's example — is left alone: a false accusation costs a full
     round-trip, so the guard stays quiet whenever it cannot actually judge.
     """
     if any(_cite_matches(fname, p) for p in (*_turn_seen_lines, *_injected_files)):
         return True
     try:
-        return _resolve(fname).is_file()
+        if _resolve(fname).is_file():
+            return True
     except OSError:
         return False
+    return any(_cite_matches(fname, p) for p in _project_file_paths())
+
+
+# --- Symbol guard ------------------------------------------------------------
+# The citation guard checks file:line. It does NOT catch an invented *symbol*,
+# which is what did the real damage in a live self-audit: it reported cmd_repl,
+# cmd_browser, cmd_fetch, _run_agent_loop and _browser_init — none of which exist
+# — complete with complexity scores, and built two P0 recommendations on them.
+#
+# The check that is both cheap and safe: a symbol the model attributes to a real
+# project file, whose name appears NOWHERE in the source tree, is fabricated.
+# Existence is tested by raw substring search over the source, not the symbol
+# index — the index only holds top-level defs from a capped file list, so a name
+# it lacks may still be perfectly real. Anything found anywhere is left alone.
+_BACKTICKED_IDENT_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{3,63})`")
+# A line that proposes or renames something is talking about code that does not
+# exist YET. Saying so is not a fabrication, so the guard keeps out of it.
+_PROPOSAL_RE = re.compile(
+    r"\b(add|adds|create|creates|new|should|shall|could|would|introduce|extract|rename|"
+    r"propose|proposes|suggest|suggests|consider|might|recommend|recommends|call(?:ed)?\s+it|"
+    r"name\s+it|split|refactor|replace\s+with|instead\s+of|e\.g\.|for\s+example)\b",
+    re.IGNORECASE,
+)
+_SYMBOL_EXISTS_MEMO: dict[str, set[str]] = {}  # cwd -> identifiers in its code; cleared per turn
+_SOURCE_EXTS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs", ".rb", ".php", ".c", ".cpp"})
+_SYMBOL_SCAN_MAX_FILES = 2000
+
+# Comments and string literals are stripped before scanning. A name that appears
+# only in prose does NOT prove the thing exists — and that is not hypothetical:
+# the first cut of this guard searched raw text, so the very comment documenting
+# `cmd_repl` as a fabrication (and the tests asserting it is one) made `cmd_repl`
+# look real. A hallucinated name must not be able to launder itself into
+# existence by being written down.
+_STRIP_BLOCKS_RE = re.compile(r'""".*?"""|\'\'\'.*?\'\'\'|/\*.*?\*/', re.DOTALL)
+_STRIP_LINES_RE = re.compile(r"(?m)(?:#|//).*$")
+_STRIP_STRINGS_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+_IDENT_SCAN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,63}")
+
+
+def _code_identifiers(source: str) -> set[str]:
+    """Identifiers appearing in actual code — comments and string literals removed."""
+    code = _STRIP_BLOCKS_RE.sub(" ", source)
+    code = _STRIP_LINES_RE.sub(" ", code)
+    code = _STRIP_STRINGS_RE.sub(" ", code)
+    return set(_IDENT_SCAN_RE.findall(code))
+
+
+def _project_identifiers() -> set[str]:
+    """Every identifier defined or used in the current project's code. Cached per turn."""
+    key = str(Path.cwd())
+    hit = _SYMBOL_EXISTS_MEMO.get(key)
+    if hit is not None:
+        return hit
+    idents: set[str] = set()
+    scanned = 0
+    try:
+        for path in _walk_matching_files(Path.cwd(), "*"):
+            if scanned >= _SYMBOL_SCAN_MAX_FILES:
+                break
+            if path.suffix.lower() not in _SOURCE_EXTS:
+                continue
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                idents |= _code_identifiers(path.read_text(encoding="utf-8", errors="replace"))
+                scanned += 1
+            except OSError:
+                continue
+    except Exception:
+        _logger.debug("symbol scan failed", exc_info=True)
+        return set()  # empty set => _symbol_exists_in_project can't judge; stays silent
+    _SYMBOL_EXISTS_MEMO[key] = idents
+    return idents
+
+
+def _symbol_exists_in_project(name: str) -> bool:
+    """True if `name` occurs in the project's CODE (any def, call, import, or
+    attribute — the question is only 'could this be real?'). A name found nowhere
+    in code is a candidate fabrication."""
+    idents = _project_identifiers()
+    if not idents:
+        return True  # nothing scanned — assume real rather than accuse falsely
+    return name in idents
+
+
+def _unverified_symbols(text: str) -> list[str]:
+    """Backticked symbols attributed to a real project file that exist nowhere in it.
+
+    Scoped hard, because a false accusation costs a whole round-trip: only lines
+    that BOTH name a real project file AND backtick an identifier are considered,
+    proposals ('extract a `foo` helper') are skipped, and any name found anywhere
+    in the source is accepted. What is left is the audit's failure mode — a table
+    row like "| `core/repl.py` | `cmd_repl` | CC 29 |" about a function nobody
+    ever wrote.
+    """
+    prose = _CODE_BLOCK_RE.sub("", text)
+    bad: list[str] = []
+    for line in prose.splitlines():
+        if _PROPOSAL_RE.search(line):
+            continue
+        # Does this line attribute something to a real file in this project?
+        files = [f for f, _ in _extract_citations(line)] + _FILE_MENTION_RE.findall(line)
+        if not any(_citation_is_judgeable(f) for f in files):
+            continue
+        for ident in _BACKTICKED_IDENT_RE.findall(line):
+            if ident in bad or "." in ident:
+                continue
+            if not _symbol_exists_in_project(ident):
+                bad.append(ident)
+    return bad
+
+
+_FILE_MENTION_RE = re.compile(r"[\w./\\+-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|cs|rb|php|c|cpp|toml|md|json)\b")
 
 
 def _unverified_citations(text: str) -> list[str]:
