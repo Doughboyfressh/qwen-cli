@@ -164,7 +164,8 @@ def test_default_token_limit_leaves_real_headroom():
     import qwen_cli.core.config as cfg
 
     source = Path(cfg.__file__).read_text(encoding="utf-8")
-    m = re.search(r'TOKEN_LIMIT = int\(_cfg\("token_limit", "QWEN_TOKEN_LIMIT", "(\d+)"\)\)', source)
+    # _pcfg since provider profiles landed: profile value, then top-level, then env.
+    m = re.search(r'TOKEN_LIMIT = int\(_p?cfg\("token_limit", "QWEN_TOKEN_LIMIT", "(\d+)"\)\)', source)
     assert m, "token_limit default moved — update this test"
     default = int(m.group(1))
 

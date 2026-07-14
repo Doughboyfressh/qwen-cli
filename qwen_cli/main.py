@@ -92,6 +92,9 @@ from qwen_cli.core.config import (  # noqa: E402
     _TOOL_TIMEOUT_FAST,
     _TOOL_TIMEOUT_NET,
     _TOOL_TIMEOUT_SLOW,
+    _is_local,
+    ACTIVE_PROVIDER,
+    API_KEY,
     AUDIT_LOG_FILE,  # noqa: F401 — tools/files.py reads it via _main (test-patchable)
     AUX_BASE_URL,
     AUX_LLM_TIMEOUT,
@@ -112,6 +115,7 @@ from qwen_cli.core.config import (  # noqa: E402
     MAX_TOOL_DEPTH,
     MODEL,
     OPENAI_API_KEY,
+    SAMPLER_EXTRAS,  # noqa: F401 — stream.py/commands.py read + rebind it via _main
     SAMPLING_PRESETS,
     SESSIONS_DIR,
     TOKEN_LIMIT,
@@ -1351,6 +1355,7 @@ _COMMANDS = [
     "/compact",
     "/context",
     "/model",
+    "/provider",
     "/mode",
     "/preset",
     "/params",
@@ -2864,29 +2869,43 @@ def _bg_llm(client) -> tuple:
 
 
 def make_client():  # returns OpenAI instance
-    """Make Client."""
-    global MODEL, ACTIVE_BACKEND
+    """Connect to the configured provider (any OpenAI-compatible endpoint)."""
+    global MODEL, ACTIVE_BACKEND, SAMPLER_EXTRAS
     import httpx
 
     _timeout = httpx.Timeout(connect=30.0, read=120.0, write=60.0, pool=10.0)
-    lm_client = _get_openai()(base_url=BASE_URL, api_key="no-key", timeout=_timeout)
+    label = ACTIVE_PROVIDER or ("llama.cpp" if _is_local(BASE_URL) else "remote")
+    client = _get_openai()(base_url=BASE_URL, api_key=API_KEY, timeout=_timeout)
     try:
-        lm_client.models.list()
-        ACTIVE_BACKEND = "llama.cpp"
-        return lm_client
+        client.models.list()
+        ACTIVE_BACKEND = label
+        return client
     except Exception:
-        _logger.debug("llama.cpp server unreachable, checking fallback")
+        _logger.debug("provider %s unreachable at %s, checking fallback", label, BASE_URL)
+
+    # A remote provider that fails to answer models.list() is a real failure —
+    # bad key, wrong URL, no network. Falling silently back to OpenAI would bill
+    # the wrong account and answer as the wrong model, so say so and stop.
+    if not _is_local(BASE_URL):
+        console.print(f"[bold red]  provider '{label}' unreachable at {BASE_URL}[/bold red]")
+        console.print("[dim]  Check base_url / api_key in config.toml, or switch with /provider.[/dim]")
+        ACTIVE_BACKEND = label
+        return client
 
     if OPENAI_API_KEY:
-        console.print(f"[yellow]  llama.cpp server unreachable — falling back to OpenAI ({FALLBACK_MODEL})[/yellow]")
+        console.print(f"[yellow]  local server unreachable — falling back to OpenAI ({FALLBACK_MODEL})[/yellow]")
+        # MODEL must change with the backend: stream.py now sends _main.MODEL, so
+        # before this the fallback sent "Qwen3.6-27B" to api.openai.com. The
+        # llama.cpp-only samplers have to go too, or OpenAI rejects the request.
         MODEL = FALLBACK_MODEL
+        SAMPLER_EXTRAS = False
         ACTIVE_BACKEND = "openai"
         return _get_openai()(api_key=OPENAI_API_KEY, timeout=_timeout)
 
     console.print(f"[yellow]  [warning] llama.cpp server not reachable at {BASE_URL}[/yellow]")
     console.print("[dim]  Set openai_api_key in config.toml or OPENAI_API_KEY env var to enable cloud fallback.[/dim]")
     ACTIVE_BACKEND = "llama.cpp"
-    return lm_client
+    return client
 
 
 # ==============================================================================

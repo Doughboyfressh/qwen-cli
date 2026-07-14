@@ -39,6 +39,13 @@ _VALIDATORS: dict[str, tuple[type | tuple[type, ...], str, bool]] = {
 
 def _validate_config(cfg: dict) -> None:
     known_keys = {
+        "provider",  # name of the active [providers.<name>] profile
+        "providers",  # table of profiles
+        "api_key",  # auth for base_url (any OpenAI-compatible provider)
+        "sampler_extras",  # send llama.cpp-only samplers (top_k/min_p/repeat_penalty)
+        "mcp",
+        "intel",
+        "tool_groups",
         "base_url",
         "model",
         "aux_base_url",
@@ -94,8 +101,55 @@ def _cfg(key: str, env: str, default: str) -> str:
     return str(_CFG.get(key, os.environ.get(env, default)))
 
 
-BASE_URL = _cfg("base_url", "QWEN_BASE_URL", "http://localhost:8080/v1")
-MODEL = _cfg("model", "QWEN_MODEL", "Qwen3.6-27B")
+# --- Providers ---------------------------------------------------------------
+# Any OpenAI-compatible endpoint can drive this CLI — the client is already an
+# OpenAI client, so llama.cpp, vLLM, Ollama, OpenAI, Anthropic (its
+# OpenAI-compatible endpoint), OpenRouter, DeepSeek, Groq and Together all work
+# through the same code path. What was missing was the ability to *name* them:
+#
+#   provider = "claude"
+#
+#   [providers.local]
+#   base_url = "http://localhost:8080/v1"
+#   model    = "Qwen3.6-27B"
+#   sampler_extras = true          # llama.cpp top_k/min_p/repeat_penalty
+#
+#   [providers.claude]
+#   base_url = "https://api.anthropic.com/v1/"
+#   api_key  = "sk-ant-..."
+#   model    = "claude-sonnet-4-5"
+#   token_limit = 180000
+#
+# Top-level base_url/model/token_limit still work and become the implicit
+# default profile, so existing config.toml files keep running unchanged.
+def _providers() -> dict:
+    raw = _CFG.get("providers")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _provider_cfg(name: str) -> dict:
+    p = _providers().get(name)
+    return p if isinstance(p, dict) else {}
+
+
+ACTIVE_PROVIDER = _cfg("provider", "QWEN_PROVIDER", "")
+_P = _provider_cfg(ACTIVE_PROVIDER)
+
+
+def _pcfg(key: str, env: str, default: str) -> str:
+    """Provider profile first, then the top-level key, then env, then default."""
+    if key in _P:
+        return str(_P[key])
+    return _cfg(key, env, default)
+
+
+BASE_URL = _pcfg("base_url", "QWEN_BASE_URL", "http://localhost:8080/v1")
+MODEL = _pcfg("model", "QWEN_MODEL", "Qwen3.6-27B")
+# Auth for BASE_URL. "no-key" keeps local llama.cpp/Ollama happy (they ignore it)
+# while letting a real provider be the PRIMARY backend rather than only a
+# fallback — previously the primary client was hardcoded to api_key="no-key", so
+# no authenticated endpoint could ever be the main model.
+API_KEY = _pcfg("api_key", "QWEN_API_KEY", "") or "no-key"
 # Optional second llama-server: fast MoE model that absorbs background LLM work
 # (memory extraction, summaries, intel, titles) so it never queues behind the
 # main conversation's single slot. Empty aux_base_url disables the aux backend.
@@ -105,8 +159,32 @@ AUX_MODEL = _cfg("aux_model", "QWEN_AUX_MODEL", "Qwen3.6-35B-A3B")
 # the input ceiling is 32768 — a 32000 default left ~768 tokens for tokenizer
 # drift and tool schemas instead of the ~4.7k the comment on SAMPLING_PRESETS
 # (and the README) assume. Only ever bit a fresh install with no config.toml.
-TOKEN_LIMIT = int(_cfg("token_limit", "QWEN_TOKEN_LIMIT", "28000"))
-MAX_TOOL_DEPTH = int(_cfg("max_tool_depth", "QWEN_MAX_TOOL_DEPTH", "20"))
+TOKEN_LIMIT = int(_pcfg("token_limit", "QWEN_TOKEN_LIMIT", "28000"))
+
+
+def _is_local(url: str) -> bool:
+    """Is this endpoint on this machine? Decides the sampler default and whether a
+    connection failure is worth falling back from."""
+    # S104 reads "0.0.0.0" as binding to all interfaces. Nothing is bound here —
+    # it is a substring test against a URL the user configured.
+    return any(h in url for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))  # noqa: S104
+
+
+# top_k / min_p / repeat_penalty and Qwen's chat_template_kwargs are llama.cpp
+# extensions. Cloud APIs reject unknown fields outright, so default this to ON
+# only for a local endpoint. Override per profile with sampler_extras = true/false.
+_SAMPLER_DEFAULT = "true" if _is_local(BASE_URL) else "false"
+SAMPLER_EXTRAS = _pcfg("sampler_extras", "QWEN_SAMPLER_EXTRAS", _SAMPLER_DEFAULT).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Per-provider: rounds are only useful if the findings survive them. On a 28k
+# window more rounds mean more mid-run compaction, which is what shreds a long
+# analysis; on a 200k model they are nearly free. So this belongs in the profile,
+# not in a single global default.
+MAX_TOOL_DEPTH = int(_pcfg("max_tool_depth", "QWEN_MAX_TOOL_DEPTH", "20"))
 MAX_AUTO_CONTINUE = int(_cfg("max_auto_continue", "QWEN_MAX_AUTO_CONTINUE", "4"))
 DEFAULT_EDITOR = _cfg("editor", "EDITOR", "notepad" if sys.platform == "win32" else "nano")
 OPENAI_API_KEY = _cfg("openai_api_key", "OPENAI_API_KEY", "")

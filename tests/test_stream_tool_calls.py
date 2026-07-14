@@ -440,6 +440,10 @@ def test_unparseable_tool_call_markup_is_stripped():
 
     _parse_xml_tool_calls only strips blocks it understood, so this passed
     straight through — raw tags rendered to the user AND stored in history.
+
+    This spelling is now RECOVERED as format D rather than merely stripped:
+    dropping a real call the model meant to make is its own failure, and it is
+    what left a live audit with no report. Either way, no markup reaches the user.
     """
     from qwen_cli.core.stream import _recover_xml_tool_calls
 
@@ -449,7 +453,7 @@ def test_unparseable_tool_call_markup_is_stripped():
     assert "<tool_call>" not in text
     assert "update_plan>" not in text
     assert text == "Report done."
-    assert calls == []
+    assert [c["function"]["name"] for c in calls] == ["update_plan"]
 
 
 def test_unclosed_tool_call_markup_is_stripped():
@@ -482,3 +486,59 @@ def test_valid_tool_call_markup_is_still_parsed_not_stripped():
     assert len(calls) == 1
     assert calls[0]["function"]["name"] == "read_file"
     assert "<tool_call>" not in text
+
+
+# ---------------------------------------------------------------------------
+# Formats Qwen actually emits under long contexts (both seen live, both lost)
+# ---------------------------------------------------------------------------
+
+
+def test_parses_call_with_dropped_angle_bracket_and_no_closing_tag():
+    """Seen live: the opening '<' is dropped and the call is truncated mid-JSON.
+
+        <tool_call> function=update_plan> <parameter=steps> [{"status": ...
+
+    _XML_TOOL_CALL_RE needs a closing tag, so the block was invisible; formats
+    A/B/C need the leading '<', so nothing parsed it. The call was discarded and
+    the raw markup went to the user.
+    """
+    raw = '<tool_call> function=update_plan> <parameter=steps> [{"status": "completed"}'
+    _, calls = _parse_xml_tool_calls(raw)
+
+    assert [c["function"]["name"] for c in calls] == ["update_plan"]
+
+
+def test_parses_bare_name_and_param_call():
+    """Seen live: no 'function='/'parameter=' at all — just name> key> value."""
+    raw = '<tool_call> update_plan> steps> [{"status": "completed"}] </tool_call>'
+    _, calls = _parse_xml_tool_calls(raw)
+
+    assert [c["function"]["name"] for c in calls] == ["update_plan"]
+    assert json.loads(calls[0]["function"]["arguments"])["steps"] == [{"status": "completed"}]
+
+
+def test_bare_parse_does_not_hijack_plain_prose():
+    """A stray '<tool_call>' around ordinary text must not become a phantom call."""
+    _, calls = _parse_xml_tool_calls("<tool_call>I think we should refactor this.</tool_call>")
+    assert calls == []
+
+
+def test_depth_cap_synthesis_never_loses_the_turn():
+    """With tools OFF, unparseable markup as the WHOLE reply used to return "" —
+    run_turn's depth-cap path then yields None and the REPL drops the turn, so the
+    user gets nothing. Live: an audit spent all 20 rounds gathering data and then
+    printed '(no synthesis)' with no report at all."""
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    text, _ = _recover_xml_tool_calls("<tool_call> garbage that parses as nothing", [], use_tools=False)
+
+    assert text, "the turn must survive with an explanation rather than vanish"
+
+
+def test_tools_enabled_still_returns_empty_so_the_nudge_can_fire():
+    """With tools live, empty is the right answer — run_turn's empty-reply nudge
+    asks the model to try again. Only the no-tools path needs a placeholder."""
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    text, _ = _recover_xml_tool_calls("<tool_call> garbage that parses as nothing", [], use_tools=True)
+    assert text == ""

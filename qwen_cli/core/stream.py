@@ -15,7 +15,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
-from qwen_cli.core.config import MODEL, SAMPLING_PRESETS
+from qwen_cli.core.config import SAMPLING_PRESETS
 
 console = Console(force_terminal=True, legacy_windows=False)
 _logger = logging.getLogger(__name__)
@@ -739,6 +739,57 @@ _HEARTBEAT_SEC = 30  # print "still waiting" after this many seconds with no tok
 _LIVE_PREVIEW_LINES = 18
 
 
+def _tool_call_blocks(text: str) -> list[tuple[str, str]]:
+    """Every <tool_call> block as (raw_span, body).
+
+    Includes an UNCLOSED trailing block. Qwen truncates mid-call under long
+    contexts — seen live: "<tool_call> function=update_plan> <parameter=steps>
+    [{...}" with no closing tag and the JSON cut off. _XML_TOOL_CALL_RE needs a
+    closing tag, so such a block was invisible here: nothing parsed it, and the
+    raw markup went to the user and into history.
+    """
+    blocks = [(m.group(0), m.group(1).strip()) for m in _XML_TOOL_CALL_RE.finditer(text)]
+    consumed = sum(len(raw) for raw, _ in blocks)
+    tail = text[consumed:] if consumed else text
+    lower = tail.lower()
+    if "<tool_call>" in lower and "</tool_call>" not in lower:
+        start = lower.index("<tool_call>")
+        blocks.append((tail[start:], tail[start + len("<tool_call>") :].strip()))
+    return blocks
+
+
+# Qwen drops the opening angle bracket under long contexts: "function=name>" and
+# "parameter=key>" instead of "<function=name>" / "<parameter=key>". Put it back
+# so the format-C regexes can do their job, rather than discarding a real call.
+_BARE_TAG_RE = re.compile(r"(?<!<)\b(function|parameter)=", re.IGNORECASE)
+# Barest spelling of all, also seen live: "<tool_call> update_plan> steps> [...]"
+# — no "function=" or "parameter=" at all, just name> key> value.
+_BARE_NAME_RE = re.compile(r"^\s*<?([A-Za-z_]\w*)>\s*(.*)$", re.DOTALL)
+_BARE_PARAM_RE = re.compile(r"<?([A-Za-z_]\w*)>\s*(.*?)\s*(?=<?[A-Za-z_]\w*>|</|$)", re.DOTALL)
+
+
+def _decode_arg(raw: str) -> object:
+    """JSON-typed values (arrays, objects, numbers) arrive as bare text — decode
+    them so e.g. update_plan's steps array isn't handed over as a string."""
+    val = raw.strip().rstrip("<").strip()
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, ValueError):
+        return val
+
+
+def _parse_bare_call(body: str) -> dict | None:
+    """Last-resort parse of 'name> key> value key2> value2' with no tags at all."""
+    m = _BARE_NAME_RE.match(body)
+    if not m:
+        return None
+    name, rest = m.group(1).strip(), m.group(2)
+    if not name or name.lower() in ("function", "parameter"):
+        return None
+    args = {key: _decode_arg(val) for key, val in _BARE_PARAM_RE.findall(rest)}
+    return {"name": name, "arguments": args}
+
+
 def _parse_xml_tool_calls(text: str) -> tuple[str, list]:
     """Extract <tool_call>...</tool_call> blocks from text.
     Handles both JSON-body and XML-param formats that Qwen3 emits.
@@ -746,8 +797,8 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list]:
     """
     tool_calls = []
     clean = text
-    for m in _XML_TOOL_CALL_RE.finditer(text):
-        body = m.group(1).strip()
+    for raw_span, raw_body in _tool_call_blocks(text):
+        body = _BARE_TAG_RE.sub(r"<\1=", raw_body)  # repair dropped '<' before function=/parameter=
         tc = None
         # Format A: JSON body {"name": ..., "arguments": {...}}
         try:
@@ -777,24 +828,25 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list]:
         if tc is None:
             fn_m = _FN_EQ_RE.search(body)
             if fn_m:
-                args = {}
-                for key, raw_val in _PARAM_EQ_RE.findall(body):
-                    val = raw_val.strip()
-                    try:
-                        # JSON-typed values (arrays, objects, numbers) arrive as
-                        # bare text here — decode so e.g. update_plan's steps
-                        # array isn't passed as a string.
-                        args[key] = json.loads(val)
-                    except (json.JSONDecodeError, ValueError):
-                        args[key] = val
+                args = {key: _decode_arg(val) for key, val in _PARAM_EQ_RE.findall(body)}
                 tc = {
                     "id": f"xml_{len(tool_calls)}",
                     "type": "function",
                     "function": {"name": fn_m.group(1).strip(), "arguments": json.dumps(args)},
                 }
+        # Format D: no tags at all — "update_plan> steps> [...]". Seen live under
+        # long contexts, and the call was simply lost.
+        if tc is None:
+            bare = _parse_bare_call(body)
+            if bare:
+                tc = {
+                    "id": f"xml_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {"name": bare["name"], "arguments": json.dumps(bare["arguments"])},
+                }
         if tc:
             tool_calls.append(tc)
-            clean = clean.replace(m.group(0), "")
+            clean = clean.replace(raw_span, "")
     return clean.strip(), tool_calls
 
 
@@ -803,7 +855,13 @@ def _live_updater(live: Live, max_lines: int = _LIVE_PREVIEW_LINES) -> Callable[
 
     def update(text: str) -> None:
         """Update."""
-        clean = _THINK_RE.sub("", text).strip()
+        clean = _THINK_RE.sub("", text)
+        # Tool-call markup is machinery, not prose — it should never flash up in the
+        # live preview, closed or (mid-stream) not yet closed.
+        clean = _XML_TOOL_CALL_RE.sub("", clean)
+        if "<tool_call>" in clean.lower():
+            clean = clean[: clean.lower().index("<tool_call>")]
+        clean = clean.strip()
         if not clean:
             live.update(Text("\u27b3 thinking\u2026", style="dim italic"))
             return
@@ -870,15 +928,26 @@ def _build_stream_kwargs(messages: list, use_tools: bool) -> dict:
 
     preset = SAMPLING_PRESETS.get(_main._active_preset, SAMPLING_PRESETS["thinking"])
     kwargs: dict = {
-        "model": MODEL,
+        # _main.MODEL, NOT the config constant: `from ...config import MODEL` binds
+        # the value at import, so every request carried the configured model no
+        # matter what. /model was cosmetic, and the cloud fallback was broken —
+        # make_client set MODEL = "gpt-4o-mini" while the request still said
+        # "Qwen3.6-27B". It only looked fine locally because llama.cpp ignores the
+        # model field and serves whatever is loaded.
+        "model": _main.MODEL,
         "messages": messages,
         "stream": True,
         "temperature": preset["temperature"],
         "top_p": preset["top_p"],
         "presence_penalty": preset["presence_penalty"],
         "max_tokens": preset["max_tokens"],
-        "extra_body": dict(preset["extra_body"]),  # copy so retries can pop it safely
     }
+    # llama.cpp-only samplers (top_k / min_p / repeat_penalty) and Qwen's
+    # chat_template_kwargs. Cloud APIs reject unknown fields, so only send them to
+    # a backend that wants them; _create_with_retry can still strip them if a
+    # server we thought was local turns out to be picky.
+    if _main.SAMPLER_EXTRAS:
+        kwargs["extra_body"] = dict(preset["extra_body"])  # copy so retries can pop it safely
     for k in ("temperature", "top_p", "max_tokens", "presence_penalty"):
         if k in _main._model_params:
             kwargs[k] = _main._model_params[k]
@@ -1002,19 +1071,30 @@ def _recover_xml_tool_calls(text: str, api_calls: list, use_tools: bool) -> tupl
 
     clean_text, xml_calls = _parse_xml_tool_calls(text)
     if not xml_calls:
-        # Tool-call markup we could not parse — Qwen drifts into spellings none of
-        # formats A/B/C match (seen live: "<tool_call> update_plan> steps> [...]").
-        # _parse_xml_tool_calls only strips blocks it understood, so these used to
-        # pass straight through: raw <tool_call> tags rendered to the user AND
-        # stored in history. Strip them. If nothing else was said, run_turn's
-        # empty-reply nudge asks the model to answer or call a tool properly.
+        # Tool-call markup none of formats A-D could parse. Strip it rather than
+        # render raw tags to the user and store them in history.
         stripped = _XML_TOOL_CALL_RE.sub("", text)
         if "<tool_call>" in stripped.lower():  # unclosed block — cut from the tag on
             stripped = stripped[: stripped.lower().index("<tool_call>")]
         stripped = stripped.strip()
-        if stripped != text.strip():
-            console.print("[dim]  [dropped an unparseable tool call — the model will be asked to retry][/dim]")
-        return stripped, api_calls
+        if stripped == text.strip():
+            return stripped, api_calls
+        console.print("[dim]  [dropped an unparseable tool call][/dim]")
+        if stripped or use_tools:
+            # With tools live, an empty reply is fine: run_turn's empty-reply nudge
+            # asks the model to answer or call a tool properly.
+            return stripped, api_calls
+        # Tools are OFF (the forced synthesis after the tool budget is spent) and
+        # the markup was the ENTIRE reply. Returning "" here loses the whole turn:
+        # run_turn's depth-cap path yields None and the REPL drops it, so the user
+        # gets nothing at all — which is exactly what happened on a live audit that
+        # spent all 20 rounds gathering data and then printed "(no synthesis)".
+        # Say something, so the turn survives and the user learns why.
+        return (
+            "[I ran out of tool rounds and my final answer came back as a malformed tool call, so "
+            "there is no report here. Ask me to continue and I will summarize what I already found.]",
+            api_calls,
+        )
     if use_tools:
         return clean_text, xml_calls
 

@@ -97,6 +97,47 @@ command = "npx"
 args    = ["-y", "@modelcontextprotocol/server-github"]
 ```
 
+### Any model, not just Qwen
+
+The client speaks the OpenAI protocol, so **any OpenAI-compatible endpoint works as the primary
+backend** — llama.cpp, Ollama, vLLM, OpenAI, Anthropic (its OpenAI-compatible endpoint),
+OpenRouter, DeepSeek, Groq, Together. Name them as profiles and switch with `/provider`:
+
+```toml
+provider = "local"          # the active profile
+
+[providers.local]
+base_url       = "http://localhost:8080/v1"
+model          = "Qwen3.6-27B"
+token_limit    = 28000
+sampler_extras = true       # llama.cpp-only top_k / min_p / repeat_penalty
+
+[providers.claude]
+base_url       = "https://api.anthropic.com/v1/"
+api_key        = "sk-ant-..."
+model          = "claude-sonnet-4-5"
+token_limit    = 180000
+max_tool_depth = 40         # rounds are cheap when findings survive them
+
+[providers.openrouter]
+base_url    = "https://openrouter.ai/api/v1"
+api_key     = "sk-or-..."
+model       = "deepseek/deepseek-chat"
+token_limit = 60000
+```
+
+`/provider` lists them, `/provider claude` switches — moving the model, the input budget and the
+samplers together as a set. `sampler_extras` defaults to on for a localhost URL and off otherwise:
+`top_k`, `min_p`, `repeat_penalty` and `chat_template_kwargs` are llama.cpp extensions, and cloud
+APIs reject unknown fields.
+
+A big-context model is worth considering for whole-repo work. The 28k window is what forces
+auto-compaction mid-task, and compaction is where a long analysis loses the measurements it took
+and starts reconstructing them from a summary.
+
+Top-level `base_url` / `model` / `token_limit` still work on their own, so a config with no
+`[providers]` table keeps running unchanged.
+
 `token_limit` must stay well under the server's `-c` minus the preset's `max_tokens` output
 reservation. The defaults (`-c 49152`, 16384 out, 28000 in) leave ~4.7k of headroom for
 tokenizer-estimate drift and tool schemas. **K and V cache types must match under `--flash-attn`** —

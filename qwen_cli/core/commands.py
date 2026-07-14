@@ -439,6 +439,73 @@ def _cmd_model(ctx: _ReplContext, arg: str) -> None:
             _main.console.print(f"[green][model switched to: {_main.MODEL}][/green]")
 
 
+def _cmd_provider(ctx: _ReplContext, arg: str) -> None:
+    """Show or switch the LLM backend: /provider [name].
+
+    Any OpenAI-compatible endpoint — llama.cpp, Ollama, vLLM, OpenAI, Anthropic,
+    OpenRouter, DeepSeek, Groq. Switching rebinds the model, the input budget and
+    the llama.cpp-only samplers together; they must move as a set, or the request
+    carries one backend's model name and another's sampler fields.
+    """
+    import qwen_cli.main as _main
+    from qwen_cli.core.config import _is_local, _provider_cfg, _providers
+
+    profiles = _providers()
+    name = arg.strip()
+
+    if not name:
+        _main.console.print(
+            f"[bold]Active:[/bold] [cyan]{_main.ACTIVE_PROVIDER or '(default)'}[/cyan]  "
+            f"{_main.MODEL}  [dim]{_main.BASE_URL}[/dim]"
+        )
+        if not profiles:
+            _main.console.print(
+                "[dim]  No profiles configured. Add one to config.toml:\n"
+                '    [providers.claude]\n'
+                '    base_url = "https://api.anthropic.com/v1/"\n'
+                '    api_key  = "sk-ant-..."\n'
+                '    model    = "claude-sonnet-4-5"\n'
+                "    token_limit = 180000[/dim]"
+            )
+            return
+        for pname, cfg in profiles.items():
+            mark = "[green]*[/green]" if pname == _main.ACTIVE_PROVIDER else " "
+            _main.console.print(
+                f"  {mark} [cyan]{pname}[/cyan]  {cfg.get('model', '?')}  [dim]{cfg.get('base_url', '?')}[/dim]"
+            )
+        _main.console.print("[dim]  /provider <name> to switch[/dim]")
+        return
+
+    cfg = _provider_cfg(name)
+    if not cfg:
+        _main.console.print(f"[yellow][no provider '{name}' in config.toml — /provider to list][/yellow]")
+        return
+    base_url = str(cfg.get("base_url") or _main.BASE_URL)
+    _main.BASE_URL = base_url
+    _main.API_KEY = str(cfg.get("api_key") or "no-key")
+    _main.MODEL = str(cfg.get("model") or _main.MODEL)
+    _main.ACTIVE_PROVIDER = name
+    _main.SAMPLER_EXTRAS = bool(cfg.get("sampler_extras", _is_local(base_url)))
+    if cfg.get("token_limit"):
+        _main.TOKEN_LIMIT = int(cfg["token_limit"])
+        _main._TOKEN_LIMIT_BASE = _main.TOKEN_LIMIT
+    if cfg.get("max_tool_depth"):
+        _main.MAX_TOOL_DEPTH = int(cfg["max_tool_depth"])
+    # A model swap invalidates the token count AND the sampler overrides: a
+    # max_tokens tuned for a 16k local ceiling is wrong for a 200k cloud model.
+    _main._model_params.pop("max_tokens", None)
+    _main._real_ctx_tokens = 0
+
+    client = _main.make_client()
+    _main._cli_client = client
+    ctx.client = client
+    _main.console.print(
+        f"[green][provider → {name}][/green]  {_main.MODEL}  [dim]{_main.BASE_URL}[/dim]  "
+        f"[dim]budget {_main.TOKEN_LIMIT:,} tok"
+        f"{' · llama.cpp samplers' if _main.SAMPLER_EXTRAS else ''}[/dim]"
+    )
+
+
 def _cmd_index(ctx: _ReplContext, arg: str) -> None:
     """Build or rebuild the project file index for faster searching."""
     import qwen_cli.main as _main
@@ -1126,6 +1193,7 @@ _REPL_COMMANDS: dict[str, callable] = {
     "/trim": _cmd_trim,
     "/mode": _cmd_mode,
     "/model": _cmd_model,
+    "/provider": _cmd_provider,
     "/index": _cmd_index,
     "/task": _cmd_task,
     "/agent": _cmd_agent,
