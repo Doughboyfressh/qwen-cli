@@ -146,6 +146,12 @@ def cmd_agent(goal: str, history: list, base_system: str, client: object, max_it
                 _main.console.print("[red]  \\[agent error or cancelled — stopping][/red]")
                 break
 
+            # An agent reports its own progress; a fabricated file:line in that
+            # report is how a wrong claim becomes the next iteration's premise.
+            # reground_citations preserves _last_turn_tool_names, so the
+            # verification gate below still sees this turn's real mutations.
+            reply = _main.reground_citations(client, msgs, reply)
+
             working.append({"role": "assistant", "content": reply})
             agent_replies.append(reply)
 
@@ -293,6 +299,11 @@ def cmd_task(goal: str, history: list, base_system: str, client: object) -> None
             if not reply:
                 _main.console.print(f"[red]  \\[step {i} failed — stopping][/red]")
                 return
+
+            # Same guard as /agent: the step report must not cite lines it never
+            # read. Preserves _last_turn_tool_names, which the `modified` check
+            # below reads to decide whether to run the tests.
+            reply = _main.reground_citations(client, step_msgs, reply)
 
             working.append({"role": "user", "content": f"Step {i}: {step}"})
             working.append({"role": "assistant", "content": reply})

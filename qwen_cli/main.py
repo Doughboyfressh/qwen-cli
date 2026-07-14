@@ -252,6 +252,7 @@ from qwen_cli.core.turn import (  # noqa: E402
     _inject_volatile_tail,  # noqa: F401
     _ledger_entry,  # noqa: F401
     _smart_cap,  # noqa: F401
+    reground_citations,  # noqa: F401 — repl.py/agent.py reach it via _main
     run_turn,
 )
 
@@ -434,6 +435,88 @@ _VERIFYING_TOOLS = frozenset(
 )
 _last_turn_tool_names: list[str] = []  # tool names executed during the current run_turn, in order
 _turn_read_cache: set[tuple] = set()  # (path, offset, limit, mtime) already served this turn
+
+# --- Citation guard (see _unverified_citations) ------------------------------
+# Evidence ledger: which lines of which files the model has ACTUALLY been shown.
+# _turn_seen_lines is per-turn (tool results never persist into history, so a
+# file read two turns ago is genuinely no longer in front of the model);
+# _injected_files holds files whose full text was pasted into the conversation
+# (@file, /file, /focus, /project), which the model can still see.
+_turn_seen_lines: dict[str, set[int]] = {}  # abs path -> line numbers displayed this turn
+_injected_files: set[str] = set()  # abs paths whose entire content sits in context
+
+# "path/to/x.py:123", "x.py line 123", "line 123 of x.py"
+_CITATION_RE = re.compile(
+    r"(?:(?P<f1>[\w./\\+-]+\.\w{1,6}):(?P<l1>\d{1,6})\b)"
+    r"|(?:\bline\s+(?P<l2>\d{1,6})\s+(?:of|in)\s+[`'\"]?(?P<f2>[\w./\\+-]+\.\w{1,6}))"
+    r"|(?:[`'\"]?(?P<f3>[\w./\\+-]+\.\w{1,6})[`'\"]?\s+line\s+(?P<l3>\d{1,6})\b)",
+    re.IGNORECASE,
+)
+
+
+def _extract_citations(text: str) -> list[tuple[str, int]]:
+    """Pull (file, line) citations out of a reply. Ignores fenced code blocks —
+    a line number inside a diff or a traceback the model is quoting is data, not
+    a claim it is making."""
+    prose = _CODE_BLOCK_RE.sub("", text)
+    out: list[tuple[str, int]] = []
+    for m in _CITATION_RE.finditer(prose):
+        fname = m.group("f1") or m.group("f2") or m.group("f3")
+        lineno = m.group("l1") or m.group("l2") or m.group("l3")
+        if fname and lineno:
+            out.append((fname, int(lineno)))
+    return out
+
+
+def _cite_matches(cited: str, seen_path: str) -> bool:
+    """Does a cited name ('main.py', 'core/repl.py') refer to this absolute path?"""
+    norm = cited.replace("\\", "/").lstrip("./").lower()
+    s = seen_path.replace("\\", "/").lower()
+    return s == norm or s.endswith("/" + norm)
+
+
+def _citation_supported(fname: str, lineno: int) -> bool:
+    """True if the model was actually shown this file:line (or the whole file)."""
+    if any(_cite_matches(fname, p) for p in _injected_files):
+        return True
+    return any(_cite_matches(fname, path) and lineno in lines for path, lines in _turn_seen_lines.items())
+
+
+def _citation_is_judgeable(fname: str) -> bool:
+    """True if we can tell whether this citation is real.
+
+    Either the file is one we demonstrably touched this turn (so a citation into
+    an unread line of it is a fabrication), or it exists relative to the cwd. A
+    name we can place neither way — a library path in a traceback, a file from
+    the user's example — is left alone: a false accusation costs a full
+    round-trip, so the guard stays quiet whenever it cannot actually judge.
+    """
+    if any(_cite_matches(fname, p) for p in (*_turn_seen_lines, *_injected_files)):
+        return True
+    try:
+        return _resolve(fname).is_file()
+    except OSError:
+        return False
+
+
+def _unverified_citations(text: str) -> list[str]:
+    """file:line citations in `text` that no tool call this turn actually showed.
+
+    Only flags citations naming a file that really exists — the model quoting
+    "app.py:42" from a user's pasted traceback, or citing a file in a library it
+    is describing from memory, is not something we can adjudicate, and a false
+    accusation costs a whole round-trip. A real file cited at a line nobody read
+    is the fabrication case (a live audit put _session_title at main.py:1210; it
+    is at 340).
+    """
+    bad: list[str] = []
+    for fname, lineno in _extract_citations(text):
+        if _citation_supported(fname, lineno) or not _citation_is_judgeable(fname):
+            continue
+        cite = f"{fname}:{lineno}"
+        if cite not in bad:
+            bad.append(cite)
+    return bad
 # Compact per-turn record of consequential tool activity (reads with ranges,
 # file mutations, commands). Appended to the stored assistant message by the
 # REPL so the next turn knows what was actually done — persistent history keeps
@@ -638,13 +721,29 @@ BASE_SYSTEM = (
     "Web search results are usually injected automatically before you reply, under '[Auto web "
     "search results...]' — read and use them; call web_search again with a sharper query if they're "
     "not enough, then fetch_url the best result for full content. Before stating any specific fact — "
-    "a name, date, version, statistic, quote — verify it if you have any uncertainty at all: search "
-    "first, answer second. If you still can't find a reliable source after searching, say so plainly "
-    "('I couldn't verify this') rather than guess — that beats a confident wrong answer every time. "
-    "Cite sources (URLs) when using web information. "
-    "This applies to code, not just the web: never state a file path, function name, config value, "
-    "or command output you haven't actually seen via a tool this session. If you don't remember "
-    "seeing it, look — read_file, list_directory, search_files, or run_command — before you claim it. "
+    "a name, date, version, statistic, quote — verify it: search first, answer second. Cite sources "
+    "(URLs) when using web information. If you can't find a reliable source, say so plainly ('I "
+    "couldn't verify this') rather than guess — that beats a confident wrong answer every time.\n\n"
+    "Every claim you make needs evidence you actually looked at. These rules are where wrong answers "
+    "really come from — follow them literally:\n"
+    "- A search hit (grep, search_files, an index, a script that counted something) proves a string "
+    "EXISTS at some line. It proves NOTHING about what that code does. Before you describe behavior, "
+    "read the surrounding lines with read_file. The fact that refutes you is usually on the very "
+    "next line.\n"
+    "- Never call something missing, unused, unbounded, dead, or broken because a search didn't find "
+    "it. A search that finds nothing means your pattern didn't match — not that the thing isn't "
+    "there. Say 'I didn't find X', never 'X doesn't exist'.\n"
+    "- Never propose changing code you have not read in full. Work out why it is the way it is "
+    "first: code that looks wrong in isolation is usually load-bearing, and a confident fix to code "
+    "you didn't understand is worse than no answer.\n"
+    "- A count, a metric, or a linter hit is a POINTER, not a finding. Open the specific case and "
+    "confirm it is really a defect before you report it as one.\n"
+    "- Never invent a line number, file path, function name, config value, URL, or command output. "
+    "If you didn't see it this session, look it up before you write it down. An exact-looking "
+    "citation that turns out to be fabricated destroys trust in everything else you said.\n"
+    "- Say 'I don't know' freely. An admitted gap is genuinely useful; a confident fabrication is "
+    "not, and you cannot tell the user which one they're getting. When you are unsure, say how "
+    "unsure, and say what would settle it.\n\n"
     "When comparing multiple options or sources, use a table instead of prose. State your confidence "
     "and flag what you couldn't verify rather than presenting a synthesis as more settled than it is.\n\n"
     "# Working Discipline\n\n"
@@ -1060,6 +1159,7 @@ def expand_at_refs(text: str) -> str:
                 if len(content) > 100_000:
                     content = content[:100_000] + "\n... [truncated]"
                 injections.append(f"[File: {p}]\n```{lang}\n{content}\n```")
+                _injected_files.add(str(p))  # whole file is in context — citing it is fine
                 console.print(f"[dim green]  @{raw} → {p.name} ({len(content):,} chars)[/dim green]")
         except Exception as e:
             console.print(f"[yellow]  @{raw}: {e}[/yellow]")
@@ -1918,6 +2018,7 @@ def load_file_into_context(arg: str, history: list) -> bool:
             text = text[:150_000]
         lang = LANG_MAP.get(path.suffix.lower(), "")
         content = f"File: `{path.name}` ({nlines:,} lines, {size:,} bytes)\n\n```{lang}\n{text}\n```"
+        _injected_files.add(str(path.resolve()))  # whole file is in context — citing it is fine
         history.append({"role": "user", "content": content})
         console.print(f"[green][loaded: {path.name} — {nlines:,} lines, {size:,} bytes][/green]")
         return True

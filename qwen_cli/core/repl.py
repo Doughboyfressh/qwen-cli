@@ -278,6 +278,12 @@ def _run_turn_and_handle_reply(ctx: _ReplContext, user_input: str, allow_tools: 
         if revised:
             reply = revised
 
+    # Citation guard — the model cited file:line it never actually read. The
+    # system prompt forbids that; this checks rather than asks. See
+    # turn.reground_citations.
+    if allow_tools:
+        reply = _main.reground_citations(ctx.client, messages, reply)
+
     ctx.history.append({"role": "user", "content": user_input})
     # The ledger records what the turn actually DID (reads, edits, commands) —
     # tool messages never enter persistent history, so without this tag the

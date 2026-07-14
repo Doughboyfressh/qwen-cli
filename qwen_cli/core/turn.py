@@ -304,6 +304,7 @@ def _prepare_turn(messages: list, allow_tools: bool, presearch: bool) -> list:
     del _main._last_turn_tool_names[:]  # fresh tool log for this turn (read by /agent verification)
     del _main._turn_ledger[:]  # fresh action ledger for this turn (read by the REPL history append)
     _main._turn_read_cache.clear()  # fresh read-dedup window for this turn
+    _main._turn_seen_lines.clear()  # fresh citation evidence (see main._unverified_citations)
     working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
     if allow_tools:
         working = _inject_volatile_tail(working)
@@ -497,6 +498,61 @@ def _execute_batches(
                 _smart_cap(client, result, tool_calls[i]["function"]["name"], last_user_msg),
             )
     return tool_results
+
+
+def reground_citations(client: object, messages: list, reply: str) -> str:
+    """Force one grounding pass if `reply` cites file:line it never actually read.
+
+    The system prompt forbids inventing line numbers; this checks. A live
+    self-audit confidently placed _session_title at main.py:1210 (it is at 340)
+    — it had grepped, not read. Shared by the REPL and both agent loops.
+
+    Returns the corrected reply, or the original if there was nothing to fix.
+    Mutates `messages` (the caller's working copy) as run_turn does.
+    """
+    import qwen_cli.main as _main
+
+    bad = _main._unverified_citations(reply)
+    if not bad:
+        return reply
+
+    shown = ", ".join(bad[:6]) + (f" (+{len(bad) - 6} more)" if len(bad) > 6 else "")
+    _main.console.print(f"[dim yellow]  [unverified citation(s): {shown} — checking before answering][/dim yellow]")
+
+    # The correction is a whole extra turn, and _prepare_turn resets the per-turn
+    # record of what happened. That record is not bookkeeping: /agent refuses
+    # AGENT_DONE until _last_turn_tool_names shows a mutation was verified, and
+    # the REPL writes _turn_ledger into history as the only trace of the turn's
+    # tool work. Letting the correction pass clear them would erase the very
+    # edits being verified, so carry both across.
+    prior_tools = list(_main._last_turn_tool_names)
+    prior_ledger = list(_main._turn_ledger)
+
+    messages.append({"role": "assistant", "content": reply})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"You cited {shown}, but nothing you read this turn actually showed you "
+                f"{'those lines' if len(bad) > 1 else 'that line'}. Do not guess at line numbers. "
+                "Use read_file (or search_files) to look at the real content now, then give your "
+                "answer again with citations you have actually verified — correcting or dropping "
+                "any that were wrong."
+            ),
+        }
+    )
+    with _main._main_llm_busy_lock:
+        _main._main_llm_busy = True
+    try:
+        # presearch=False: this is a code-grounding correction, not a web question.
+        corrected = _main.run_turn(client, messages, allow_tools=True, presearch=False)
+    finally:
+        with _main._main_llm_busy_lock:
+            _main._main_llm_busy = False
+
+    _main._last_turn_tool_names[:0] = prior_tools
+    _main._turn_ledger[:0] = prior_ledger
+    return corrected or reply
 
 
 def run_turn(client: object, messages: list, allow_tools: bool = True, presearch: bool = True) -> str | None:

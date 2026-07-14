@@ -402,6 +402,10 @@ def do_read_file(path: str, offset: int = 0, limit: int = 0) -> str:
             snippet = snippet[:_MAX_READ_CHARS] + "\n... [single line truncated]"
         end = start + len(chunk)
 
+        # Evidence for the citation guard: these are the lines the model can now
+        # actually see, and the only ones it may cite. See main._unverified_citations.
+        _main._turn_seen_lines.setdefault(str(p), set()).update(range(start + 1, end + 1))
+
         if start == 0 and end >= total:
             header = f"{p}  ({total} lines)"
             _main.console.print(f"[dim]read {p} ({total} lines, {p.stat().st_size} bytes)[/dim]")
@@ -847,6 +851,12 @@ def do_search_files(path: str, query: str, pattern: str = "**/*", context: int =
                 continue
             match_idx, lines_out = hit
             file_hits[str(fpath.relative_to(p))] = (match_idx, lines_out)
+            # Evidence for the citation guard: a search result DOES show real line
+            # numbers, so citing one is legitimate — unlike reasoning about what
+            # the code around them does. See main._unverified_citations.
+            seen = _main._turn_seen_lines.setdefault(str(fpath), set())
+            for mi in match_idx:
+                seen.update(range(max(0, mi - context) + 1, mi + context + 2))
             total += len(match_idx)
             if total >= _SEARCH_MAX_MATCHES:
                 break
