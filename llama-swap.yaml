@@ -1,0 +1,77 @@
+# llama-swap — one llama-server per model, loaded on demand.
+#
+# Why: llama-server serves ONE model per process and ignores the OpenAI "model"
+# field, so /model could never switch weights. llama-swap is an
+# OpenAI-compatible proxy that reads that field, starts the right llama-server,
+# and stops the previous one. Then /model <name> does what you'd expect.
+#
+# It also fixes a real problem with the current two-server setup: the 27B (24 GB)
+# and the 35B-A3B (25 GB) cannot both be GPU-resident on a 32 GB card, so one has
+# been spilling into shared system memory. Swapping keeps whichever model you are
+# using fully on the GPU.
+#
+#   Proxy:      http://localhost:8090   <- point the CLI here
+#   Upstreams:  8091 (27B), 8092 (35B-A3B)  — started/stopped by the proxy
+#
+# Flags below are copied verbatim from start-qwen.bat. They are benchmarked and
+# load-bearing: K and V cache types MUST match under --flash-attn, or prompt
+# processing falls off the CUDA fast path (2500 -> 69 t/s).
+
+healthCheckTimeout: 300     # a 24 GB model takes 30-90 s to load
+logLevel: info
+
+macros:
+  # Path to llama-server.exe. LM Studio bumps this version directory on update —
+  # if the proxy fails to start a model, this is the line to fix.
+  # start-swap.bat checks it and warns you if a newer backend appears.
+  # Single-quoted single line on purpose: a folded (>) scalar would append a
+  # newline into the middle of the command.
+  llama: '"C:/Users/Dough/.lmstudio/extensions/backends/llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.24.0/llama-server.exe"'
+
+models:
+  # ---- Dense 27B, vision-capable. The default: best quality, has the mmproj. --
+  "Qwen3.6-27B":
+    name: "Qwen3.6 27B (dense, vision)"
+    description: "Main coding model. Q6_K_XL, 49k ctx, q8_0 KV."
+    cmd: |
+      ${llama}
+      -m "C:/Users/Dough/.qwen-cli/models/Qwen3.6-27B-UD-Q6_K_XL.gguf"
+      --mmproj "C:/Users/Dough/.qwen-cli/models/mmproj-F32.gguf"
+      --alias "Qwen3.6-27B"
+      --port 8091
+      --host 127.0.0.1
+      -ngl 64
+      -c 49152
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -np 1
+      -t 16
+      --flash-attn on
+      --image-min-tokens 1024
+    proxy: "http://127.0.0.1:8091"
+    ttl: 1800     # unload after 30 min idle, freeing the GPU for the other model
+
+  # ---- MoE 35B-A3B: 3B active params, so far faster. No vision. ---------------
+  "Qwen3.6-35B-A3B":
+    name: "Qwen3.6 35B-A3B (MoE, fast)"
+    description: "Sparse MoE — much faster generation. Q5_K_XL, 40k ctx, q4_0 KV."
+    cmd: |
+      ${llama}
+      -m "C:/Users/Dough/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf"
+      --alias "Qwen3.6-35B-A3B"
+      --port 8092
+      --host 127.0.0.1
+      -ngl 99
+      -c 40960
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      -np 1
+      -t 16
+      --flash-attn on
+    proxy: "http://127.0.0.1:8092"
+    ttl: 1800
+
+# No `groups:` block on purpose. The default is exactly what a single 32 GB GPU
+# wants: one model resident at a time, the previous one stopped before the next
+# starts. Adding a group that runs both concurrently would put you straight back
+# into 49 GB of models on a 32 GB card.
