@@ -173,13 +173,25 @@ def _is_local(url: str) -> bool:
 # top_k / min_p / repeat_penalty and Qwen's chat_template_kwargs are llama.cpp
 # extensions. Cloud APIs reject unknown fields outright, so default this to ON
 # only for a local endpoint. Override per profile with sampler_extras = true/false.
+_TRUTHY = ("1", "true", "yes", "on")
 _SAMPLER_DEFAULT = "true" if _is_local(BASE_URL) else "false"
-SAMPLER_EXTRAS = _pcfg("sampler_extras", "QWEN_SAMPLER_EXTRAS", _SAMPLER_DEFAULT).strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+SAMPLER_EXTRAS = _pcfg("sampler_extras", "QWEN_SAMPLER_EXTRAS", _SAMPLER_DEFAULT).strip().lower() in _TRUTHY
+
+# chat_template_kwargs={"preserve_thinking": ...} is an argument to QWEN'S chat
+# template. Hand it to a Llama/Mistral/Gemma GGUF whose template has no such
+# parameter and llama.cpp can reject the request outright — so this CLI could
+# only ever really drive Qwen. Default it from the model name and let a profile
+# say otherwise; any thinking-style model (Qwen, DeepSeek-R1, QwQ) can opt in.
+def _looks_like_thinking_model(name: str) -> bool:
+    n = name.lower()
+    return any(tag in n for tag in ("qwen", "qwq", "deepseek-r1", "r1-", "thinking"))
+
+
+PRESERVE_THINKING = _pcfg(
+    "preserve_thinking",
+    "QWEN_PRESERVE_THINKING",
+    "true" if _looks_like_thinking_model(MODEL) else "false",
+).strip().lower() in _TRUTHY
 # Per-provider: rounds are only useful if the findings survive them. On a 28k
 # window more rounds mean more mid-run compaction, which is what shreds a long
 # analysis; on a 200k model they are nearly free. So this belongs in the profile,

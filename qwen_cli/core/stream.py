@@ -947,7 +947,12 @@ def _build_stream_kwargs(messages: list, use_tools: bool) -> dict:
     # a backend that wants them; _create_with_retry can still strip them if a
     # server we thought was local turns out to be picky.
     if _main.SAMPLER_EXTRAS:
-        kwargs["extra_body"] = dict(preset["extra_body"])  # copy so retries can pop it safely
+        extra = dict(preset["extra_body"])  # copy so retries can pop it safely
+        if not _main.PRESERVE_THINKING:
+            # A Qwen chat-template argument. A Llama/Mistral/Gemma template has no
+            # such parameter and llama.cpp can reject the whole request for it.
+            extra.pop("chat_template_kwargs", None)
+        kwargs["extra_body"] = extra
     for k in ("temperature", "top_p", "max_tokens", "presence_penalty"):
         if k in _main._model_params:
             kwargs[k] = _main._model_params[k]

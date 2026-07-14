@@ -65,21 +65,54 @@ if not defined LLAMA_PATH (
     exit /b 1
 )
 
+REM --- Model selection -------------------------------------------------------
+REM Run a different GGUF without editing this file:
+REM     start-qwen.bat "C:\models\Llama-3.3-70B-Q4_K_M.gguf"
+REM or set MAIN_MODEL / MAIN_CTX / MAIN_NGL in the environment first.
+REM The alias reported by /v1/models is the file name, so whatever you load shows
+REM up under its own name rather than always claiming to be Qwen.
+if not defined MAIN_MODEL set "MAIN_MODEL=%USERPROFILE%\.qwen-cli\models\Qwen3.6-27B-UD-Q6_K_XL.gguf"
+if not "%~1"=="" set "MAIN_MODEL=%~1"
+
+if not exist "%MAIN_MODEL%" (
+    echo [ERROR] Model not found: %MAIN_MODEL%
+    pause
+    exit /b 1
+)
+
+for %%F in ("%MAIN_MODEL%") do set "MAIN_ALIAS=%%~nF"
+if not defined MAIN_CTX set "MAIN_CTX=49152"
+if not defined MAIN_NGL set "MAIN_NGL=64"
+
+REM Vision projector: only pass --mmproj when one is actually present. A
+REM projector belongs to a specific model — handing Qwen's to a Llama GGUF fails
+REM at load, so a non-vision model must simply start without it.
+if not defined MAIN_MMPROJ set "MAIN_MMPROJ=%USERPROFILE%\.qwen-cli\models\mmproj-F32.gguf"
+set "MMPROJ_ARG="
+set "VISION_ARG="
+echo %MAIN_ALIAS% | findstr /I "qwen" >nul
+if not errorlevel 1 if exist "%MAIN_MMPROJ%" (
+    set MMPROJ_ARG=--mmproj "%MAIN_MMPROJ%"
+    set VISION_ARG=--image-min-tokens 1024
+)
+
+echo [start-qwen] Model: %MAIN_ALIAS%  (ctx %MAIN_CTX%)
+
 REM --- Start LLM Server ---
-start "Qwen LLM Server" "%LLAMA_PATH%" ^
-  -m "%USERPROFILE%\.qwen-cli\models\Qwen3.6-27B-UD-Q6_K_XL.gguf" ^
-  --mmproj "%USERPROFILE%\.qwen-cli\models\mmproj-F32.gguf" ^
-  --alias "Qwen3.6-27B" ^
+start "LLM Server: %MAIN_ALIAS%" "%LLAMA_PATH%" ^
+  -m "%MAIN_MODEL%" ^
+  %MMPROJ_ARG% ^
+  --alias "%MAIN_ALIAS%" ^
   --port 8080 ^
   --host 127.0.0.1 ^
-  -ngl 64 ^
-  -c 49152 ^
+  -ngl %MAIN_NGL% ^
+  -c %MAIN_CTX% ^
   --cache-type-k q8_0 ^
   --cache-type-v q8_0 ^
   -np 1 ^
   -t 16 ^
   --flash-attn on ^
-  --image-min-tokens 1024 ^
+  %VISION_ARG% ^
   --log-file "%USERPROFILE%\.qwen-cli\llama-main.log"
 
 echo [start-qwen] Loading model (30-90 seconds)...

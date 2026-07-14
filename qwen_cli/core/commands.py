@@ -448,7 +448,7 @@ def _cmd_provider(ctx: _ReplContext, arg: str) -> None:
     carries one backend's model name and another's sampler fields.
     """
     import qwen_cli.main as _main
-    from qwen_cli.core.config import _is_local, _provider_cfg, _providers
+    from qwen_cli.core.config import _is_local, _looks_like_thinking_model, _provider_cfg, _providers
 
     profiles = _providers()
     name = arg.strip()
@@ -486,6 +486,7 @@ def _cmd_provider(ctx: _ReplContext, arg: str) -> None:
     _main.MODEL = str(cfg.get("model") or _main.MODEL)
     _main.ACTIVE_PROVIDER = name
     _main.SAMPLER_EXTRAS = bool(cfg.get("sampler_extras", _is_local(base_url)))
+    _main.PRESERVE_THINKING = bool(cfg.get("preserve_thinking", _looks_like_thinking_model(_main.MODEL)))
     if cfg.get("token_limit"):
         _main.TOKEN_LIMIT = int(cfg["token_limit"])
         _main._TOKEN_LIMIT_BASE = _main.TOKEN_LIMIT

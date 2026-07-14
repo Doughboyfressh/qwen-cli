@@ -115,6 +115,7 @@ from qwen_cli.core.config import (  # noqa: E402
     MAX_TOOL_DEPTH,
     MODEL,
     OPENAI_API_KEY,
+    PRESERVE_THINKING,  # noqa: F401 — stream.py/commands.py read + rebind it via _main
     SAMPLER_EXTRAS,  # noqa: F401 — stream.py/commands.py read + rebind it via _main
     SAMPLING_PRESETS,
     SESSIONS_DIR,

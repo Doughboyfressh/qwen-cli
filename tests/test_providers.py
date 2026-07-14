@@ -231,3 +231,51 @@ def test_max_tool_depth_is_per_provider(qwen_cli, monkeypatch):
     ):
         _cmd_provider(ctx, "big")
         assert qwen_cli.MAX_TOOL_DEPTH == 40
+
+
+# ---------------------------------------------------------------------------
+# Running a NON-Qwen GGUF on llama.cpp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking"),
+    [
+        ("Qwen3.6-27B", True),
+        ("qwen3-30b-a3b", True),
+        ("QwQ-32B", True),
+        ("DeepSeek-R1-Distill-32B", True),
+        ("Llama-3.3-70B-Instruct", False),
+        ("Mistral-Small-24B", False),
+        ("gemma-3-27b-it", False),
+    ],
+)
+def test_preserve_thinking_defaults_from_the_model(model, thinking):
+    """chat_template_kwargs={"preserve_thinking": ...} is an argument to QWEN'S
+    chat template. A Llama/Mistral/Gemma template has no such parameter and
+    llama.cpp can reject the request for it — which is why this CLI could only
+    ever really drive Qwen."""
+    from qwen_cli.core.config import _looks_like_thinking_model
+
+    assert _looks_like_thinking_model(model) is thinking
+
+
+def test_non_qwen_model_gets_no_chat_template_kwargs(qwen_cli):
+    with (
+        patch.object(qwen_cli, "SAMPLER_EXTRAS", True),  # still llama.cpp: top_k etc. are fine
+        patch.object(qwen_cli, "PRESERVE_THINKING", False),
+    ):
+        extra = _build_stream_kwargs(MSGS, use_tools=False)["extra_body"]
+
+    assert "chat_template_kwargs" not in extra, "a Llama GGUF's template has no such parameter"
+    assert "top_k" in extra, "the llama.cpp samplers themselves are model-agnostic"
+
+
+def test_qwen_model_still_gets_preserve_thinking(qwen_cli):
+    with (
+        patch.object(qwen_cli, "SAMPLER_EXTRAS", True),
+        patch.object(qwen_cli, "PRESERVE_THINKING", True),
+    ):
+        extra = _build_stream_kwargs(MSGS, use_tools=False)["extra_body"]
+
+    assert extra["chat_template_kwargs"] == {"preserve_thinking": True}
