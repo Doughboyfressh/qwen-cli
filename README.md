@@ -97,11 +97,11 @@ command = "npx"
 args    = ["-y", "@modelcontextprotocol/server-github"]
 ```
 
-### Any model, not just Qwen
+### Any model, any backend
 
-The client speaks the OpenAI protocol, so **any OpenAI-compatible endpoint works as the primary
-backend** — llama.cpp, Ollama, vLLM, OpenAI, Anthropic (its OpenAI-compatible endpoint),
-OpenRouter, DeepSeek, Groq, Together. Name them as profiles and switch with `/provider`:
+The client speaks the OpenAI protocol, so **any OpenAI-compatible endpoint can be the primary
+backend** — llama.cpp, Ollama, vLLM, or a hosted API. Name them as profiles and switch with
+`/provider`:
 
 ```toml
 provider = "local"          # the active profile
@@ -112,28 +112,36 @@ model          = "Qwen3.6-27B"
 token_limit    = 28000
 sampler_extras = true       # llama.cpp-only top_k / min_p / repeat_penalty
 
-[providers.claude]
-base_url       = "https://api.anthropic.com/v1/"
-api_key        = "sk-ant-..."
-model          = "claude-sonnet-4-5"
-token_limit    = 180000
-max_tool_depth = 40         # rounds are cheap when findings survive them
+# Open-weight models, served over the same protocol. No vendor lock-in:
+# DeepSeek-V3, Qwen3-235B, Kimi K2, GLM-4.6 and Llama 4 are all open weights.
+[providers.deepseek]
+base_url       = "https://api.deepseek.com/v1"
+api_key        = "sk-..."
+model          = "deepseek-chat"
+token_limit    = 100000
+max_tool_depth = 40         # rounds are cheap when the findings survive them
 
 [providers.openrouter]
 base_url    = "https://openrouter.ai/api/v1"
 api_key     = "sk-or-..."
-model       = "deepseek/deepseek-chat"
-token_limit = 60000
+model       = "qwen/qwen3-235b-a22b"
+token_limit = 100000
+
+[providers.vllm]            # your own box, bigger context
+base_url    = "http://192.168.1.50:8000/v1"
+model       = "Qwen/Qwen3-30B-A3B"
+token_limit = 100000
 ```
 
-`/provider` lists them, `/provider claude` switches — moving the model, the input budget and the
-samplers together as a set. `sampler_extras` defaults to on for a localhost URL and off otherwise:
-`top_k`, `min_p`, `repeat_penalty` and `chat_template_kwargs` are llama.cpp extensions, and cloud
-APIs reject unknown fields.
+`/provider` lists them, `/provider deepseek` switches — moving the model, the input budget, the
+tool-round budget and the samplers together as a set. `sampler_extras` defaults to on for a
+localhost URL and off otherwise: `top_k`, `min_p`, `repeat_penalty` and `chat_template_kwargs` are
+llama.cpp extensions, and hosted APIs reject unknown fields.
 
-A big-context model is worth considering for whole-repo work. The 28k window is what forces
-auto-compaction mid-task, and compaction is where a long analysis loses the measurements it took
-and starts reconstructing them from a summary.
+**Context is the setting that matters most for agentic work.** A 28k window forces auto-compaction
+mid-task, and compaction is where a long analysis loses the measurements it took and starts
+reconstructing them from a summary — which is how you get a confident report about functions that
+do not exist. If a task keeps hitting `[auto-compact]`, the window is the bug, not the model.
 
 Top-level `base_url` / `model` / `token_limit` still work on their own, so a config with no
 `[providers]` table keeps running unchanged.
