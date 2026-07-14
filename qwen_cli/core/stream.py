@@ -1,12 +1,13 @@
 """Streaming module — LLM streaming, retry, tool call parsing, live preview."""
 
+import contextlib
 import json
 import logging
 import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from rich.console import Console
@@ -858,16 +859,15 @@ def _create_with_retry(client: object, **kwargs) -> Any:
     return None
 
 
-def stream_once(client: object, messages: list, use_tools: bool, update_fn=None) -> tuple[str, list, dict]:
-    """Returns (text, tool_calls, usage_dict)."""
+def _failed_usage() -> dict:
+    """The usage dict for a call that produced nothing at all."""
+    return {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
+
+
+def _build_stream_kwargs(messages: list, use_tools: bool) -> dict:
+    """Request kwargs: the active preset, with manual /params overrides on top."""
     import qwen_cli.main as _main
 
-    content_parts: list[str] = []
-    tc_buf: dict[int, dict] = {}
-    usage: dict = {}
-    finish_reason: str | None = None
-
-    # Build kwargs from active preset, then layer manual _model_params on top
     preset = SAMPLING_PRESETS.get(_main._active_preset, SAMPLING_PRESETS["thinking"])
     kwargs: dict = {
         "model": MODEL,
@@ -879,7 +879,6 @@ def stream_once(client: object, messages: list, use_tools: bool, update_fn=None)
         "max_tokens": preset["max_tokens"],
         "extra_body": dict(preset["extra_body"]),  # copy so retries can pop it safely
     }
-    # Manual overrides win over preset
     for k in ("temperature", "top_p", "max_tokens", "presence_penalty"):
         if k in _main._model_params:
             kwargs[k] = _main._model_params[k]
@@ -888,107 +887,150 @@ def stream_once(client: object, messages: list, use_tools: bool, update_fn=None)
     if use_tools:
         kwargs["tools"] = _main.active_tools()
         kwargs["tool_choice"] = "auto"
+    return kwargs
 
-    interrupted = False
+
+@contextlib.contextmanager
+def _heartbeat() -> Iterator[Callable[[], None]]:
+    """Print a "still waiting" line when the server goes quiet mid-generation.
+
+    Yields a tick() the caller invokes on each chunk; without it the thread has
+    no way to tell a slow stream from a hung one.
+    """
+    stop = threading.Event()
+    state = {"last_chunk": time.monotonic(), "last_print": 0.0}
+
+    def tick() -> None:
+        state["last_chunk"] = time.monotonic()
+
+    def loop() -> None:
+        while not stop.wait(timeout=5):
+            now = time.monotonic()
+            silent_for = now - state["last_chunk"]
+            if silent_for > _HEARTBEAT_SEC and now - state["last_print"] > _HEARTBEAT_SEC:
+                state["last_print"] = now
+                console.print(f"\n[dim]  still waiting for response ({int(silent_for)}s)...[/dim]")
+
+    threading.Thread(target=loop, daemon=True).start()
     try:
-        stream = _create_with_retry(client, **kwargs)
-    except Exception as e:
-        if not content_parts:
-            return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
-        interrupted = True
-        console.print(f"\n[yellow]  [stream error \u2014 {type(e).__name__}: {e}][/yellow]")
-        full_text = "".join(content_parts)
-        api_calls = [] if interrupted else list(tc_buf.values())
-        usage["finish_reason"] = "interrupted" if interrupted else finish_reason
-        usage["truncated"] = interrupted or finish_reason == "length"
-        if not api_calls and use_tools and "<tool_call>" in full_text.lower():
-            clean_text, xml_calls = _parse_xml_tool_calls(full_text)
-            if xml_calls:
-                return clean_text, xml_calls, usage
-        return full_text, api_calls, usage
-    if stream is None:
-        return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
-
-    _hb_stop = threading.Event()
-    _last_chunk_time = time.monotonic()
-    _last_hb_print = 0.0
-
-    def _hb_loop() -> None:
-        nonlocal _last_hb_print
-        while not _hb_stop.wait(timeout=5):
-            elapsed = time.monotonic() - _last_chunk_time
-            if elapsed > _HEARTBEAT_SEC and time.monotonic() - _last_hb_print > _HEARTBEAT_SEC:
-                _last_hb_print = time.monotonic()
-                console.print(f"\n[dim]  still waiting for response ({int(elapsed)}s)...[/dim]")
-
-    threading.Thread(target=_hb_loop, daemon=True).start()
-
-    try:
-        for chunk in stream:
-            _last_chunk_time = time.monotonic()
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage = {
-                    "prompt": getattr(chunk.usage, "prompt_tokens", 0) or 0,
-                    "completion": getattr(chunk.usage, "completion_tokens", 0) or 0,
-                }
-            if not chunk.choices:
-                continue
-            fr = getattr(chunk.choices[0], "finish_reason", None)
-            if fr:
-                finish_reason = fr
-            delta = chunk.choices[0].delta
-            if delta.content:
-                content_parts.append(delta.content)
-                if update_fn is not None:
-                    update_fn("".join(content_parts))
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tc_buf:
-                        tc_buf[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
-                    if tc.id:
-                        tc_buf[idx]["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name:
-                            tc_buf[idx]["function"]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            tc_buf[idx]["function"]["arguments"] += tc.function.arguments
-    except Exception as e:
-        if not content_parts:
-            return "", [], {"prompt": 0, "completion": 0, "finish_reason": "error", "truncated": False}
-        interrupted = True
-        console.print(f"\n[yellow]  [stream interrupted \u2014 keeping partial reply ({type(e).__name__})][/yellow]")
+        yield tick
     finally:
-        _hb_stop.set()
+        stop.set()
 
-    full_text = "".join(content_parts)
-    api_calls = [] if interrupted else list(tc_buf.values())
+
+def _accumulate_tool_calls(tc_buf: dict[int, dict], deltas) -> None:
+    """Fold one chunk's tool_call deltas into the buffer.
+
+    Names and JSON argument strings arrive split across chunks, so both are
+    concatenated, never assigned.
+    """
+    for tc in deltas:
+        slot = tc_buf.setdefault(
+            tc.index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        )
+        if tc.id:
+            slot["id"] = tc.id
+        if tc.function:
+            if tc.function.name:
+                slot["function"]["name"] += tc.function.name
+            if tc.function.arguments:
+                slot["function"]["arguments"] += tc.function.arguments
+
+
+def _drain_stream(stream, update_fn) -> tuple[str, list, dict]:
+    """Consume the stream. Returns (text, tool_calls, usage).
+
+    A stream that dies mid-flight keeps whatever it had already produced: the
+    partial reply is worth more than nothing, and usage["truncated"] tells the
+    caller the answer is incomplete so run_turn can resume it. Tool calls are
+    dropped in that case — a half-streamed call has a truncated JSON argument
+    string and is unusable.
+    """
+    content_parts: list[str] = []
+    tc_buf: dict[int, dict] = {}
+    usage: dict = {}
+    finish_reason: str | None = None
+    interrupted = False
+
+    with _heartbeat() as tick:
+        try:
+            for chunk in stream:
+                tick()
+                if getattr(chunk, "usage", None):
+                    usage = {
+                        "prompt": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                        "completion": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                    }
+                if not chunk.choices:
+                    continue
+                finish_reason = getattr(chunk.choices[0], "finish_reason", None) or finish_reason
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    content_parts.append(delta.content)
+                    if update_fn is not None:
+                        update_fn("".join(content_parts))
+                if delta.tool_calls:
+                    _accumulate_tool_calls(tc_buf, delta.tool_calls)
+        except Exception as e:
+            if not content_parts:
+                return "", [], _failed_usage()
+            interrupted = True
+            console.print(
+                f"\n[yellow]  [stream interrupted — keeping partial reply ({type(e).__name__})][/yellow]"
+            )
 
     # Record how the generation ended so callers can tell a *complete* answer
     # apart from one the model was cut off in the middle of. "length" means the
     # token cap stopped it; an interrupted stream is likewise incomplete.
     usage["finish_reason"] = "interrupted" if interrupted else finish_reason
     usage["truncated"] = interrupted or finish_reason == "length"
+    return "".join(content_parts), ([] if interrupted else list(tc_buf.values())), usage
 
-    # Qwen3 fallback: model emitted <tool_call> XML in text instead of API tool_calls
-    if not api_calls and use_tools and "<tool_call>" in full_text.lower():
-        clean_text, xml_calls = _parse_xml_tool_calls(full_text)
-        if xml_calls:
-            return clean_text, xml_calls, usage
 
-    # Tools disabled (e.g. the forced no-tools synthesis round after the tool
-    # budget is exhausted) but the model emitted tool syntax anyway: strip it
-    # rather than leaking raw <tool_call> markup to the user and into history.
-    if not use_tools and "<tool_call>" in full_text.lower():
-        clean_text, xml_calls = _parse_xml_tool_calls(full_text)
-        if xml_calls:
-            names = ", ".join(tc["function"]["name"] for tc in xml_calls)
-            console.print(
-                f"[dim]  [dropped {len(xml_calls)} tool call(s) ({names}) — tool use unavailable for this reply][/dim]"
-            )
-            full_text = clean_text or f"[ran out of tool rounds before finishing — wanted to call: {names}]"
+def _recover_xml_tool_calls(text: str, api_calls: list, use_tools: bool) -> tuple[str, list]:
+    """Handle the model writing tool calls as text instead of using the API field.
 
-    return full_text, api_calls, usage
+    With tools enabled that's a Qwen3 quirk worth honouring: parse them out and
+    run them. With tools DISABLED (the forced no-tools synthesis round after the
+    tool budget is spent) there is nothing to run, so strip the markup rather
+    than leak raw <tool_call> tags to the user and into history.
+    """
+    if "<tool_call>" not in text.lower():
+        return text, api_calls
+    if api_calls and use_tools:
+        return text, api_calls
+
+    clean_text, xml_calls = _parse_xml_tool_calls(text)
+    if not xml_calls:
+        return text, api_calls
+    if use_tools:
+        return clean_text, xml_calls
+
+    names = ", ".join(tc["function"]["name"] for tc in xml_calls)
+    console.print(
+        f"[dim]  [dropped {len(xml_calls)} tool call(s) ({names}) — tool use unavailable for this reply][/dim]"
+    )
+    return clean_text or f"[ran out of tool rounds before finishing — wanted to call: {names}]", api_calls
+
+
+def stream_once(client: object, messages: list, use_tools: bool, update_fn=None) -> tuple[str, list, dict]:
+    """Returns (text, tool_calls, usage_dict)."""
+    kwargs = _build_stream_kwargs(messages, use_tools)
+    try:
+        stream = _create_with_retry(client, **kwargs)
+    except Exception as e:
+        # Nothing has streamed yet, so there is no partial reply to salvage. The
+        # old code had a recovery branch here that rebuilt a reply from
+        # content_parts — dead code: content_parts cannot be non-empty before the
+        # first chunk arrives, so its guard never passed.
+        console.print(f"\n[yellow]  [stream error — {type(e).__name__}: {e}][/yellow]")
+        return "", [], _failed_usage()
+    if stream is None:
+        return "", [], _failed_usage()
+
+    text, api_calls, usage = _drain_stream(stream, update_fn)
+    text, api_calls = _recover_xml_tool_calls(text, api_calls, use_tools)
+    return text, api_calls, usage
 
 
 def _short_args(name: str, args: dict) -> str:
