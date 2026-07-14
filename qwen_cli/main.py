@@ -444,6 +444,12 @@ _turn_read_cache: set[tuple] = set()  # (path, offset, limit, mtime) already ser
 # (@file, /file, /focus, /project), which the model can still see.
 _turn_seen_lines: dict[str, set[int]] = {}  # abs path -> line numbers displayed this turn
 _injected_files: set[str] = set()  # abs paths whose entire content sits in context
+# Text the model WROTE this turn (write_file / edit_file). Checked for citations
+# too: a fabricated file:line laundered into a report on disk is worse than one
+# said out loud — it outlives the turn and the next reader (human or model)
+# treats it as established fact. A live self-audit did exactly this, inventing
+# five functions and their complexity scores inside audit-2026-07-14.md.
+_turn_written: list[tuple[str, str]] = []  # (path, content written)
 
 # "path/to/x.py:123", "x.py line 123", "line 123 of x.py"
 _CITATION_RE = re.compile(
@@ -2310,8 +2316,6 @@ def _call_with_timeout(name: str, fn, *args, timeout: int, status: str = "", **k
     except concurrent.futures.TimeoutError:
         fut.cancel()
         return f"[{name}] timed out after {timeout}s. The operation took too long to complete."
-    except Exception:
-        raise
 
 
 def _render_plan_panel() -> None:

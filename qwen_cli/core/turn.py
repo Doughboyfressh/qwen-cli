@@ -305,6 +305,7 @@ def _prepare_turn(messages: list, allow_tools: bool, presearch: bool) -> list:
     del _main._turn_ledger[:]  # fresh action ledger for this turn (read by the REPL history append)
     _main._turn_read_cache.clear()  # fresh read-dedup window for this turn
     _main._turn_seen_lines.clear()  # fresh citation evidence (see main._unverified_citations)
+    del _main._turn_written[:]  # fresh record of what this turn wrote (citation guard)
     working = _auto_presearch(list(messages)) if (allow_tools and presearch) else list(messages)
     if allow_tools:
         working = _inject_volatile_tail(working)
@@ -513,10 +514,23 @@ def reground_citations(client: object, messages: list, reply: str) -> str:
     import qwen_cli.main as _main
 
     bad = _main._unverified_citations(reply)
-    if not bad:
+    # Files written this turn get the same scrutiny. A fabricated file:line that
+    # reaches disk is worse than one merely spoken: it outlives the turn, and the
+    # next reader — human or model — treats it as established fact. A live
+    # self-audit wrote a report inventing five functions and their complexity
+    # scores; every claim went through write_file, so checking only the chat reply
+    # caught none of it.
+    written_bad: list[tuple[str, list[str]]] = []
+    for path, content in _main._turn_written:
+        wb = _main._unverified_citations(content)
+        if wb:
+            written_bad.append((path, wb))
+
+    if not bad and not written_bad:
         return reply
 
-    shown = ", ".join(bad[:6]) + (f" (+{len(bad) - 6} more)" if len(bad) > 6 else "")
+    all_bad = list(bad) + [c for _, cites in written_bad for c in cites]
+    shown = ", ".join(all_bad[:6]) + (f" (+{len(all_bad) - 6} more)" if len(all_bad) > 6 else "")
     _main.console.print(f"[dim yellow]  [unverified citation(s): {shown} — checking before answering][/dim yellow]")
 
     # The correction is a whole extra turn, and _prepare_turn resets the per-turn
@@ -528,19 +542,24 @@ def reground_citations(client: object, messages: list, reply: str) -> str:
     prior_tools = list(_main._last_turn_tool_names)
     prior_ledger = list(_main._turn_ledger)
 
-    messages.append({"role": "assistant", "content": reply})
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"You cited {shown}, but nothing you read this turn actually showed you "
-                f"{'those lines' if len(bad) > 1 else 'that line'}. Do not guess at line numbers. "
-                "Use read_file (or search_files) to look at the real content now, then give your "
-                "answer again with citations you have actually verified — correcting or dropping "
-                "any that were wrong."
-            ),
-        }
+    demand = (
+        f"You cited {shown}, but nothing you read this turn actually showed you "
+        f"{'those lines' if len(all_bad) > 1 else 'that line'}. Do not guess at line numbers, and do "
+        "not invent function or symbol names. Use read_file (or search_files) to look at the real "
+        "content now, then give your answer again with citations you have actually verified — "
+        "correcting or dropping any that were wrong."
     )
+    if written_bad:
+        files = ", ".join(path for path, _ in written_bad)
+        demand += (
+            f"\n\nUnverified citations also went into {files}, which you WROTE this turn. A wrong "
+            "citation on disk outlives this conversation and the next reader will trust it. After "
+            "you have checked the real lines, correct that file with edit_file too — or delete the "
+            "claims you cannot support."
+        )
+
+    messages.append({"role": "assistant", "content": reply})
+    messages.append({"role": "user", "content": demand})
     with _main._main_llm_busy_lock:
         _main._main_llm_busy = True
     try:

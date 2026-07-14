@@ -426,3 +426,59 @@ def test_short_args_labels_the_tool_chain(name, args, expected):
 
 def test_short_args_is_empty_for_unlabelled_tools():
     assert _short_args("update_plan", {"steps": []}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Unparseable tool-call markup must never reach the user or history
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_tool_call_markup_is_stripped():
+    """Qwen drifts into spellings none of formats A/B/C match. Seen live:
+
+        <tool_call> update_plan> steps> [{...}] </tool_call>
+
+    _parse_xml_tool_calls only strips blocks it understood, so this passed
+    straight through — raw tags rendered to the user AND stored in history.
+    """
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    raw = 'Report done.\n<tool_call> update_plan> steps> [{"status": "completed"}] </tool_call>'
+    text, calls = _recover_xml_tool_calls(raw, [], use_tools=True)
+
+    assert "<tool_call>" not in text
+    assert "update_plan>" not in text
+    assert text == "Report done."
+    assert calls == []
+
+
+def test_unclosed_tool_call_markup_is_stripped():
+    """No closing tag, so the block regex can't match it — cut from the tag on."""
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    text, calls = _recover_xml_tool_calls("Here goes.\n<tool_call> garbage steps>", [], use_tools=True)
+
+    assert "<tool_call>" not in text
+    assert text == "Here goes."
+    assert calls == []
+
+
+def test_stripping_an_empty_reply_leaves_nothing_for_the_nudge():
+    """If the markup was the whole reply, the text is empty — run_turn's
+    empty-reply nudge then asks the model to answer or call a tool properly."""
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    text, _ = _recover_xml_tool_calls("<tool_call> update_plan> steps> [] </tool_call>", [], use_tools=True)
+    assert text == ""
+
+
+def test_valid_tool_call_markup_is_still_parsed_not_stripped():
+    """The fix must not eat well-formed calls the parser does understand."""
+    from qwen_cli.core.stream import _recover_xml_tool_calls
+
+    raw = '<tool_call>{"name": "read_file", "arguments": {"path": "x.py"}}</tool_call>'
+    text, calls = _recover_xml_tool_calls(raw, [], use_tools=True)
+
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read_file"
+    assert "<tool_call>" not in text

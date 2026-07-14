@@ -1002,7 +1002,19 @@ def _recover_xml_tool_calls(text: str, api_calls: list, use_tools: bool) -> tupl
 
     clean_text, xml_calls = _parse_xml_tool_calls(text)
     if not xml_calls:
-        return text, api_calls
+        # Tool-call markup we could not parse — Qwen drifts into spellings none of
+        # formats A/B/C match (seen live: "<tool_call> update_plan> steps> [...]").
+        # _parse_xml_tool_calls only strips blocks it understood, so these used to
+        # pass straight through: raw <tool_call> tags rendered to the user AND
+        # stored in history. Strip them. If nothing else was said, run_turn's
+        # empty-reply nudge asks the model to answer or call a tool properly.
+        stripped = _XML_TOOL_CALL_RE.sub("", text)
+        if "<tool_call>" in stripped.lower():  # unclosed block — cut from the tag on
+            stripped = stripped[: stripped.lower().index("<tool_call>")]
+        stripped = stripped.strip()
+        if stripped != text.strip():
+            console.print("[dim]  [dropped an unparseable tool call — the model will be asked to retry][/dim]")
+        return stripped, api_calls
     if use_tools:
         return clean_text, xml_calls
 

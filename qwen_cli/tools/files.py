@@ -558,6 +558,7 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
         _main._backup_file(p)
         _lsp_pre_edit_snapshot(p)
         _write_raw(p, _restore_endings(patched, uses_crlf))
+        _main._turn_written.append((str(p), new_string))  # citation guard — see main._turn_written
         lines_changed = sum(
             1 for ln in changed_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
@@ -954,6 +955,7 @@ def do_write_file(path: str, content: str) -> str:
                 return "[write cancelled by user]"
             _lsp_pre_edit_snapshot(p)
         _write_raw(p, _restore_endings(content, uses_crlf))
+        _main._turn_written.append((str(p), content))  # citation guard — see main._turn_written
         action = "updated" if existed else "created"
         _main.console.print(f"[bold yellow]  [write_file][/bold yellow] {action}: {p}")
         _main._lsp_post_edit_report(p)

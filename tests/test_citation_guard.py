@@ -27,15 +27,16 @@ def _clean_ledger(qwen_cli):
     '[turn actions: ...]' tag to history in an unrelated test, which fails there
     and passes in isolation — the worst kind of test bug.
     """
-    for attr in ("_turn_seen_lines", "_injected_files"):
-        getattr(qwen_cli, attr).clear()
-    qwen_cli._last_turn_tool_names[:] = []
-    qwen_cli._turn_ledger[:] = []
+    def _reset() -> None:
+        for attr in ("_turn_seen_lines", "_injected_files"):
+            getattr(qwen_cli, attr).clear()
+        qwen_cli._last_turn_tool_names[:] = []
+        qwen_cli._turn_ledger[:] = []
+        qwen_cli._turn_written[:] = []
+
+    _reset()
     yield
-    for attr in ("_turn_seen_lines", "_injected_files"):
-        getattr(qwen_cli, attr).clear()
-    qwen_cli._last_turn_tool_names[:] = []
-    qwen_cli._turn_ledger[:] = []
+    _reset()
 
 
 @pytest.fixture
@@ -168,6 +169,48 @@ def test_repl_forces_a_grounding_pass_on_a_bad_citation(qwen_cli, code_file):
     assert len(calls) == 2, "an unverified citation must force a second, grounding turn"
     assert calls[1] is False, "the grounding pass must not web-presearch its own critique"
     assert "Corrected" in ctx.history[-1]["content"]
+
+
+def test_fabricated_citation_written_to_a_file_is_caught(qwen_cli, code_file, tmp_path):
+    """The laundering case: the claim goes to disk, not into the chat reply.
+
+    A live self-audit wrote a report inventing five functions and their complexity
+    scores. Every claim went through write_file, so a guard that only inspected
+    the spoken reply caught none of it — and the bad citations outlived the turn.
+    """
+    from qwen_cli.tools.files import do_write_file
+
+    with patch.object(qwen_cli, "_auto_approve", True):
+        do_write_file(str(tmp_path / "report.md"), f"The bug lives at {code_file.name}:999.")
+
+    demands: list[str] = []
+
+    def fake_run_turn(client, messages, allow_tools=True, presearch=True):
+        demands.append(messages[-1]["content"])
+        return "Corrected."
+
+    with patch.object(qwen_cli, "run_turn", side_effect=fake_run_turn):
+        out = qwen_cli.reground_citations(object(), [], "Wrote the report.")  # reply itself is clean
+
+    assert out == "Corrected."
+    assert demands, "a bad citation inside a written file must still force a grounding pass"
+    assert f"{code_file.name}:999" in demands[0]
+    assert "report.md" in demands[0], "the model must be told which file to correct"
+
+
+def test_clean_written_file_does_not_fire(qwen_cli, code_file, tmp_path):
+    from qwen_cli.tools.files import do_read_file, do_write_file
+
+    do_read_file(str(code_file), offset=1, limit=20)
+    with patch.object(qwen_cli, "_auto_approve", True):
+        do_write_file(str(tmp_path / "report.md"), f"See {code_file.name}:5 — verified.")
+
+    calls = []
+    with patch.object(qwen_cli, "run_turn", side_effect=lambda *a, **k: calls.append(1)):
+        out = qwen_cli.reground_citations(object(), [], "Wrote the report.")
+
+    assert out == "Wrote the report."
+    assert not calls, "a verified citation in a written file must not cost a round-trip"
 
 
 def test_reground_preserves_the_turn_record(qwen_cli, code_file):
