@@ -82,11 +82,14 @@ class TestEditFile:
     def test_records_session_change_and_backup(self, qwen_cli, tmp_path, monkeypatch):
         p = tmp_path / "code.txt"
         p.write_text("v1\n", encoding="utf-8")
+        original = p.read_bytes()  # whatever endings this platform actually wrote
         _auto_confirm(monkeypatch, qwen_cli, "y")
         _patch_backups(monkeypatch, qwen_cli, tmp_path)
         monkeypatch.setattr(qwen_cli, "_session_changes", {})
         qwen_cli.do_edit_file(str(p), "v1", "v2")
-        assert qwen_cli._session_changes[str(p)] == "v1\n"
+        # The recorded original is byte-faithful, not newline-normalized: /rollback
+        # writes it straight back, so a normalized copy would itself convert the file.
+        assert qwen_cli._session_changes[str(p)].encode() == original
         assert list(tmp_path.glob("code.txt.*.bak"))
 
     def test_registered_as_tool(self, qwen_cli):

@@ -40,6 +40,26 @@ def qwen_cli():
     return sys.modules["qwen_cli.main"]
 
 
+@pytest.fixture(autouse=True)
+def _reset_permission_flags():
+    """Reset the process-wide permission flags before every test.
+
+    main() legitimately latches _auto_approve and _unattended on for a spawned
+    --task agent, and run_piped does the same — in production each is the last
+    thing the process does, so nothing ever unsets them. In-process they leak:
+    qwen_cli.main is imported once per session, so any test that drives main()
+    or run_piped() left the flags on for every test that ran afterwards. That
+    silently turned later dangerous-command prompts into auto-denials and made
+    an unrelated audit-log test fail only under the full suite, never alone.
+    Fail loudly on a leak instead of letting it change another test's meaning.
+    """
+    main = sys.modules.get("qwen_cli.main")
+    if main is not None:
+        main._auto_approve = False
+        main._unattended = False
+    yield
+
+
 @pytest.fixture(scope="session")
 def qwen_tools():
     """The shared qwen_cli.tools.shared module."""

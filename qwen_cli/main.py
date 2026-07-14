@@ -213,8 +213,10 @@ from qwen_cli.tools.files import (  # noqa: E402
     _is_dangerous,  # noqa: F401
     _lsp_post_edit_report,  # noqa: F401
     _lsp_pre_edit_snapshot,  # noqa: F401
+    _read_raw,
     _recover_old_string,  # noqa: F401
     _resolve,
+    _write_raw,
     do_delete_file,  # noqa: F401
     do_edit_file,
     do_find_files,
@@ -447,13 +449,23 @@ _model_params: dict = {}  # runtime overrides — layered on top of active prese
 # permission mode in other agent CLIs, where edits flow but rm -rf does not.
 _auto_approve = False
 
+# True when no human is attached to answer a prompt: piped mode (stdin is
+# exhausted) and spawned --task agents (their console is nobody's console).
+# The dangerous-command gate is a real y/N decision, so it can neither be
+# auto-approved nor left to block: an unattended agent that hit `rm -rf` sat on
+# console.input() forever, and a piped run raised EOFError out of the tool.
+# Dangerous commands are DENIED outright when this is set — fail closed, but
+# fail fast, and tell the model to ask the user instead of stalling.
+_unattended = False
+
 _active_preset: str = _CFG.get("preset", "thinking") if _CFG.get("preset") in SAMPLING_PRESETS else "thinking"
 
 # High-output mode: Qwen3's recommended 81,920-token ceiling for hard math/coding
 # competition problems (vs. 32,768 for general use). Toggled at runtime via /long.
 _LONG_OUTPUT = 81920
 _long_mode = False
-_TOKEN_LIMIT_BASE = TOKEN_LIMIT  # input budget to restore when /long is turned off
+_TOKEN_LIMIT_BASE = TOKEN_LIMIT  # configured input budget; /model restores to this
+_pre_long_token_limit = 0  # budget in force when /long was switched on; 0 = never on
 
 # Module-level thread pool for parallel tool execution — avoids per-turn pool creation
 _POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="qwen-tool")
@@ -534,6 +546,11 @@ _DANGEROUS_CMD_RE = re.compile(
     r"(remove-item|ri)\b[^|;\n]*-rec|"
     r"format\s+[a-z]:|"
     r"git\s+reset\s+--hard|git\s+clean\s+-[^-]*f|"
+    # BASE_SYSTEM tells the model force-pushes "already require the user's
+    # explicit confirmation" — until this pattern existed they did not, so a
+    # force-push ran unprompted (and silently under /auto). Covers --force,
+    # --force-with-lease and -f.
+    r"git\s+push\b[^|;&\n]*?\s(?:--force\S*|-f)\b|"
     r"drop\s+table|drop\s+database|truncate\s+table|"
     r"dd\s+if=|mkfs[.\s]|shred\s+|"
     r"sudo\s+rm|sudo\s+mkfs|sudo\s+dd|sudo\s+chmod\s+777|"
@@ -1200,7 +1217,10 @@ def cmd_changes(arg: str = "") -> None:
         for path_str, original in _session_changes.items():
             p = Path(path_str)
             try:
-                current = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+                # Raw on both sides: _session_changes stores the original with its
+                # endings intact, so a newline-normalized read here would report
+                # every line of a CRLF file as changed.
+                current = _read_raw(p) if p.exists() else ""
                 diff = list(
                     difflib.unified_diff(
                         original.splitlines(keepends=True),
@@ -1371,7 +1391,7 @@ def cmd_long(arg: str) -> None:
     competition-style problems. The larger output reservation reduces the input
     budget (context_window - 81,920 - buffer), so TOKEN_LIMIT is adjusted to match.
     """
-    global _long_mode, TOKEN_LIMIT, _TOKEN_LIMIT_BASE
+    global _long_mode, TOKEN_LIMIT, _pre_long_token_limit
     a = arg.strip().lower()
     if a in ("off", "0", "no"):
         want = False
@@ -1383,10 +1403,15 @@ def cmd_long(arg: str) -> None:
         console.print(f"[dim][long mode already {'on' if want else 'off'}][/dim]")
         return
     if want:
-        _TOKEN_LIMIT_BASE = TOKEN_LIMIT
+        # Stash the CURRENT budget in its own var, never in _TOKEN_LIMIT_BASE:
+        # that one is the config baseline /model restores from, so overwriting it
+        # here made `/model aux` → `/long on` → `/model main` come back to the
+        # aux-capped 28000 instead of the configured limit, for the rest of the
+        # session.
+        _pre_long_token_limit = TOKEN_LIMIT
         default_out = SAMPLING_PRESETS.get(_active_preset, {}).get("max_tokens", 32768)
         _model_params["max_tokens"] = _LONG_OUTPUT
-        TOKEN_LIMIT = max(8192, _TOKEN_LIMIT_BASE + default_out - _LONG_OUTPUT)
+        TOKEN_LIMIT = max(8192, TOKEN_LIMIT + default_out - _LONG_OUTPUT)
         _long_mode = True
         console.print(
             f"[green][long mode ON][/green] max output → [bold]{_LONG_OUTPUT:,}[/bold] tokens "
@@ -1394,7 +1419,7 @@ def cmd_long(arg: str) -> None:
         )
     else:
         _model_params.pop("max_tokens", None)
-        TOKEN_LIMIT = _TOKEN_LIMIT_BASE
+        TOKEN_LIMIT = _pre_long_token_limit if _pre_long_token_limit else _TOKEN_LIMIT_BASE
         _long_mode = False
         console.print(
             f"[green][long mode OFF][/green] output restored to preset default; input budget → ~{TOKEN_LIMIT:,}.",
@@ -1486,7 +1511,9 @@ def cmd_rollback() -> None:
     restored = 0
     for path_str, original in list(_session_changes.items()):
         try:
-            Path(path_str).write_text(original, encoding="utf-8")
+            # _session_changes holds the raw pre-edit bytes; restore them as-is
+            # (write_text would convert an LF file to CRLF — see files._write_raw).
+            _write_raw(Path(path_str), original)
             console.print(f"  [green]restored:[/green] {Path(path_str).name}")
             restored += 1
         except Exception as e:
@@ -2434,7 +2461,9 @@ def run_piped(client: object) -> None:
     # stdin is exhausted, so y/N confirmations can never be answered in pipe
     # mode — they now cancel cleanly via _confirm_action's EOF handling. Set
     # QWEN_AUTO_APPROVE=1 to let piped runs apply file edits unattended.
-    global _auto_approve
+    global _auto_approve, _unattended
+    _saved_unattended, _saved_auto_approve = _unattended, _auto_approve
+    _unattended = True  # dangerous commands are denied, not prompted — see _unattended
     if os.environ.get("QWEN_AUTO_APPROVE", "") == "1":
         _auto_approve = True
 
@@ -2516,7 +2545,12 @@ def run_piped(client: object) -> None:
         sys.stderr.write(f"error: {e}\n")
         sys.exit(1)
     finally:
+        # Restore the process-wide flags, not just the console: run_piped is the
+        # end of the line in production, but leaving _unattended latched on leaks
+        # into anything that calls it in-process (the test suite does) and
+        # silently turns every later dangerous-command prompt into a denial.
         console = _saved_console
+        _unattended, _auto_approve = _saved_unattended, _saved_auto_approve
 
 
 # ---------------------------------------------------------------------------
@@ -2691,7 +2725,8 @@ def main() -> None:
         _cli_client, \
         _real_ctx_tokens, \
         _session_start, \
-        _auto_approve
+        _auto_approve, \
+        _unattended
 
     _session_start = time.monotonic()
 
@@ -2760,6 +2795,9 @@ def main() -> None:
         # is watching — cmd_agent's "Auto-approve file edits?" prompt would
         # block them at startup forever. They are autonomous by definition.
         _auto_approve = True
+        # ...and for the same reason a dangerous shell command must not sit on a
+        # y/N prompt no one will ever answer. See _unattended.
+        _unattended = True
         base_system = BASE_SYSTEM
         history: list[dict] = []
         _auto_task = expand_at_refs(_auto_task)

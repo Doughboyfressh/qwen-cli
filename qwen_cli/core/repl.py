@@ -447,6 +447,15 @@ def _repl_setup(client: object) -> tuple[str, list, _ReplContext]:
 def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
     import qwen_cli.main as _main
 
+    # Read history/base_system off ctx on every use, never through these locals.
+    # /load and /branch restore REBIND ctx.history to a brand-new list, and
+    # /system rebinds ctx.base_system — turns follow ctx, so a local captured
+    # here goes stale the moment either runs. That desync was live: after a
+    # /load, exiting with Ctrl+D saved the *pre-load* history and silently threw
+    # the loaded session away, and /watch injections were appended to a list
+    # nothing read anymore. The params stay for the existing call signature.
+    ctx.history, ctx.base_system = history, base_system
+
     while True:
         if _main._watch_pending:
             for _wp in _main._watch_pending[:]:
@@ -454,7 +463,7 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
                     _p = Path(_wp)
                     _lang = _main.LANG_MAP.get(_p.suffix.lower(), "")
                     _content = _p.read_text(encoding="utf-8", errors="replace")
-                    history.append(
+                    ctx.history.append(
                         {"role": "user", "content": f"[File updated: {_p.name}]\n```{_lang}\n{_content[:10_000]}\n```"}
                     )
                     console.print(f"[dim cyan]  [watch] {_p.name} updated — injected[/dim cyan]")
@@ -469,9 +478,9 @@ def _repl_loop(ctx: _ReplContext, history: list, base_system: str) -> None:
             continue
         except EOFError:
             console.print()
-            if history:
-                _main.save_session(history, base_system)
-                _main._save_exit_handoff(history)
+            if ctx.history:
+                _main.save_session(ctx.history, ctx.base_system)
+                _main._save_exit_handoff(ctx.history)
             with contextlib.suppress(Exception):
                 _main.record_session_changes_memory(ctx.client)
             _cleanup_watch()

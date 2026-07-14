@@ -149,8 +149,10 @@ compaction).
 
 ## Safety
 
-- Destructive shell commands (`rm -rf`, `DROP TABLE`, `git reset --hard`, pipe-to-shell, …) always
-  prompt, even under `/auto`. Both `run_command` and `run_script` use the same gate.
+- Destructive shell commands (`rm -rf`, `DROP TABLE`, `git reset --hard`, `git push --force`,
+  pipe-to-shell, …) always prompt, even under `/auto`. Both `run_command` and `run_script` use the
+  same gate. Where no one is there to answer — piped input, or an agent spawned by
+  `team_spawn_agent` — they are **denied outright** rather than run or left blocking on a prompt.
 - Every shell execution is appended to `audit.log` with its cwd and outcome.
 - File writes are backed up to `backups/` before being overwritten.
 - Content arriving through a tool (web pages, command output) is treated as data, never as
@@ -159,7 +161,7 @@ compaction).
 ## Development
 
 ```bash
-.venv/Scripts/python -m pytest tests/ -q     # 632 tests
+.venv/Scripts/python -m pytest tests/ -q     # 871 tests
 .venv/Scripts/python -m ruff check qwen_cli tests
 ```
 

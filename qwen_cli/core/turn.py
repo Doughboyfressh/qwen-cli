@@ -638,10 +638,17 @@ def run_turn(client: object, messages: list, allow_tools: bool = True, presearch
             first_call = False
             depth += 1
         except KeyboardInterrupt:
+            # Ctrl+C here means "stop", so actually stop: this used to fall
+            # through to the next loop iteration and fire another LLM call
+            # despite printing "returning to prompt", forcing a second Ctrl+C.
+            # Pair every outstanding tool_call with a result first — the API
+            # rejects an assistant tool_calls message with no matching tool
+            # message, and `working` is the list a caller may still hold.
             _main.console.print("\n[dim][tools cancelled — returning to prompt][/dim]")
             for i in range(len(tool_calls)):
                 working.append(
                     {"role": "tool", "tool_call_id": tool_calls[i]["id"], "content": "[user cancelled tool execution]"}
                 )
+            return ""
 
 

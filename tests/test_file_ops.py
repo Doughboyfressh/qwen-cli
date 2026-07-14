@@ -110,13 +110,16 @@ class TestPatchFile:
         # of calling it — verify it now goes through the shared path.
         p = tmp_path / "code.txt"
         p.write_text("alpha\n", encoding="utf-8")
+        original = p.read_bytes()  # whatever endings this platform actually wrote
         _auto_confirm(monkeypatch, qwen_cli, "y")
         _patch_backups(monkeypatch, qwen_cli, tmp_path)
         monkeypatch.setattr(qwen_cli, "_backup_stack", [])
         diff = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n"
         qwen_cli.do_patch_file(str(p), diff)
         assert len(qwen_cli._backup_stack) == 1
-        assert qwen_cli._backup_stack[0]["content"] == "alpha\n"
+        # Byte-faithful: the backup is the only recovery copy after a crash, so it
+        # must not have had its line endings rewritten on the way in.
+        assert qwen_cli._backup_stack[0]["content"].encode() == original
 
     def test_backups_do_not_collide_within_same_second(self, qwen_cli, tmp_path, monkeypatch):
         # Two patches to the same file in the same wall-clock second used to

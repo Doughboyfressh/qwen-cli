@@ -190,13 +190,17 @@ def _cmd_undo(ctx: _ReplContext, arg: str) -> None:
     """Restore the most recently backed-up file from the undo stack."""
     import qwen_cli.main as _main
 
+    from qwen_cli.tools.files import _write_raw
+
     if not _main._backup_stack:
         _main.console.print("[yellow][no backup available][/yellow]")
     else:
         entry = _main._backup_stack.pop()
         orig: Path = entry["original"]
         bak: Path = entry["backup"]
-        orig.write_text(entry["content"], encoding="utf-8")
+        # _write_raw, not write_text: restoring must reproduce the file byte for
+        # byte, and write_text would rewrite an LF file's endings as CRLF.
+        _write_raw(orig, entry["content"])
         _main.console.print(f"[green][restored: {orig.name} from {bak.name}][/green]")
         remaining = len(_main._backup_stack)
         if remaining:

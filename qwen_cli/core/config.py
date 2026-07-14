@@ -101,7 +101,11 @@ MODEL = _cfg("model", "QWEN_MODEL", "Qwen3.6-27B")
 # main conversation's single slot. Empty aux_base_url disables the aux backend.
 AUX_BASE_URL = _cfg("aux_base_url", "QWEN_AUX_BASE_URL", "http://localhost:8081/v1")
 AUX_MODEL = _cfg("aux_model", "QWEN_AUX_MODEL", "Qwen3.6-35B-A3B")
-TOKEN_LIMIT = int(_cfg("token_limit", "QWEN_TOKEN_LIMIT", "32000"))
+# 28000, not 32000: the server runs -c 49152 with 16384 reserved for output, so
+# the input ceiling is 32768 — a 32000 default left ~768 tokens for tokenizer
+# drift and tool schemas instead of the ~4.7k the comment on SAMPLING_PRESETS
+# (and the README) assume. Only ever bit a fresh install with no config.toml.
+TOKEN_LIMIT = int(_cfg("token_limit", "QWEN_TOKEN_LIMIT", "28000"))
 MAX_TOOL_DEPTH = int(_cfg("max_tool_depth", "QWEN_MAX_TOOL_DEPTH", "20"))
 MAX_AUTO_CONTINUE = int(_cfg("max_auto_continue", "QWEN_MAX_AUTO_CONTINUE", "4"))
 DEFAULT_EDITOR = _cfg("editor", "EDITOR", "notepad" if sys.platform == "win32" else "nano")

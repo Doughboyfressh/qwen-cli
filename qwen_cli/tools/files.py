@@ -41,6 +41,30 @@ def _resolve(path: str) -> Path:
     return p.resolve(strict=False) if p.is_absolute() else (Path.cwd() / p).resolve(strict=False)
 
 
+def _read_raw(p: Path) -> str:
+    r"""Read a file with no newline translation — CRLF stays CRLF."""
+    with open(p, encoding="utf-8", errors="replace", newline="") as f:
+        return f.read()
+
+
+def _write_raw(p: Path, text: str) -> None:
+    r"""Write text verbatim, with no newline translation.
+
+    Path.write_text() opens with newline=None, which rewrites every "\n" as
+    os.linesep — on Windows that silently converts an LF file to CRLF, so
+    writing back a file the model barely touched marks every one of its lines
+    as modified in git. do_edit_file already round-tripped endings correctly;
+    write_file, patch_file, the backups, /undo and /rollback all still went
+    through write_text and corrupted LF files. Everything that writes a user's
+    file now goes through here.
+    """
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def _restore_endings(text_lf: str, uses_crlf: bool) -> str:
+    """Re-apply the file's original line-ending style to LF-normalized text."""
+    return text_lf.replace("\n", "\r\n") if uses_crlf else text_lf
 
 
 
@@ -141,8 +165,18 @@ def do_run_command(
             "send the complete pipeline in a single call]"
         )
     if _is_dangerous(command):
+        if _main._unattended:
+            _audit_log(command, work_dir, "denied_unattended")
+            return (
+                "[blocked: this command needs the user's explicit confirmation, and no user is "
+                "attached to this session (piped input or a spawned agent). It was NOT run. "
+                "Do not retry it — report what you wanted to run and why, and let the user run it.]"
+            )
         _main.console.print(f"[bold red]  [dangerous][/bold red] {command}")
-        answer = _main.console.input("[bold red]  Run anyway? [y/N]:[/bold red] ").strip().lower()
+        try:
+            answer = _main.console.input("[bold red]  Run anyway? [y/N]:[/bold red] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            answer = ""
         if answer != "y":
             _audit_log(command, work_dir, "declined_by_user")
             return "[command cancelled by user]"
@@ -267,6 +301,13 @@ def do_run_script(language: str, code: str, cwd: str = "", timeout: int = 30) ->
     # simply by picking run_script. Prompt rather than hard-block, so this
     # matches run_command's behavior (and gets the same audit-log entry).
     if _is_dangerous(code):
+        if _main._unattended:
+            _audit_log(f"[run_script:{lang_key}] {code}", Path(cwd) if cwd else Path.cwd(), "denied_unattended")
+            return (
+                "[blocked: this script needs the user's explicit confirmation, and no user is "
+                "attached to this session (piped input or a spawned agent). It was NOT run. "
+                "Do not retry it — report what you wanted to run and why, and let the user run it.]"
+            )
         _main.console.print(f"[bold red]  [dangerous script][/bold red] {lang_key}")
         _audit_log(f"[run_script:{lang_key}] {code}", Path(cwd) if cwd else Path.cwd(), "dangerous_prompt")
         try:
@@ -461,8 +502,7 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
         # The old read_text/write_text pair normalized on read but converted
         # every \n to os.linesep on write — every edit on Windows silently
         # rewrote LF files as CRLF.
-        with open(p, encoding="utf-8", errors="replace", newline="") as f:
-            raw_text = f.read()
+        raw_text = _read_raw(p)
         uses_crlf = "\r\n" in raw_text
         original = raw_text.replace("\r\n", "\n")
         old_string = old_string.replace("\r\n", "\n")
@@ -485,8 +525,10 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
                 f"to make it unique, or pass replace_all=true to change every occurrence.]"
             )
         patched = original.replace(old_string, new_string)
+        # Store the RAW original (endings intact) — /rollback writes this back
+        # verbatim, so an LF-normalized copy here would itself convert the file.
         if str(p) not in _main._session_changes:
-            _main._session_changes[str(p)] = original
+            _main._session_changes[str(p)] = raw_text
 
         changed_lines = list(
             difflib.unified_diff(
@@ -511,8 +553,7 @@ def do_edit_file(path: str, old_string: str, new_string: str, replace_all: bool 
 
         _main._backup_file(p)
         _lsp_pre_edit_snapshot(p)
-        with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(patched.replace("\n", "\r\n") if uses_crlf else patched)
+        _write_raw(p, _restore_endings(patched, uses_crlf))
         lines_changed = sum(
             1 for ln in changed_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
@@ -554,9 +595,14 @@ def do_patch_file(path: str, diff: str) -> str:
 
         if not p.exists():
             return f"[file not found: {p}]"
-        original = p.read_text(encoding="utf-8", errors="replace")
+        # Match/patch in LF space (models emit LF diffs regardless of the file's
+        # endings), write back in the file's own style — same round-trip as
+        # do_edit_file. See _write_raw.
+        raw_text = _read_raw(p)
+        uses_crlf = "\r\n" in raw_text
+        original = raw_text.replace("\r\n", "\n")
         if str(p) not in _main._session_changes:
-            _main._session_changes[str(p)] = original
+            _main._session_changes[str(p)] = raw_text
         try:
             patched = _main._apply_diff(original, diff)
         except ValueError as e:
@@ -592,7 +638,7 @@ def do_patch_file(path: str, diff: str) -> str:
         # the in-memory _main._backup_stack doesn't survive a crash).
         _main._backup_file(p)
 
-        p.write_text(patched, encoding="utf-8")
+        _write_raw(p, _restore_endings(patched, uses_crlf))
         lines_changed = sum(
             1 for ln in preview_lines if ln.startswith(("+", "-")) and not ln.startswith(("---", "+++"))
         )
@@ -812,8 +858,10 @@ def _backup_file(p: Path) -> None:
         while (_main.BACKUPS_DIR / f"{p.name}.{stamp}_{n}.bak").exists():
             n += 1
         backup = _main.BACKUPS_DIR / f"{p.name}.{stamp}_{n}.bak"
-    content = p.read_text(encoding="utf-8", errors="replace")
-    backup.write_text(content, encoding="utf-8")
+    # Byte-faithful: the backup (and the /undo stack entry fed from it) is the
+    # only recovery copy, so it must not have its line endings rewritten either.
+    content = _read_raw(p)
+    _write_raw(backup, content)
     _main._backup_stack.append({"original": p, "backup": backup, "content": content})
     if len(_main._backup_stack) > _main._MAX_BACKUP_STACK:
         _main._backup_stack.pop(0)
@@ -828,10 +876,16 @@ def do_write_file(path: str, content: str) -> str:
         p = _main._resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
+        # An overwrite keeps the file's existing line-ending style; a new file is
+        # written exactly as the model produced it. See _write_raw.
+        uses_crlf = False
+        content = content.replace("\r\n", "\n")
         if existed:
-            old = p.read_text(encoding="utf-8", errors="replace")
+            raw_old = _read_raw(p)
+            uses_crlf = "\r\n" in raw_old
+            old = raw_old.replace("\r\n", "\n")
             if str(p) not in _main._session_changes:
-                _main._session_changes[str(p)] = old
+                _main._session_changes[str(p)] = raw_old
             if old == content:
                 return f"[no changes: {p}]"
             _main._backup_file(p)
@@ -851,7 +905,7 @@ def do_write_file(path: str, content: str) -> str:
             if not _main._confirm_action("Overwrite?"):
                 return "[write cancelled by user]"
             _lsp_pre_edit_snapshot(p)
-        p.write_text(content, encoding="utf-8")
+        _write_raw(p, _restore_endings(content, uses_crlf))
         action = "updated" if existed else "created"
         _main.console.print(f"[bold yellow]  [write_file][/bold yellow] {action}: {p}")
         _main._lsp_post_edit_report(p)
