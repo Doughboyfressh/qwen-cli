@@ -727,6 +727,99 @@ def do_find_files(path: str, pattern: str) -> str:
         return f"[error: {e}]"
 
 
+_SEARCH_MAX_FILE_BYTES = 5_000_000
+_SEARCH_MAX_MATCHES = 500  # across all files; stop the walk once hit
+_SEARCH_MAX_LINES_PER_FILE = 250
+
+
+def _compile_query(query: str) -> re.Pattern:
+    """Compile the query as a regex, falling back to a literal search.
+
+    The model passes both — a bare identifier and a real pattern — and a query
+    like `foo(` is a valid literal but an invalid regex.
+    """
+    try:
+        return re.compile(query, re.IGNORECASE)
+    except re.error:
+        return re.compile(re.escape(query), re.IGNORECASE)
+
+
+def _walk_matching_files(root: Path, name_pat: str) -> Iterator[Path]:
+    """Yield files under root whose NAME matches name_pat.
+
+    os.walk with in-place pruning of _dns, not rglob: ignored trees (.venv,
+    node_modules) are never descended into at all, which is what keeps a search
+    at a repo root from enumerating 10,000+ files and hanging.
+    """
+    import fnmatch
+
+    if root.is_file():
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        for fn in sorted(filenames):
+            if fnmatch.fnmatch(fn, name_pat):
+                yield Path(dirpath) / fn
+
+
+def _context_ranges(match_idx: list[int], n_lines: int, context: int) -> list[tuple[int, int]]:
+    """Line ranges around each match, merging any that touch or overlap."""
+    ranges: list[tuple[int, int]] = []
+    for mi in match_idx:
+        lo, hi = max(0, mi - context), min(n_lines - 1, mi + context)
+        if ranges and lo <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+        else:
+            ranges.append((lo, hi))
+    return ranges
+
+
+def _render_matches(file_lines: list[str], match_idx: list[int], context: int) -> list[str]:
+    """Format one file's hits: bare match lines, or grep -C style context blocks."""
+    if not context:
+        return [f"  L{mi + 1:>4}: {file_lines[mi].rstrip()}" for mi in match_idx]
+
+    match_set = set(match_idx)
+    out: list[str] = []
+    for ri, (lo, hi) in enumerate(_context_ranges(match_idx, len(file_lines), context)):
+        if ri:
+            out.append("  ···")  # gap between non-adjacent blocks
+        for ci in range(lo, hi + 1):
+            marker = ">" if ci in match_set else " "
+            out.append(f"  {marker} L{ci + 1:>4}: {file_lines[ci].rstrip()}")
+    return out
+
+
+def _search_one_file(fpath: Path, rx: re.Pattern, context: int) -> tuple[list[int], list[str]] | None:
+    """Search a single file. None if it has no matches, or isn't searchable text."""
+    if fpath.stat().st_size > _SEARCH_MAX_FILE_BYTES:
+        return None
+    raw = fpath.read_bytes()
+    if b"\x00" in raw[:4096]:  # binary
+        return None
+    file_lines = raw.decode("utf-8", errors="replace").splitlines()
+    match_idx = [i for i, ln in enumerate(file_lines) if rx.search(ln)]
+    if not match_idx:
+        return None
+    return match_idx, _render_matches(file_lines, match_idx, context)
+
+
+def _format_search_report(query: str, root: Path, file_hits: dict, total: int) -> str:
+    """Render the grouped-by-file result block."""
+    out = [f"Matches for '{query}' in {root} — {total} match(es) in {len(file_hits)} file(s):\n"]
+    for fname, (indices, hit_lines) in file_hits.items():
+        n = len(indices)
+        out.append(f"{fname}  ({n} match{'es' if n != 1 else ''}):")
+        out.extend(hit_lines[:_SEARCH_MAX_LINES_PER_FILE])
+        if len(hit_lines) > _SEARCH_MAX_LINES_PER_FILE:
+            out.append(f"  ... ({len(hit_lines) - _SEARCH_MAX_LINES_PER_FILE} more lines)")
+        out.append("")
+    if total >= _SEARCH_MAX_MATCHES:
+        out.append(f"... (stopped at {_SEARCH_MAX_MATCHES} — narrow your query or glob pattern)")
+    return "\n".join(out)
+
+
 def do_search_files(path: str, query: str, pattern: str = "**/*", context: int = 0) -> str:
     """Handle search files operation."""
     import qwen_cli.main as _main
@@ -735,87 +828,32 @@ def do_search_files(path: str, query: str, pattern: str = "**/*", context: int =
         p = _main._resolve(path)
         if not p.exists():
             return f"[not found: {p}]"
-        try:
-            rx = re.compile(query, re.IGNORECASE)
-        except re.error:
-            rx = re.compile(re.escape(query), re.IGNORECASE)
+        rx = _compile_query(query)
+        # Only the last segment of the glob is used — the walk handles recursion,
+        # so "**/*.py" and "*.py" both mean "any .py file underneath".
+        name_pat = pattern.rstrip("/").split("/")[-1] if pattern else "*"
 
         file_hits: dict[str, tuple[list[int], list[str]]] = {}
         total = 0
-
-        # Use os.walk with in-place directory pruning so ignored dirs (e.g. .venv)
-        # are never descended into, avoiding the 10,000+ file enumeration hang.
-        import fnmatch as _fnmatch
-        import os as _os
-
-        _name_pat = pattern.rstrip("/").split("/")[-1] if pattern else "*"
-
-        def _walk_files(root: Path) -> Iterator[Path]:
-            """Recursively walk a directory, yielding file paths matching a name pattern."""
-            if root.is_file():
-                yield root
-                return
-            for _dp_str, _dns, _fns in _os.walk(root):
-                _dns[:] = sorted(d for d in _dns if d not in IGNORE_DIRS)
-                _dp = Path(_dp_str)
-                for _fn in sorted(_fns):
-                    if _fnmatch.fnmatch(_fn, _name_pat):
-                        yield _dp / _fn
-
-        for fpath in _walk_files(p):
+        for fpath in _walk_matching_files(p, name_pat):
             if not fpath.is_file():
                 continue
             try:
-                if fpath.stat().st_size > 5_000_000:
-                    continue
-                raw = fpath.read_bytes()
-                if b"\x00" in raw[:4096]:
-                    continue
-                file_lines = raw.decode("utf-8", errors="replace").splitlines()
-                match_idx = [i for i, ln in enumerate(file_lines) if rx.search(ln)]
-                if not match_idx:
-                    continue
-                lines_out: list[str] = []
-                if context:
-                    match_set = set(match_idx)
-                    ranges: list[tuple[int, int]] = []
-                    for mi in match_idx:
-                        lo, hi = max(0, mi - context), min(len(file_lines) - 1, mi + context)
-                        if ranges and lo <= ranges[-1][1] + 1:
-                            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
-                        else:
-                            ranges.append((lo, hi))
-                    for ri, (lo, hi) in enumerate(ranges):
-                        if ri:
-                            lines_out.append("  ···")
-                        for ci in range(lo, hi + 1):
-                            marker = ">" if ci in match_set else " "
-                            lines_out.append(f"  {marker} L{ci + 1:>4}: {file_lines[ci].rstrip()}")
-                else:
-                    for mi in match_idx:
-                        lines_out.append(f"  L{mi + 1:>4}: {file_lines[mi].rstrip()}")
-                rel = str(fpath.relative_to(p))
-                file_hits[rel] = (match_idx, lines_out)
-                total += len(match_idx)
-                if total >= 500:
-                    break
+                hit = _search_one_file(fpath, rx, context)
             except Exception:
                 _logger.debug("Skipping unreadable file %s during search", fpath)
                 continue
+            if hit is None:
+                continue
+            match_idx, lines_out = hit
+            file_hits[str(fpath.relative_to(p))] = (match_idx, lines_out)
+            total += len(match_idx)
+            if total >= _SEARCH_MAX_MATCHES:
+                break
 
         if not file_hits:
             return f"No matches for '{query}' in {p}"
-        out = [f"Matches for '{query}' in {p} — {total} match(es) in {len(file_hits)} file(s):\n"]
-        for fname, (indices, hit_lines) in file_hits.items():
-            n = len(indices)
-            out.append(f"{fname}  ({n} match{'es' if n != 1 else ''}):")
-            out.extend(hit_lines[:250])
-            if len(hit_lines) > 250:
-                out.append(f"  ... ({len(hit_lines) - 250} more lines)")
-            out.append("")
-        if total >= 500:
-            out.append("... (stopped at 500 — narrow your query or glob pattern)")
-        return "\n".join(out)
+        return _format_search_report(query, p, file_hits, total)
     except Exception as e:
         return f"[error: {e}]"
 
